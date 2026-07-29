@@ -50,8 +50,8 @@ Artifacts are written to `dist/`.
 
 Every branch push triggers `.github/workflows/release.yml`. The workflow runs the regression tests, builds and verifies a Universal macOS DMG, and creates a uniquely tagged GitHub Release containing:
 
-- `Codex Token Atlas.dmg`
-- `Codex Token Atlas.dmg.sha256`
+- `Codex-Token-Atlas.dmg`
+- `Codex-Token-Atlas.dmg.sha256`
 
 Release tags use `v<app-version>-build.<workflow-run-number>`, so each push produces a separate installer without rewriting earlier releases.
 

@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build and verify DMG
         run: ./scripts/build_dmg.sh
@@ -27,8 +27,9 @@ jobs:
           set -euo pipefail
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Info.plist)"
           tag="v${version}-build.${GITHUB_RUN_NUMBER}"
-          checksum_path="dist/Codex Token Atlas.dmg.sha256"
-          shasum -a 256 "dist/Codex Token Atlas.dmg" > "$checksum_path"
+          release_dmg_path="dist/Codex-Token-Atlas.dmg"
+          cp "dist/Codex Token Atlas.dmg" "$release_dmg_path"
+          (cd dist && shasum -a 256 "Codex-Token-Atlas.dmg" > "Codex-Token-Atlas.dmg.sha256")
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "title=Codex Token Atlas ${version} (build ${GITHUB_RUN_NUMBER})" >> "$GITHUB_OUTPUT"
 
@@ -39,8 +40,8 @@ jobs:
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
           gh release create "$RELEASE_TAG" \
-            "dist/Codex Token Atlas.dmg" \
-            "dist/Codex Token Atlas.dmg.sha256" \
+            "dist/Codex-Token-Atlas.dmg" \
+            "dist/Codex-Token-Atlas.dmg.sha256" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
             --notes "Automated installer build for commit $GITHUB_SHA on $GITHUB_REF_NAME."
