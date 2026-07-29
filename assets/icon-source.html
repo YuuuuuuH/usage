@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; }
+html, body { width: 1024px; height: 1024px; margin: 0; overflow: hidden; background: transparent; }
+body { font-family: "Avenir Next", Avenir, sans-serif; }
+.icon {
+  position: absolute;
+  inset: 62px;
+  overflow: hidden;
+  border: 3px solid rgba(222, 247, 239, .5);
+  border-radius: 210px;
+  background:
+    linear-gradient(rgba(181,230,215,.07) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(181,230,215,.07) 1px, transparent 1px),
+    linear-gradient(145deg, #123c39, #075f54 72%, #04473f);
+  background-size: 42px 42px, 42px 42px, auto;
+  box-shadow: inset 0 2px 1px rgba(255,255,255,.24), 0 40px 65px rgba(4,45,40,.3);
+}
+.title {
+  position: absolute;
+  top: 92px;
+  left: 104px;
+  color: #e8fff8;
+  font-size: 55px;
+  font-weight: 800;
+  line-height: .9;
+  letter-spacing: 0;
+}
+.title small {
+  display: block;
+  margin-top: 14px;
+  color: #8dd4bf;
+  font: 700 19px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .14em;
+}
+.grid {
+  position: absolute;
+  left: 104px;
+  right: 104px;
+  top: 300px;
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  grid-template-rows: repeat(7, 1fr);
+  gap: 12px;
+  height: 410px;
+}
+.cell {
+  border: 1px solid rgba(230,255,248,.14);
+  border-radius: 7px;
+  background: rgba(176,227,211,.22);
+}
+.cell.hot { background: #eb7757 !important; box-shadow: 0 0 0 5px rgba(235,119,87,.16); }
+.mark {
+  position: absolute;
+  right: 100px;
+  bottom: 80px;
+  color: #eafff9;
+  font: 800 51px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: -.08em;
+}
+.mark span { color: #ef9d38; }
+</style>
+</head>
+<body>
+  <div class="icon">
+    <div class="title">TOKEN<small>CODEX ATLAS</small></div>
+    <div class="grid" id="grid"></div>
+    <div class="mark">7<span>×</span>24</div>
+  </div>
+<script>
+const grid = document.getElementById('grid');
+for (let i = 0; i < 84; i++) {
+  const cell = document.createElement('span');
+  cell.className = 'cell' + (i === 33 ? ' hot' : '');
+  if (i !== 33) {
+    const intensity = .16 + ((Math.sin(i * 1.91) + 1) / 2) * .68;
+    cell.style.background = `rgba(171, 231, 211, ${intensity.toFixed(2)})`;
+  }
+  grid.appendChild(cell);
+}
+</script>
+</body>
+</html>
