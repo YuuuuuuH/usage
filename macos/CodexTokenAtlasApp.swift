@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         homeURL.appendingPathComponent("codex_token_usage_by_day.csv"),
         homeURL.appendingPathComponent("codex_token_usage_by_hour.csv"),
         homeURL.appendingPathComponent("codex_token_usage_by_model.csv"),
+        homeURL.appendingPathComponent("codex_token_usage_by_route.csv"),
         homeURL.appendingPathComponent("codex_token_usage_by_session.csv"),
         homeURL.appendingPathComponent("codex_token_usage_summary.json")
     ]
@@ -161,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             defer: false
         )
         window.title = "Codex Token Atlas"
-        window.subtitle = "Fork-safe · Model-aware · Hourly resolution"
+        window.subtitle = "Fork-safe · Provider-aware · Tier-aware"
         window.minSize = NSSize(width: 860, height: 600)
         window.center()
         window.isReleasedWhenClosed = false

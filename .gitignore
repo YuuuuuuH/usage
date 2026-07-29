@@ -9,5 +9,6 @@ dist/
 /codex_token_usage_by_day.csv
 /codex_token_usage_by_hour.csv
 /codex_token_usage_by_model.csv
+/codex_token_usage_by_route.csv
 /codex_token_usage_by_session.csv
 /codex_token_usage_summary.json

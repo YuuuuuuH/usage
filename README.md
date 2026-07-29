@@ -1,18 +1,20 @@
 # Codex Token Atlas
 
-Codex Token Atlas scans local Codex session logs and builds a model-aware token dashboard for macOS. It includes a native AppKit shell, a 7 x 24 hourly heatmap, daily history, session and model breakdowns, fork deduplication, CSV/JSON exports, and an API-equivalent cost estimate.
+Codex Token Atlas scans local Codex session logs and builds a route-aware token dashboard for macOS. It includes a native AppKit shell, a 7 x 24 hourly heatmap, daily history, session and model breakdowns, fork deduplication, CSV/JSON exports, and an official direct-API equivalent value estimate.
 
 All session parsing and report generation happen locally. The repository does not contain session logs, prompts, generated reports, or personal usage data.
 
 ## Highlights
 
 - Keeps `total_tokens` as the primary usage metric, including cached input and any unclassified total reported by Codex.
-- Attributes every call to the nearest preceding `turn_context` model instead of assigning one final model to the whole session.
+- Attributes every call to the nearest preceding model, provider, service tier, and reasoning-effort settings instead of assigning one final setting to the whole session.
 - Deduplicates inherited fork history using lineage root, turn ID, cumulative usage, per-call usage, and context window.
 - Aggregates usage into continuous-color 7 x 24 and daily heatmaps.
-- Shows the API cost estimate for each heatmap cell on hover.
-- Prices current and historical GPT families, Codex variants, and older reasoning models; unknown future models remain visible and are marked unpriced.
-- Exports daily, hourly, model, session, and audit data.
+- Shows the official direct-API equivalent value for each heatmap cell on hover.
+- Separates Standard/default and Priority/Fast API rates where the provider publishes both.
+- Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. Unknown models remain visible and are marked unpriced.
+- Reads cache hits and cache writes separately when the log schema provides them.
+- Exports daily, hourly, model, provider/model/tier route, session, and audit data.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
 
 ## Accounting
@@ -21,7 +23,33 @@ The dashboard sums unique `last_token_usage` events. When that field is missing,
 
 Codex `/status` may show a much smaller number because its displayed token usage generally resembles uncached input plus output. Token Atlas intentionally preserves the complete `total_tokens` field from local logs.
 
-Cost values are estimates using OpenAI standard API text-token prices, not actual Codex or ChatGPT subscription charges. Unclassified tokens are excluded. GPT-5.6 session logs do not distinguish cache reads from cache writes, so cached input is estimated at the cache-read rate. See the [official OpenAI pricing table](https://developers.openai.com/api/docs/pricing).
+The value panel is deliberately not labelled as an actual bill:
+
+- **ChatGPT Plan:** local token events cannot reconstruct subscription charges or Codex credits. Standard API equivalent value is still shown for comparison. Fast-mode credit multipliers are not dollar token prices.
+- **OpenAI API key:** `default` uses Standard rates and logged `priority`/`fast` routes use published Priority rates when available.
+- **Other provider or relay:** the logged provider and model are retained. A recognized DeepSeek, Gemini, Claude, Grok, or GPT model is valued at that vendor's official direct rate even when it was reached through an OpenAI-compatible relay.
+- **Unknown or internal model:** usage remains in every total and export, but value is unpriced until it can be mapped to a built-in official model.
+
+Unclassified tokens are excluded from value. Cache writes use a published write rate when one exists; otherwise they use the uncached input rate. Pricing sources are listed in the generated report.
+
+## Official model aliases
+
+Create `~/.codex/token_atlas_pricing.json` only when a relay logs an internal model name that should map to a known official model. The repository includes [an example](examples/token_atlas_pricing.example.json).
+
+An alias can be global or scoped to a logged provider:
+
+```json
+{
+  "aliases": {
+    "CompanyRelay/internal-gpt": "gpt-5.6-sol",
+    "internal-deepseek": "deepseek-v4-pro"
+  }
+}
+```
+
+Alias targets must exist in the app's built-in official catalog. Custom relay prices and contract rates are intentionally rejected, so the report always answers one question: what would the same logged model usage be worth through its official API channel?
+
+The current authentication mode is shown only as context. Codex logs do not preserve enough historical authentication data to prove whether every old call was billed through a plan, an API account, or a relay.
 
 ## Requirements
 
@@ -75,7 +103,8 @@ Generated files are written to the home directory:
 - `~/codex_token_usage_by_day.csv`
 - `~/codex_token_usage_by_hour.csv`
 - `~/codex_token_usage_by_model.csv`
+- `~/codex_token_usage_by_route.csv`
 - `~/codex_token_usage_by_session.csv`
 - `~/codex_token_usage_summary.json`
 
-Pricing data is versioned in `src/codex_token_heatmap.py` with an `as_of` date. Models without a matching official standard rate are still fully counted but excluded from the cost estimate.
+Pricing data is versioned in `src/codex_token_heatmap.py` with an `as_of` date. Models without a matching official rate are still fully counted but excluded from the value estimate.

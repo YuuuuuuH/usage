@@ -1,0 +1,7 @@
+{
+  "aliases": {
+    "CompanyRelay/internal-gpt": "gpt-5.6-sol",
+    "CompanyRelay/internal-deepseek": "deepseek-v4-pro",
+    "internal-claude": "claude-sonnet-4-6"
+  }
+}
