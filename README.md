@@ -1,6 +1,6 @@
 # Codex Token Atlas
 
-Codex Token Atlas scans local Codex session logs and builds a route-aware token dashboard for macOS. It includes a native AppKit shell, a 7 x 24 hourly heatmap, daily history, session and model breakdowns, fork deduplication, CSV/JSON exports, and an official direct-API equivalent value estimate.
+Codex Token Atlas scans local Codex session logs and builds a route-aware token dashboard for macOS. It uses a native SwiftUI/AppKit interface with no embedded browser or WebKit dependency. The app includes a 7 x 24 hourly heatmap, daily history, session and model breakdowns, fork deduplication, filtered exports, and an official direct-API equivalent value estimate.
 
 All session parsing and report generation happen locally. The repository does not contain session logs, prompts, generated reports, or personal usage data.
 
@@ -10,11 +10,14 @@ All session parsing and report generation happen locally. The repository does no
 - Attributes every call to the nearest preceding model, provider, service tier, and reasoning-effort settings instead of assigning one final setting to the whole session.
 - Deduplicates inherited fork history using lineage root, turn ID, cumulative usage, per-call usage, and context window.
 - Aggregates usage into continuous-color 7 x 24 and daily heatmaps.
-- Shows the official direct-API equivalent value for each heatmap cell on hover.
+- Shows tokens, calls, and the selected official direct-API equivalent value for every hourly and daily heatmap cell on hover.
+- Filters the whole dashboard by all history, the latest 7 or 30 days, or an exact custom date range.
+- Switches between a simple Standard-rate estimate and a service-tier estimate that distinguishes Default from Fast/Priority calls.
 - Separates Standard/default and Priority/Fast API rates where the provider publishes both.
 - Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. Unknown models remain visible and are marked unpriced.
 - Reads cache hits and cache writes separately when the log schema provides them.
-- Exports daily, hourly, model, provider/model/tier route, session, and audit data.
+- Adds date- and model-aware official value columns to session and route reporting.
+- Lets the user choose the export format and destination for filtered JSON, daily/hourly/model/route/session CSV, complete HTML, or all formats together.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
 
 ## Accounting
@@ -23,7 +26,12 @@ The dashboard sums unique `last_token_usage` events. When that field is missing,
 
 Codex `/status` may show a much smaller number because its displayed token usage generally resembles uncached input plus output. Token Atlas intentionally preserves the complete `total_tokens` field from local logs.
 
-The value panel is deliberately not labelled as an actual bill:
+The value panel is deliberately not labelled as an actual bill. Its controls offer two comparison modes:
+
+- **Simple pricing:** every recognized call uses the model's official Standard API rate.
+- **Default / Fast pricing:** logged Default calls use Standard rates and logged Fast/Priority calls use official Priority rates when available, with an explicit Standard fallback when no Priority rate exists.
+
+Channel interpretation remains separate from those controls:
 
 - **ChatGPT Plan:** local token events cannot reconstruct subscription charges or Codex credits. Standard API equivalent value is still shown for comparison. Fast-mode credit multipliers are not dollar token prices.
 - **OpenAI API key:** `default` uses Standard rates and logged `priority`/`fast` routes use published Priority rates when available.

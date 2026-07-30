@@ -485,6 +485,14 @@ class SessionStats:
     by_route: dict[tuple[str, str, str], Counter] = field(
         default_factory=lambda: defaultdict(Counter)
     )
+    by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    by_day_model: dict[date, dict[str, Counter]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+    )
+    costs_by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    costs_by_day_model: dict[date, dict[str, Counter]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+    )
     raw_events: int = 0
     unique_events: int = 0
     inherited_events: int = 0
@@ -517,6 +525,9 @@ class UsageReport:
     usage_by_route: dict[tuple[str, str, str], Counter] = field(
         default_factory=lambda: defaultdict(Counter)
     )
+    usage_by_day_route: dict[date, dict[tuple[str, str, str], Counter]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+    )
     by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
     by_day_model: dict[date, dict[str, Counter]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
@@ -539,6 +550,15 @@ class UsageReport:
     )
     costs_by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
     costs_by_day_model: dict[date, dict[str, Counter]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+    )
+    costs_by_day_route: dict[date, dict[tuple[str, str, str], Counter]] = field(
+        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+    )
+    costs_by_hour: dict[datetime, Counter] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
+    costs_by_hour_model: dict[datetime, dict[str, Counter]] = field(
         default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
     )
     costs_weekday_hour: dict[tuple[int, int], Counter] = field(
@@ -1243,6 +1263,8 @@ def add_usage(
     stats.by_provider[route_provider].update(usage)
     stats.by_service_tier[service_tier].update(usage)
     stats.by_reasoning_effort[reasoning_effort or "(unknown)"].update(usage)
+    stats.by_day[day].update(usage)
+    stats.by_day_model[day][model].update(usage)
     route = (route_provider, model, service_tier)
     stats.by_route[route].update(usage)
     report.totals.update(usage)
@@ -1251,6 +1273,7 @@ def add_usage(
     report.totals_by_service_tier[service_tier].update(usage)
     report.totals_by_reasoning_effort[reasoning_effort or "(unknown)"].update(usage)
     report.usage_by_route[route].update(usage)
+    report.usage_by_day_route[day][route].update(usage)
     report.by_day[day].update(usage)
     report.by_day_model[day][model].update(usage)
     report.by_hour[hour].update(usage)
@@ -1265,10 +1288,15 @@ def add_usage(
         report.pricing_catalog,
         report.pricing_aliases,
     )
+    stats.costs_by_day[day].update(cost)
+    stats.costs_by_day_model[day][model].update(cost)
     report.costs_by_model[model].update(cost)
     report.costs_by_route[route].update(cost)
     report.costs_by_day[day].update(cost)
     report.costs_by_day_model[day][model].update(cost)
+    report.costs_by_day_route[day][route].update(cost)
+    report.costs_by_hour[hour].update(cost)
+    report.costs_by_hour_model[hour][model].update(cost)
     report.costs_weekday_hour[weekday_hour].update(cost)
     report.costs_weekday_hour_model[weekday_hour][model].update(cost)
 
@@ -1463,7 +1491,7 @@ def cost_dict(value: Counter | dict[str, float] | None = None) -> dict[str, floa
     result: dict[str, float | int] = {}
     for field in COST_FIELDS:
         raw = value.get(field, 0)
-        result[field] = round(float(raw), 6) if field.endswith("_usd") else int(raw)
+        result[field] = round(float(raw), 9) if field.endswith("_usd") else int(raw)
     return result
 
 
@@ -1547,6 +1575,13 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
             "pricing_model": None,
             "rates": None,
             "source": None,
+            "daily": {
+                day.isoformat(): {
+                    "usage": counter_dict(report.usage_by_day_route[day][route]),
+                    "costs": cost_dict(report.costs_by_day_route[day][route]),
+                }
+                for day in sorted(report.by_day)
+            },
         }
         if pricing_match is not None:
             pricing_model, pricing = pricing_match
@@ -1634,6 +1669,17 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
                 report.by_day_model[day][model]
             )
 
+    timeline_hourly: dict[str, dict[str, dict[str, int]]] = {
+        scope: {} for scope in [ALL_MODELS_KEY, *models]
+    }
+    for hour in sorted(report.by_hour):
+        key = hour.strftime("%Y-%m-%dT%H")
+        timeline_hourly[ALL_MODELS_KEY][key] = counter_dict(report.by_hour[hour])
+        for model in models:
+            usage = report.by_hour_model[hour][model]
+            if usage["calls"]:
+                timeline_hourly[model][key] = counter_dict(usage)
+
     pricing_data = build_pricing_data(report, models)
     hourly_costs: dict[str, list[list[dict[str, float | int]]]] = {}
     for scope in [ALL_MODELS_KEY, *models]:
@@ -1662,6 +1708,22 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
             )
     pricing_data["hourly"] = hourly_costs
     pricing_data["daily"] = daily_costs
+    pricing_data["timeline_hourly"] = {
+        scope: {
+            hour.strftime("%Y-%m-%dT%H"): cost_dict(
+                report.costs_by_hour[hour]
+                if scope == ALL_MODELS_KEY
+                else report.costs_by_hour_model[hour][scope]
+            )
+            for hour in sorted(report.by_hour)
+            if (
+                scope == ALL_MODELS_KEY
+                or report.by_hour_model[hour][scope]["priced_calls"]
+                or report.by_hour_model[hour][scope]["unpriced_calls"]
+            )
+        }
+        for scope in [ALL_MODELS_KEY, *models]
+    }
 
     sessions = []
     for stats in report.sessions:
@@ -1704,6 +1766,28 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
                     effort: counter_dict(usage)
                     for effort, usage in stats.by_reasoning_effort.items()
                 },
+                "by_day": {
+                    day.isoformat(): counter_dict(usage)
+                    for day, usage in sorted(stats.by_day.items())
+                },
+                "by_day_model": {
+                    day.isoformat(): {
+                        model: counter_dict(usage)
+                        for model, usage in by_model.items()
+                    }
+                    for day, by_model in sorted(stats.by_day_model.items())
+                },
+                "costs_by_day": {
+                    day.isoformat(): cost_dict(cost)
+                    for day, cost in sorted(stats.costs_by_day.items())
+                },
+                "costs_by_day_model": {
+                    day.isoformat(): {
+                        model: cost_dict(cost)
+                        for model, cost in by_model.items()
+                    }
+                    for day, by_model in sorted(stats.costs_by_day_model.items())
+                },
                 "unique_events": stats.unique_events,
                 "inherited_events": stats.inherited_events,
                 "local_duplicate_events": stats.local_duplicate_events,
@@ -1737,6 +1821,7 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
             },
         },
         "hourly": hourly,
+        "timeline_hourly": timeline_hourly,
         "daily": daily,
         "sessions": sessions,
         "audit": {
@@ -2842,6 +2927,7 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
         "accounting_method": "sum unique last_token_usage events",
         "deduplication_key": "lineage_root + turn_id + cumulative_usage + last_usage + context_window",
         "sessions_root": str(SESSIONS_ROOT),
+        "dashboard": build_dashboard_data(report),
         "totals": counter_dict(report.totals),
         "usage_by_model": models,
         "usage_by_provider": {
@@ -3141,6 +3227,18 @@ def run_self_test() -> None:
         )[0] == "gpt-5.6-sol"
 
         dashboard = build_dashboard_data(report)
+        assert summary_payload(report)["dashboard"]["totals"]["all"]["total_tokens"] == 200
+        assert dashboard["timeline_hourly"]["all"]["2026-01-02T11"]["total_tokens"] == 20
+        child_dashboard = next(item for item in dashboard["sessions"] if item["id"] == child_id)
+        assert child_dashboard["by_day"]["2026-01-02"]["total_tokens"] == 50
+        assert child_dashboard["costs_by_day"]["2026-01-02"]["priority_tier_calls"] == 1
+        assert child_dashboard["costs_by_day_model"]["2026-01-02"]["gpt-5.6-sol"]["standard_equivalent_cost_usd"] > 0
+        priority_route = next(
+            item
+            for item in dashboard["pricing"]["routes"]
+            if item["model"] == "gpt-5.6-sol" and item["service_tier"] == "priority"
+        )
+        assert priority_route["daily"]["2026-01-02"]["usage"]["total_tokens"] == 20
         assert dashboard["pricing"]["hourly"]["all"][4][11]["priority_tier_calls"] == 1
         assert dashboard["pricing"]["daily"]["all"]["2026-01-02"]["unpriced_tokens"] == 30
         assert "一周 × 24 小时" in render_html(report)

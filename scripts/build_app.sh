@@ -26,7 +26,7 @@ xcrun swiftc \
   -parse-as-library \
   -target arm64-apple-macos12.0 \
   -framework AppKit \
-  -framework WebKit \
+  -framework SwiftUI \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-arm64"
 
@@ -35,7 +35,7 @@ xcrun swiftc \
   -parse-as-library \
   -target x86_64-apple-macos12.0 \
   -framework AppKit \
-  -framework WebKit \
+  -framework SwiftUI \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-x86_64"
 
