@@ -18,6 +18,14 @@ command -v codesign >/dev/null
 /usr/bin/python3 -m py_compile "$ROOT_DIR/src/codex_token_heatmap.py"
 /usr/bin/python3 "$ROOT_DIR/src/codex_token_heatmap.py" --self-test
 
+xcrun swiftc \
+  -O \
+  -parse-as-library \
+  "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
+  "$ROOT_DIR/tests/LiveTokenMonitorTests.swift" \
+  -o "$TEMP_DIR/LiveTokenMonitorTests"
+"$TEMP_DIR/LiveTokenMonitorTests"
+
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 
@@ -27,6 +35,7 @@ xcrun swiftc \
   -target arm64-apple-macos12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-arm64"
 
@@ -36,6 +45,7 @@ xcrun swiftc \
   -target x86_64-apple-macos12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-x86_64"
 
