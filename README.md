@@ -19,14 +19,15 @@ All session parsing and report generation happen locally. The repository does no
 - Adds date- and model-aware official value columns to session and route reporting.
 - Lets the user choose the export format and destination for filtered JSON, daily/hourly/model/route/session CSV, complete HTML, or all formats together.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
-- Adds an optional native menu-bar monitor with a compact two-line sensor readout, a 60-second rolling token rate, and input/cache/output rate details.
-- Supports persistent 1-, 2-, or 5-second live refresh intervals while reading only bytes appended to local session logs.
+- Adds an optional native menu-bar monitor with a compact 60-second rolling Token rate plus historical total and input/cache/output details in its panel.
+- Defaults live detection to 5 seconds and provides persistent 1-, 2-, or 5-second choices while reading only bytes appended to local session logs.
+- Places Dock presence, System/Light/Dark appearance, and live refresh controls in the toolbar Settings menu immediately left of Refresh.
 
 ## Accounting
 
 The dashboard sums unique `last_token_usage` events. When that field is missing, it falls back to a non-negative delta of cumulative usage. `reasoning_output_tokens` is treated as part of output and is not added to the total a second time.
 
-The menu-bar rate monitor is off by default and can be enabled from the main toolbar or application menu. It baselines files that already exist when it starts and waits until newly discovered files stop growing before reading appended events. This prevents inherited fork history from appearing as fresh throughput. Its rate is a 60-second rolling average; the selected refresh interval controls how quickly appended log events are detected, not the averaging window. Codex writes usage after model calls rather than as a token stream, so an in-flight call becomes visible only after its `token_count` event reaches disk. Dragging the live panel away from the menu bar pins it as a normal persistent window without forcing it above other apps. Closing the dashboard leaves an enabled monitor running, and clicking its compact menu-bar readout opens the live panel.
+The menu-bar monitor is off by default and can be enabled from the main toolbar or application menu. Its compact readout remains the 60-second live rate; the expanded panel adds the all-time total, published once per minute. It baselines files that already exist when it starts and waits until newly discovered files stop growing before reading appended events. This prevents inherited fork history from appearing as fresh throughput. The selected refresh interval controls how quickly appended log events are detected, not the averaging window. Codex writes usage after model calls rather than as a token stream, so an in-flight call becomes visible only after its `token_count` event reaches disk. Dragging the live panel away from the menu bar pins it as a normal persistent window without forcing it above other apps. Closing the dashboard leaves an enabled monitor running, and clicking its compact menu-bar readout opens the live panel. Hiding the Dock icon automatically keeps that status item available; disabling it restores the Dock icon so the app cannot become unreachable.
 
 Codex `/status` may show a much smaller number because its displayed token usage generally resembles uncached input plus output. Token Atlas intentionally preserves the complete `total_tokens` field from local logs.
 
@@ -95,7 +96,7 @@ Every branch push triggers `.github/workflows/release.yml`. The workflow runs th
 - `Codex-Token-Atlas.dmg`
 - `Codex-Token-Atlas.dmg.sha256`
 
-Release tags use the semantic app version, such as `v2.1.1`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
+Release tags use the semantic app version, such as `v2.1.2`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
 
 ## Generator
 

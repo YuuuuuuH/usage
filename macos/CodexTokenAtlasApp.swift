@@ -3,7 +3,44 @@ import Darwin
 import Foundation
 import SwiftUI
 
+private let showInDockDefaultsKey = "showInDockV1"
+private let appearanceModeDefaultsKey = "appearanceModeV1"
+private let historicalTotalDefaultsKey = "historicalTotalTokensV1"
+private let liveRefreshDefaultsKey = "liveTokenRefreshSecondsV2"
+private let dashboardRenderScale: CGFloat = 0.9
+
+private enum AppearanceMode: Int, CaseIterable {
+    case system, light, dark
+
+    var title: String {
+        switch self {
+        case .system: return "跟随系统"
+        case .light: return "浅色"
+        case .dark: return "深色"
+        }
+    }
+
+    var appKitAppearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+private func preferredDockVisibility() -> Bool {
+    let defaults = UserDefaults.standard
+    guard defaults.object(forKey: showInDockDefaultsKey) != nil else { return true }
+    return defaults.bool(forKey: showInDockDefaultsKey)
+}
+
+private func preferredAppearanceMode() -> AppearanceMode {
+    AppearanceMode(rawValue: UserDefaults.standard.integer(forKey: appearanceModeDefaultsKey)) ?? .system
+}
+
 private extension NSToolbarItem.Identifier {
+    static let settings = NSToolbarItem.Identifier("local.codex.token-atlas.settings")
     static let refreshReport = NSToolbarItem.Identifier("local.codex.token-atlas.refresh")
     static let reportStatus = NSToolbarItem.Identifier("local.codex.token-atlas.status")
     static let exportReport = NSToolbarItem.Identifier("local.codex.token-atlas.export")
@@ -16,19 +53,32 @@ private enum AtlasColor {
         NSColor(srgbRed: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: alpha)
     }
 
-    static let canvas = rgb(238, 245, 242)
-    static let surface = rgb(255, 255, 255)
-    static let ink = rgb(16, 42, 42)
-    static let inkSoft = rgb(62, 92, 89)
-    static let muted = rgb(109, 129, 126)
-    static let line = rgb(207, 220, 216)
-    static let lineStrong = rgb(169, 191, 186)
-    static let teal = rgb(8, 121, 104)
-    static let tealDeep = rgb(4, 78, 71)
-    static let coral = rgb(232, 111, 81)
-    static let statusInk = rgb(133, 64, 46)
-    static let amber = rgb(216, 154, 43)
-    static let zero = rgb(229, 236, 233)
+    static func adaptive(light: NSColor, dark: NSColor) -> NSColor {
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        }
+    }
+
+    static let canvas = adaptive(light: rgb(238, 245, 242), dark: rgb(18, 24, 23))
+    static let surface = adaptive(light: rgb(255, 255, 255), dark: rgb(29, 36, 35))
+    static let ink = adaptive(light: rgb(16, 42, 42), dark: rgb(232, 242, 239))
+    static let inkSoft = adaptive(light: rgb(62, 92, 89), dark: rgb(188, 204, 199))
+    static let muted = adaptive(light: rgb(109, 129, 126), dark: rgb(139, 158, 153))
+    static let line = adaptive(light: rgb(207, 220, 216), dark: rgb(51, 64, 61))
+    static let lineStrong = adaptive(light: rgb(169, 191, 186), dark: rgb(76, 93, 89))
+    static let teal = adaptive(light: rgb(8, 121, 104), dark: rgb(58, 194, 163))
+    static let tealDeep = adaptive(light: rgb(4, 78, 71), dark: rgb(106, 224, 194))
+    static let coral = adaptive(light: rgb(232, 111, 81), dark: rgb(245, 139, 110))
+    static let statusInk = adaptive(light: rgb(133, 64, 46), dark: rgb(244, 157, 132))
+    static let amber = adaptive(light: rgb(216, 154, 43), dark: rgb(237, 183, 76))
+    static let zero = adaptive(light: rgb(229, 236, 233), dark: rgb(39, 48, 46))
+    static let onAccent = adaptive(light: rgb(255, 255, 255), dark: rgb(7, 35, 31))
+    static let tooltipSurface = rgb(16, 42, 42)
+    static let tooltipText = rgb(255, 255, 255)
+    static let heatLow = adaptive(light: rgb(220, 235, 230), dark: rgb(34, 48, 45))
+    static let heatMidLow = adaptive(light: rgb(132, 205, 184), dark: rgb(34, 111, 94))
+    static let heatMid = adaptive(light: rgb(24, 146, 122), dark: rgb(27, 178, 143))
+    static let heatHigh = adaptive(light: rgb(3, 78, 70), dark: rgb(74, 220, 180))
 }
 
 private struct Usage: Decodable {
@@ -348,27 +398,38 @@ private func percentile(_ values: [Double], fraction: Double) -> Double {
 private func heatColor(value: Double, cap: Double) -> NSColor {
     guard value > 0, cap > 0 else { return AtlasColor.zero }
     let t = pow(min(value / cap, 1), 0.44)
-    let stops: [(Double, (Double, Double, Double))] = [
+    let lightStops: [(Double, (Double, Double, Double))] = [
         (0, (0.86, 0.92, 0.90)),
         (0.36, (0.49, 0.79, 0.70)),
         (0.70, (0.09, 0.57, 0.48)),
         (1, (0.01, 0.31, 0.27))
     ]
-    var left = stops[0]
-    var right = stops[stops.count - 1]
-    for index in 1..<stops.count where t <= stops[index].0 {
-        left = stops[index - 1]
-        right = stops[index]
-        break
+    let darkStops: [(Double, (Double, Double, Double))] = [
+        (0, (0.13, 0.19, 0.17)),
+        (0.36, (0.12, 0.39, 0.32)),
+        (0.70, (0.08, 0.61, 0.48)),
+        (1, (0.29, 0.86, 0.70))
+    ]
+
+    func interpolate(_ stops: [(Double, (Double, Double, Double))]) -> NSColor {
+        var left = stops[0]
+        var right = stops[stops.count - 1]
+        for index in 1..<stops.count where t <= stops[index].0 {
+            left = stops[index - 1]
+            right = stops[index]
+            break
+        }
+        let span = max(0.0001, right.0 - left.0)
+        let local = (t - left.0) / span
+        return NSColor(
+            srgbRed: left.1.0 + (right.1.0 - left.1.0) * local,
+            green: left.1.1 + (right.1.1 - left.1.1) * local,
+            blue: left.1.2 + (right.1.2 - left.1.2) * local,
+            alpha: 1
+        )
     }
-    let span = max(0.0001, right.0 - left.0)
-    let local = (t - left.0) / span
-    return NSColor(
-        srgbRed: left.1.0 + (right.1.0 - left.1.0) * local,
-        green: left.1.1 + (right.1.1 - left.1.1) * local,
-        blue: left.1.2 + (right.1.2 - left.1.2) * local,
-        alpha: 1
-    )
+
+    return AtlasColor.adaptive(light: interpolate(lightStops), dark: interpolate(darkStops))
 }
 
 private final class HourHeatmapView: NSView {
@@ -528,7 +589,7 @@ private final class CalendarHeatmapView: NSView {
         for (key, rect) in cells {
             let isInside = key >= start && key <= end
             let value = isInside ? Double(usage[key]?.value(for: metricKey) ?? 0) : 0
-            (isInside ? heatColor(value: value, cap: cap) : NSColor(calibratedWhite: 0.94, alpha: 1)).setFill()
+            (isInside ? heatColor(value: value, cap: cap) : AtlasColor.canvas).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
         }
     }
@@ -776,6 +837,7 @@ private final class LiveMonitorPresentation: ObservableObject {
     @Published var snapshot = LiveTokenSnapshot.zero
     @Published var refreshSeconds = 2
     @Published var panelPinned = false
+    @Published var historicalTotalTokens: Int64 = 0
 }
 
 private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
@@ -863,14 +925,41 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
     }
 }
 
+private struct ScaledContent<Content: View>: View {
+    let scale: CGFloat
+    let content: Content
+
+    init(scale: CGFloat, @ViewBuilder content: () -> Content) {
+        self.scale = scale
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            content
+                .frame(
+                    width: geometry.size.width / scale,
+                    height: geometry.size.height / scale,
+                    alignment: .topLeading
+                )
+                .scaleEffect(scale, anchor: .topLeading)
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, ObservableObject {
     private var window: NSWindow!
     private var scrollView: NSScrollView!
     private let toolbarSpinner = NSProgressIndicator()
     private let toolbarStatus = NSTextField(labelWithString: "准备中")
     private var refreshToolbarItem: NSToolbarItem?
+    private weak var settingsToolbarButton: NSButton?
     private weak var liveToolbarButton: NSButton?
     private weak var liveMenuItem: NSMenuItem?
+    private weak var dockMenuItem: NSMenuItem?
+    private let settingsMenu = NSMenu(title: "设置")
+    private var appearanceMenuItems: [AppearanceMode: NSMenuItem] = [:]
+    private var refreshMenuItems: [Int: NSMenuItem] = [:]
     @Published fileprivate var generatorRunning = false
     @Published fileprivate var loadingTitleText = "正在刷新 Token 历史"
     @Published fileprivate var loadingDetailText = "读取本地 Codex 会话并校正 fork 用量…"
@@ -889,6 +978,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var livePanel: LiveMonitorPanel!
     private var liveMonitor: LiveTokenMonitor!
     private var latestLiveSnapshot = LiveTokenSnapshot.zero
+    private var historicalTotalTokens = (UserDefaults.standard.object(forKey: historicalTotalDefaultsKey) as? NSNumber)?.int64Value ?? 0
+    private var historicalDisplayTimer: Timer?
+    private var showsInDock = preferredDockVisibility()
+    private var appearanceMode = preferredAppearanceMode()
 
     private let fileManager = FileManager.default
     private lazy var homeURL = fileManager.homeDirectoryForCurrentUser
@@ -905,13 +998,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.appearance = appearanceMode.appKitAppearance
         pricingMode = PricingMode(rawValue: UserDefaults.standard.integer(forKey: "pricingMode")) ?? .simple
-        let storedRefresh = UserDefaults.standard.integer(forKey: "liveTokenRefreshSeconds")
-        livePresentation.refreshSeconds = [1, 2, 5].contains(storedRefresh) ? storedRefresh : 2
+        let storedRefresh = UserDefaults.standard.integer(forKey: liveRefreshDefaultsKey)
+        livePresentation.refreshSeconds = [1, 2, 5].contains(storedRefresh) ? storedRefresh : 5
+        if ![1, 2, 5].contains(storedRefresh) {
+            UserDefaults.standard.set(5, forKey: liveRefreshDefaultsKey)
+        }
         liveMonitorEnabled = UserDefaults.standard.bool(forKey: "liveTokenMonitorEnabledV2")
+        if !showsInDock && !liveMonitorEnabled {
+            liveMonitorEnabled = true
+            UserDefaults.standard.set(true, forKey: "liveTokenMonitorEnabledV2")
+        }
         configureMainMenu()
         configureWindow()
         configureLiveMonitor()
+        NSApp.setActivationPolicy(showsInDock ? .regular : .accessory)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refreshReport(nil)
@@ -925,6 +1027,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        publishHistoricalTotal()
+        historicalDisplayTimer?.invalidate()
         liveMonitor?.stop()
     }
 
@@ -934,7 +1038,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let appMenu = NSMenu(title: "Codex Token Atlas")
         appMenu.addItem(withTitle: "关于 Codex Token Atlas", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
-        let liveItem = appMenu.addItem(withTitle: "顶部栏 Token 速率", action: #selector(toggleLiveMonitor(_:)), keyEquivalent: "")
+        let liveItem = appMenu.addItem(withTitle: "顶部栏 Token 统计", action: #selector(toggleLiveMonitor(_:)), keyEquivalent: "")
         liveItem.target = self
         liveMenuItem = liveItem
         appMenu.addItem(.separator())
@@ -981,22 +1085,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         mainMenu.addItem(windowMenuItem)
         NSApp.windowsMenu = windowMenu
         NSApp.mainMenu = mainMenu
+        configureSettingsMenu()
+    }
+
+    private func configureSettingsMenu() {
+        settingsMenu.removeAllItems()
+        appearanceMenuItems.removeAll()
+        refreshMenuItems.removeAll()
+
+        let dockItem = settingsMenu.addItem(withTitle: "在程序坞中显示", action: #selector(toggleDockPresence(_:)), keyEquivalent: "")
+        dockItem.target = self
+        dockItem.state = showsInDock ? .on : .off
+        dockMenuItem = dockItem
+        settingsMenu.addItem(.separator())
+
+        let appearanceItem = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
+        let appearanceMenu = NSMenu(title: "外观")
+        for mode in AppearanceMode.allCases {
+            let item = appearanceMenu.addItem(withTitle: mode.title, action: #selector(chooseAppearance(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = mode.rawValue
+            item.state = mode == appearanceMode ? .on : .off
+            appearanceMenuItems[mode] = item
+        }
+        appearanceItem.submenu = appearanceMenu
+        settingsMenu.addItem(appearanceItem)
+
+        let refreshItem = NSMenuItem(title: "实时刷新", action: nil, keyEquivalent: "")
+        let refreshMenu = NSMenu(title: "实时刷新")
+        for seconds in [1, 2, 5] {
+            let item = refreshMenu.addItem(withTitle: "\(seconds) 秒", action: #selector(chooseLiveRefreshMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = seconds
+            item.state = seconds == livePresentation.refreshSeconds ? .on : .off
+            refreshMenuItems[seconds] = item
+        }
+        refreshItem.submenu = refreshMenu
+        settingsMenu.addItem(refreshItem)
     }
 
     private func configureWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 840),
+            contentRect: NSRect(x: 0, y: 0, width: 1152, height: 756),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Codex Token Atlas"
-        window.minSize = NSSize(width: 1100, height: 680)
+        window.minSize = NSSize(width: 990, height: 612)
         window.center()
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: AtlasDashboardView(controller: self))
+        window.contentView = NSHostingView(
+            rootView: ScaledContent(scale: dashboardRenderScale) {
+                AtlasDashboardView(controller: self)
+            }
+        )
 
         let toolbar = NSToolbar(identifier: "local.codex.token-atlas.toolbar.v3")
         toolbar.delegate = self
@@ -1009,6 +1154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func configureLiveMonitor() {
+        livePresentation.historicalTotalTokens = historicalTotalTokens
         livePanel = LiveMonitorPanel(contentSize: NSSize(width: 296, height: 270))
         livePanel.contentViewController = NSHostingController(
             rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
@@ -1024,9 +1170,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             if self.livePanel.isVisible {
                 self.livePresentation.snapshot = snapshot
             }
+            self.historicalTotalTokens += snapshot.intervalUsage.totalTokens
             self.updateStatusItem(rate: snapshot.totalRate)
         }
-        setLiveMonitorEnabled(liveMonitorEnabled, persist: false)
+        setLiveMonitorEnabled(liveMonitorEnabled, persist: false, ensureReachability: false)
+        let historyTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            self?.publishHistoricalTotal()
+        }
+        historyTimer.tolerance = 5
+        RunLoop.main.add(historyTimer, forMode: .common)
+        historicalDisplayTimer = historyTimer
     }
 
     private func installStatusItem() {
@@ -1085,7 +1238,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         setLiveMonitorEnabled(enabled, persist: true)
     }
 
-    private func setLiveMonitorEnabled(_ enabled: Bool, persist: Bool) {
+    private func setLiveMonitorEnabled(_ enabled: Bool, persist: Bool, ensureReachability: Bool = true) {
+        if ensureReachability && !enabled && !showsInDock {
+            applyDockPresence(true, persist: true)
+        }
         liveMonitorEnabled = enabled
         if persist { UserDefaults.standard.set(enabled, forKey: "liveTokenMonitorEnabledV2") }
         liveToolbarButton?.state = enabled ? .on : .off
@@ -1119,6 +1275,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         showMainWindow()
     }
 
+    @objc private func toggleDockPresence(_ sender: Any?) {
+        applyDockPresence(!showsInDock, persist: true)
+    }
+
+    private func applyDockPresence(_ visible: Bool, persist: Bool) {
+        if !visible && !liveMonitorEnabled {
+            setLiveMonitorEnabled(true, persist: true)
+        }
+        showsInDock = visible
+        dockMenuItem?.state = visible ? .on : .off
+        if persist { UserDefaults.standard.set(visible, forKey: showInDockDefaultsKey) }
+        NSApp.setActivationPolicy(visible ? .regular : .accessory)
+        if visible, window.isVisible {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @objc private func chooseAppearance(_ sender: NSMenuItem) {
+        guard let mode = AppearanceMode(rawValue: sender.tag) else { return }
+        appearanceMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: appearanceModeDefaultsKey)
+        NSApp.appearance = mode.appKitAppearance
+        for (candidate, item) in appearanceMenuItems {
+            item.state = candidate == mode ? .on : .off
+        }
+        window.contentView?.needsDisplay = true
+        livePanel.contentView?.needsDisplay = true
+    }
+
+    @objc private func chooseLiveRefreshMenu(_ sender: NSMenuItem) {
+        chooseLiveRefresh(sender.tag)
+    }
+
+    @objc private func showSettingsMenu(_ sender: Any?) {
+        guard let button = settingsToolbarButton else { return }
+        settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: button)
+    }
+
     fileprivate func showMainWindow() {
         if !livePanel.isPinned { livePanel.orderOut(nil) }
         if window.isMiniaturized { window.deminiaturize(nil) }
@@ -1126,11 +1320,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    fileprivate func chooseLiveRefresh(_ seconds: Int) {
+    private func chooseLiveRefresh(_ seconds: Int) {
         guard [1, 2, 5].contains(seconds) else { return }
         livePresentation.refreshSeconds = seconds
-        UserDefaults.standard.set(seconds, forKey: "liveTokenRefreshSeconds")
+        UserDefaults.standard.set(seconds, forKey: liveRefreshDefaultsKey)
+        for (candidate, item) in refreshMenuItems {
+            item.state = candidate == seconds ? .on : .off
+        }
         liveMonitor.setInterval(TimeInterval(seconds))
+    }
+
+    private func publishHistoricalTotal() {
+        livePresentation.historicalTotalTokens = historicalTotalTokens
+        UserDefaults.standard.set(NSNumber(value: historicalTotalTokens), forKey: historicalTotalDefaultsKey)
     }
 
     fileprivate func closeLivePanel() {
@@ -1138,15 +1340,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.refreshReport, .reportStatus, .liveMonitor, .flexibleSpace, .space, .exportReport, .revealExports]
+        [.settings, .refreshReport, .reportStatus, .liveMonitor, .flexibleSpace, .space, .exportReport, .revealExports]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.refreshReport, .liveMonitor, .flexibleSpace, .reportStatus, .flexibleSpace, .exportReport, .revealExports]
+        [.settings, .refreshReport, .liveMonitor, .flexibleSpace, .reportStatus, .flexibleSpace, .exportReport, .revealExports]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch identifier {
+        case .settings:
+            let image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "设置")
+            let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(showSettingsMenu(_:)))
+            button.bezelStyle = .texturedRounded
+            button.controlSize = .regular
+            button.imagePosition = .imageOnly
+            button.toolTip = "设置"
+            button.setAccessibilityLabel("设置")
+            button.widthAnchor.constraint(equalToConstant: 34).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            settingsToolbarButton = button
+            let item = NSToolbarItem(itemIdentifier: identifier)
+            item.label = ""
+            item.paletteLabel = "设置"
+            item.toolTip = "设置"
+            item.view = button
+            return item
         case .refreshReport:
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = ""
@@ -1167,7 +1386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             item.action = #selector(exportReport(_:))
             return item
         case .liveMonitor:
-            let image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "顶部栏 Token 速率")
+            let image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "顶部栏 Token 统计")
             let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(toggleLiveMonitor(_:)))
             button.setButtonType(.toggle)
             button.bezelStyle = .texturedRounded
@@ -1175,15 +1394,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             button.imagePosition = .imageOnly
             button.state = liveMonitorEnabled ? .on : .off
             button.contentTintColor = liveMonitorEnabled ? AtlasColor.teal : .secondaryLabelColor
-            button.toolTip = "显示或隐藏顶部栏 Token 速率"
-            button.setAccessibilityLabel("顶部栏 Token 速率")
+            button.toolTip = "显示或隐藏顶部栏 Token 统计"
+            button.setAccessibilityLabel("顶部栏 Token 统计")
             button.widthAnchor.constraint(equalToConstant: 34).isActive = true
             button.heightAnchor.constraint(equalToConstant: 28).isActive = true
             liveToolbarButton = button
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = ""
-            item.paletteLabel = "顶部栏 Token 速率"
-            item.toolTip = "开启后增量读取 Codex 日志并显示 60 秒 Token 速率"
+            item.paletteLabel = "顶部栏 Token 统计"
+            item.toolTip = "状态栏显示 60 秒实时速率；展开后同时显示历史累计 Token"
             item.view = button
             return item
         case .revealExports:
@@ -1269,6 +1488,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             let data = try Data(contentsOf: summaryURL)
             let loadedDashboard = try JSONDecoder().decode(ReportEnvelope.self, from: data).dashboard
             dashboard = loadedDashboard
+            historicalTotalTokens = max(historicalTotalTokens, loadedDashboard.totals["all"]?.total_tokens ?? 0)
+            publishHistoricalTotal()
             if selectedStartDate == nil || selectedEndDate == nil {
                 selectedStartDate = reportDateFormatter.date(from: loadedDashboard.range.start)
                 selectedEndDate = reportDateFormatter.date(from: loadedDashboard.range.end)
@@ -1377,7 +1598,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         try require(liveEvent?.usage == LiveTokenUsage(inputTokens: 90, cachedInputTokens: 50, outputTokens: 10, totalTokens: 100), "live token parser rejected valid last usage")
         try require(LiveTokenMonitor.parseTokenCountLine(Data(#"{"type":"event_msg","payload":{"type":"agent_message"}}"#.utf8)) == nil, "live token parser accepted a non-token event")
 
-        try require(window.contentView is NSHostingView<AtlasDashboardView>, "window is not backed by native SwiftUI")
+        guard let contentView = window.contentView else {
+            throw NSError(domain: "CodexTokenAtlasSmoke", code: 2, userInfo: [NSLocalizedDescriptionKey: "window has no content view"])
+        }
+        let contentViewClass = String(describing: type(of: contentView))
+        try require(contentViewClass.contains("NSHostingView"), "window is not backed by native SwiftUI")
     }
 
     fileprivate func activeRange(_ data: DashboardData) -> (start: String, end: String) {
@@ -1498,7 +1723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func makeHeader(_ data: DashboardData) -> NSView {
-        let header = SurfaceView(fill: NSColor(calibratedWhite: 1, alpha: 0.98), border: NSColor(calibratedRed: 0.03, green: 0.47, blue: 0.40, alpha: 0.28), radius: 6)
+        let header = SurfaceView(fill: AtlasColor.surface, border: AtlasColor.teal.withAlphaComponent(0.28), radius: 6)
         let eyebrow = makeLabel("LOCAL CODEX TELEMETRY / ASIA SHANGHAI", size: 10, weight: .bold, color: AtlasColor.teal, monospaced: true)
         let title = makeLabel("Token Atlas", size: 48, weight: .bold)
         let range = activeRange(data)
@@ -1560,7 +1785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 8
-        let container = SurfaceView(fill: NSColor(calibratedWhite: 1, alpha: 0.9), border: AtlasColor.line, radius: 5)
+        let container = SurfaceView(fill: AtlasColor.surface, border: AtlasColor.line, radius: 5)
         control.translatesAutoresizingMaskIntoConstraints = false
         stack.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(stack)
@@ -2161,18 +2386,40 @@ private struct LiveTokenPopover: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            historySummary
             rateHeader
             LiveRateChart(samples: snapshot.samples)
-                .frame(height: 46)
+                .frame(height: 40)
             rateBreakdown
             Divider().overlay(Color(nsColor: AtlasColor.line))
-            refreshControl
             statusLine
         }
         .padding(12)
         .frame(width: 296, height: 270)
         .background(Color(nsColor: AtlasColor.canvas))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var historySummary: some View {
+        HStack(alignment: .lastTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("ALL-TIME TOKENS")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color(nsColor: AtlasColor.teal))
+                Text("1 MIN")
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color(nsColor: AtlasColor.muted))
+            }
+            Spacer()
+            Text(shortNumber(presentation.historicalTotalTokens))
+                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color(nsColor: AtlasColor.ink))
+                .help(formatInt(presentation.historicalTotalTokens))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color(nsColor: AtlasColor.surface))
+        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 
     private var rateHeader: some View {
@@ -2189,6 +2436,9 @@ private struct LiveTokenPopover: View {
             Text(isActive ? "ACTIVE" : "IDLE")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.muted))
+            LiveIconButton(symbol: "macwindow", help: "打开 Token Atlas") {
+                controller.showMainWindow()
+            }
             if presentation.panelPinned {
                 LiveIconButton(symbol: "xmark", help: "关闭常驻窗口") {
                     controller.closeLivePanel()
@@ -2205,23 +2455,8 @@ private struct LiveTokenPopover: View {
             LiveRateMetric(label: "OUTPUT", value: snapshot.outputRate, accent: AtlasColor.amber)
         }
         .padding(.vertical, 8)
-        .background(Color.white)
+        .background(Color(nsColor: AtlasColor.surface))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
-    }
-
-    private var refreshControl: some View {
-        HStack(spacing: 12) {
-            Text("检测")
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                .help("日志轮询周期；最近一次扫描耗时 \(String(format: "%.1f ms", snapshot.pollDurationMilliseconds))")
-            AtlasSegmentedControl(
-                items: [(1, "1s"), (2, "2s"), (5, "5s")],
-                selection: Binding(get: { presentation.refreshSeconds }, set: { controller.chooseLiveRefresh($0) })
-            )
-            .frame(width: 180)
-            Spacer()
-        }
     }
 
     private var statusLine: some View {
@@ -2335,7 +2570,7 @@ private struct LiveRateChart: View {
             }
             context.stroke(guides, with: .color(Color(nsColor: AtlasColor.line).opacity(0.7)), style: StrokeStyle(lineWidth: 0.5, dash: [3, 4]))
         }
-        .background(Color.white)
+        .background(Color(nsColor: AtlasColor.surface))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 }
@@ -2427,7 +2662,7 @@ private struct AtlasDashboardView: View {
         return VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Token Atlas")
-                    .font(.custom("Avenir Next", size: 54).weight(.bold))
+                    .font(.custom("Avenir Next", size: 40).weight(.bold))
                     .foregroundStyle(Color(nsColor: AtlasColor.ink))
                 Text("\(range.start) → \(range.end) · \(controller.selectedModel == "all" ? "全部模型" : controller.selectedModel) · \(metric)")
                     .font(.system(size: 15))
@@ -2454,7 +2689,7 @@ private struct AtlasDashboardView: View {
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 34)
-        .background(Color.white)
+        .background(Color(nsColor: AtlasColor.surface))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.teal).opacity(0.22)))
     }
 
@@ -2652,7 +2887,7 @@ private struct AtlasControl<Content: View>: View {
         .padding(.leading, 13)
         .padding(.trailing, 8)
         .padding(.vertical, 6)
-        .background(Color.white)
+        .background(Color(nsColor: AtlasColor.surface))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
     }
 }
@@ -2708,7 +2943,7 @@ private struct AtlasSegmentedControl<Value: Hashable>: View {
                 } label: {
                     Text(item.title)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(selection == item.value ? Color.white : Color(nsColor: AtlasColor.inkSoft))
+                        .foregroundStyle(selection == item.value ? Color(nsColor: AtlasColor.onAccent) : Color(nsColor: AtlasColor.inkSoft))
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, minHeight: 30)
                         .contentShape(Rectangle())
@@ -2941,7 +3176,7 @@ private struct HourlyHeatmap: View {
             }
             HStack(spacing: 8) {
                 Text("0")
-                LinearGradient(colors: [Color(red: 220 / 255, green: 235 / 255, blue: 230 / 255), Color(red: 132 / 255, green: 205 / 255, blue: 184 / 255), Color(red: 24 / 255, green: 146 / 255, blue: 122 / 255), Color(red: 3 / 255, green: 78 / 255, blue: 70 / 255)], startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [AtlasColor.heatLow, AtlasColor.heatMidLow, AtlasColor.heatMid, AtlasColor.heatHigh].map { Color(nsColor: $0) }, startPoint: .leading, endPoint: .trailing)
                     .frame(width: 180, height: 9)
                     .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.tealDeep).opacity(0.12)))
                 Text(shortNumber(Int64(cap)))
@@ -3016,12 +3251,12 @@ private struct AtlasTooltipBubble: View {
     var body: some View {
         Text(text)
             .font(.system(size: 11, weight: .medium, design: .monospaced))
-            .foregroundStyle(Color.white)
+            .foregroundStyle(Color(nsColor: AtlasColor.tooltipText))
             .multilineTextAlignment(.leading)
             .fixedSize(horizontal: true, vertical: true)
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
-            .background(Color(nsColor: AtlasColor.ink).opacity(0.97))
+            .background(Color(nsColor: AtlasColor.tooltipSurface).opacity(0.97))
             .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.coral), lineWidth: 1))
             .allowsHitTesting(false)
     }
@@ -3164,7 +3399,7 @@ private struct DailyHeatmap: View {
             }
             HStack(spacing: 8) {
                 Text("0")
-                LinearGradient(colors: [Color(red: 220 / 255, green: 235 / 255, blue: 230 / 255), Color(red: 132 / 255, green: 205 / 255, blue: 184 / 255), Color(red: 24 / 255, green: 146 / 255, blue: 122 / 255), Color(red: 3 / 255, green: 78 / 255, blue: 70 / 255)], startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [AtlasColor.heatLow, AtlasColor.heatMidLow, AtlasColor.heatMid, AtlasColor.heatHigh].map { Color(nsColor: $0) }, startPoint: .leading, endPoint: .trailing)
                     .frame(width: 180, height: 9)
                     .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.tealDeep).opacity(0.12)))
                 Text(shortNumber(Int64(cap)))
@@ -3236,7 +3471,8 @@ enum CodexTokenAtlasMain {
 
     static func main() {
         let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
+        application.setActivationPolicy(preferredDockVisibility() ? .regular : .accessory)
+        application.appearance = preferredAppearanceMode().appKitAppearance
         application.delegate = delegate
         application.run()
     }
