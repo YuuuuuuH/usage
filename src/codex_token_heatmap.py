@@ -602,11 +602,50 @@ def fmt_short(value: int) -> str:
     return str(value)
 
 
-def clean_text(value: str | None, limit: int | None = None) -> str:
-    text = " ".join((value or "").split())
+def clean_text(value: Any, limit: int | None = None) -> str:
+    if isinstance(value, str):
+        raw_text = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        raw_text = str(value)
+    else:
+        raw_text = ""
+    text = " ".join(raw_text.split())
     if limit is not None and len(text) > limit:
         return text[: max(0, limit - 1)].rstrip() + "…"
     return text
+
+
+def source_text(value: Any, limit: int = 200) -> str:
+    direct = clean_text(value, limit)
+    if direct or not isinstance(value, (dict, list)):
+        return direct
+
+    parts: list[str] = []
+
+    def append_part(part: Any) -> None:
+        text = clean_text(part)
+        if text and text not in parts:
+            parts.append(text)
+
+    def visit(node: Any, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                key_text = clean_text(key)
+                if isinstance(child, (dict, list)):
+                    append_part(key_text)
+                    visit(child, depth + 1)
+                elif key_text in {"type", "kind", "name", "source", "origin"}:
+                    append_part(child)
+                elif depth == 0:
+                    append_part(key_text)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child, depth + 1)
+
+    visit(value)
+    return clean_text(" / ".join(parts), limit)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -646,6 +685,8 @@ def read_session_index_names(path: Path = SESSION_INDEX) -> dict[str, str]:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
                 continue
             thread_id = str(row.get("id") or "")
             thread_name = clean_text(row.get("thread_name"))
@@ -731,11 +772,20 @@ def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
                 if metadata:
                     break
                 continue
+            if not isinstance(obj, dict):
+                if metadata:
+                    break
+                continue
             if obj.get("type") != "session_meta":
                 if metadata:
                     break
                 continue
-            payload = obj.get("payload") or {}
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                if metadata:
+                    break
+                continue
+            source = payload.get("source") or payload.get("thread_source")
             metadata.append(
                 {
                     "id": str(payload.get("id") or ""),
@@ -744,7 +794,7 @@ def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
                     "model_provider": clean_text(payload.get("model_provider")),
                     "cli_version": clean_text(payload.get("cli_version")),
                     "originator": clean_text(payload.get("originator")),
-                    "source": clean_text(payload.get("source") or payload.get("thread_source")),
+                    "source": source_text(source),
                     "context_window": safe_int(payload.get("context_window")),
                 }
             )
@@ -901,8 +951,12 @@ def active_model_from_context(payload: dict[str, Any]) -> str:
     direct = clean_text(payload.get("model"))
     if direct:
         return direct
-    collaboration = payload.get("collaboration_mode") or {}
-    settings = collaboration.get("settings") or {}
+    collaboration = payload.get("collaboration_mode")
+    if not isinstance(collaboration, dict):
+        return ""
+    settings = collaboration.get("settings")
+    if not isinstance(settings, dict):
+        return ""
     return clean_text(settings.get("model"))
 
 
@@ -910,8 +964,12 @@ def active_effort_from_context(payload: dict[str, Any]) -> str:
     direct = clean_text(payload.get("effort") or payload.get("reasoning_effort"))
     if direct:
         return direct
-    collaboration = payload.get("collaboration_mode") or {}
-    settings = collaboration.get("settings") or {}
+    collaboration = payload.get("collaboration_mode")
+    if not isinstance(collaboration, dict):
+        return ""
+    settings = collaboration.get("settings")
+    if not isinstance(settings, dict):
+        return ""
     return clean_text(settings.get("reasoning_effort"))
 
 
@@ -1381,11 +1439,17 @@ def collect_usage(
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
 
-                payload = obj.get("payload") or {}
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
                 obj_type = obj.get("type")
                 if obj_type == "event_msg" and payload.get("type") == "thread_settings_applied":
-                    settings = payload.get("thread_settings") or {}
+                    settings = payload.get("thread_settings")
+                    if not isinstance(settings, dict):
+                        continue
                     settings_model = clean_text(settings.get("model"))
                     if settings_model:
                         active_model = settings_model
@@ -3065,7 +3129,11 @@ def run_self_test() -> None:
         parent_id = "00000000-0000-4000-8000-000000000001"
         child_id = "00000000-0000-4000-8000-000000000002"
 
-        def meta(session_id: str, parent: str = "") -> str:
+        def meta(
+            session_id: str,
+            parent: str = "",
+            source: Any = "cli",
+        ) -> str:
             return synthetic_event(
                 "2026-01-01T00:00:00Z",
                 "session_meta",
@@ -3076,7 +3144,7 @@ def run_self_test() -> None:
                     "model_provider": "OpenAI",
                     "cli_version": "0.test",
                     "originator": "codex_cli_rs",
-                    "source": "cli",
+                    "source": source,
                 },
             )
 
@@ -3165,7 +3233,11 @@ def run_self_test() -> None:
             usage_event(150, second_last, "2026-01-01T01:00:02Z"),
         ]
         child_lines = [
-            meta(child_id, parent_id),
+            meta(
+                child_id,
+                parent_id,
+                {"subagent": {"thread_spawn": {"parent_thread_id": parent_id}}},
+            ),
             meta(parent_id),
             context("turn-a", "gpt-a", "2026-01-02T00:00:01Z"),
             usage_event(100, first_last, "2026-01-02T00:00:02Z"),
@@ -3206,6 +3278,13 @@ def run_self_test() -> None:
         assert report.inherited_events == 2
         assert report.local_duplicate_events == 1
         assert report.fallback_delta_events == 1
+        child_stats = next(
+            stats
+            for stats in report.sessions
+            if stats.descriptor.session_id == child_id
+        )
+        assert child_stats.descriptor.source == "subagent / thread_spawn"
+        assert clean_text({"unexpected": "object"}) == ""
         assert pricing_for_model("gpt-5.6-luna-2026-07-01")[0] == "gpt-5.6-luna"
         assert pricing_for_model("gpt-4o-mini-2024-07-18")[0] == "gpt-4o-mini"
         assert pricing_for_model("gpt-4o-2024-05-13")[0] == "gpt-4o-2024-05-13"
