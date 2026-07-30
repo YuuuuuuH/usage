@@ -54,7 +54,7 @@ enum LiveTokenMonitorTests {
         }
         monitor.stop()
         try require(snapshots.last?.windowUsage.totalTokens == 100, "appended usage was not sampled")
-        try require(abs((snapshots.last?.totalRate ?? 0) - (100.0 / 30.0)) < 0.0001, "rolling rate denominator differs")
+        try require(abs((snapshots.last?.totalRate ?? 0) - (100.0 / 60.0)) < 0.0001, "rolling rate denominator differs")
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

@@ -28,7 +28,7 @@ struct LiveTokenUsage: Equatable {
 }
 
 struct LiveTokenSnapshot {
-    static let windowSeconds: TimeInterval = 30
+    static let windowSeconds: TimeInterval = 60
     static let zero = LiveTokenSnapshot(
         totalRate: 0,
         inputRate: 0,

@@ -22,6 +22,7 @@ SESSIONS_ROOT = HOME / ".codex" / "sessions"
 STATE_DB = HOME / ".codex" / "state_5.sqlite"
 SESSION_INDEX = HOME / ".codex" / "session_index.jsonl"
 AUTH_FILE = HOME / ".codex" / "auth.json"
+CONFIG_FILE = HOME / ".codex" / "config.toml"
 MODEL_ALIASES_FILE = HOME / ".codex" / "token_atlas_pricing.json"
 
 OUTPUT_HTML = HOME / "codex_token_heatmap.html"
@@ -514,6 +515,7 @@ class SessionStats:
 @dataclass
 class UsageReport:
     sessions: list[SessionStats]
+    configured_service_tier_fallback: str = DEFAULT_SERVICE_TIER
     pricing_catalog: dict[str, dict[str, Any]] = field(default_factory=dict)
     pricing_aliases: dict[str, str] = field(default_factory=dict)
     pricing_config_errors: list[str] = field(default_factory=list)
@@ -922,6 +924,36 @@ def normalize_service_tier(value: Any) -> str:
     return normalized
 
 
+def read_configured_service_tier(config_file: Path = CONFIG_FILE) -> str:
+    if not config_file.exists():
+        return DEFAULT_SERVICE_TIER
+
+    try:
+        try:
+            import tomllib  # type: ignore[import-not-found]
+        except ImportError:
+            tomllib = None  # type: ignore[assignment]
+
+        if tomllib is not None:
+            with config_file.open("rb") as fh:
+                config = tomllib.load(fh)
+            return normalize_service_tier(config.get("service_tier"))
+
+        for raw_line in config_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("["):
+                break
+            match = re.fullmatch(
+                r"service_tier\s*=\s*(['\"])([^'\"]+)\1\s*(?:#.*)?",
+                line,
+            )
+            if match:
+                return normalize_service_tier(match.group(2))
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SERVICE_TIER
+
+
 def normalize_provider(value: Any) -> str:
     provider = clean_text(str(value or ""))
     canonical = {
@@ -1304,13 +1336,20 @@ def add_usage(
 def collect_usage(
     sessions_root: Path = SESSIONS_ROOT,
     thread_info: dict[str, ThreadInfo] | None = None,
+    fallback_service_tier: str | None = None,
 ) -> UsageReport:
     if thread_info is None:
         thread_info = read_thread_info()
     descriptors = discover_sessions(sessions_root, thread_info)
     model_aliases, pricing_errors = read_model_aliases()
+    configured_service_tier = normalize_service_tier(
+        fallback_service_tier
+        if fallback_service_tier is not None
+        else read_configured_service_tier()
+    )
     report = UsageReport(
         sessions=[],
+        configured_service_tier_fallback=configured_service_tier,
         pricing_catalog=dict(PRICING_USD_PER_MTOK),
         pricing_aliases=model_aliases,
         pricing_config_errors=pricing_errors,
@@ -1326,7 +1365,7 @@ def collect_usage(
         active_turn = ""
         active_model = ""
         active_provider = normalize_provider(descriptor.model_provider)
-        active_service_tier = DEFAULT_SERVICE_TIER
+        active_service_tier = configured_service_tier
         active_reasoning_effort = ""
         provider_from_event = bool(descriptor.model_provider)
         service_tier_from_event = False
@@ -1612,7 +1651,11 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
         "scopes": scopes,
         "models": model_details,
         "routes": route_details,
-        "billing_context": read_billing_context(),
+        "billing_context": {
+            **read_billing_context(),
+            "configured_service_tier_fallback": report.configured_service_tier_fallback,
+            "inferred_service_tier_calls": report.fallback_service_tier_events,
+        },
         "model_aliases": {
             "path": str(MODEL_ALIASES_FILE),
             "aliases": len(report.pricing_aliases),
@@ -1845,6 +1888,7 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
             "missing_timestamp_events": report.missing_timestamp_events,
             "fallback_provider_events": report.fallback_provider_events,
             "fallback_service_tier_events": report.fallback_service_tier_events,
+            "configured_service_tier_fallback": report.configured_service_tier_fallback,
             "pricing_config_errors": len(report.pricing_config_errors),
             "sqlite_threads_total_tokens": report.sqlite_threads_total_tokens,
         },
@@ -2646,7 +2690,10 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       ? ` 已加载 ${pricing.model_aliases.aliases} 个官方模型别名映射。`
       : " 可用 ~/.codex/token_atlas_pricing.json 将内部模型名映射到内置官方型号；不接受中转站自定义单价。";
     const configErrorNote = pricing.model_aliases.errors.length ? ` 模型映射配置有 ${pricing.model_aliases.errors.length} 个错误。` : "";
-    document.getElementById("costMethod").textContent = `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`;
+    const inferredTier = pricing.billing_context?.configured_service_tier_fallback === "priority" ? "Fast/Priority" : (pricing.billing_context?.configured_service_tier_fallback || "Default");
+    const inferredTierCalls = Number(pricing.billing_context?.inferred_service_tier_calls || 0);
+    const inferredTierNote = inferredTierCalls ? ` 日志缺失 tier 的 ${fmt(inferredTierCalls)} 次调用按当前 Codex 配置 ${inferredTier} 推断。` : "";
+    document.getElementById("costMethod").textContent = `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`;
     const sourceMap = new Map();
     pricing.sources.forEach(item => {
       if (!sourceMap.has(item.url)) sourceMap.set(item.url, []);
@@ -2966,6 +3013,7 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
             "missing_timestamp_events": report.missing_timestamp_events,
             "fallback_provider_events": report.fallback_provider_events,
             "fallback_service_tier_events": report.fallback_service_tier_events,
+            "configured_service_tier_fallback": report.configured_service_tier_fallback,
             "pricing_config_errors": report.pricing_config_errors,
             "sqlite_threads_total_tokens_reference_only": report.sqlite_threads_total_tokens,
         },
@@ -3139,7 +3187,11 @@ def run_self_test() -> None:
             encoding="utf-8",
         )
 
-        report = collect_usage(root, thread_info={})
+        report = collect_usage(
+            root,
+            thread_info={},
+            fallback_service_tier=DEFAULT_SERVICE_TIER,
+        )
         assert report.totals["total_tokens"] == 200
         assert report.totals["unclassified_tokens"] == 30
         assert report.totals["calls"] == 4
@@ -3180,6 +3232,17 @@ def run_self_test() -> None:
         assert priority_cost["priority_tier_calls"] == 1
         assert normalize_service_tier("fast") == "priority"
         assert normalize_provider("openai") == "OpenAI"
+        config_file = Path(temp_dir) / "config.toml"
+        config_file.write_text(
+            'service_tier = "fast"\n\n[projects."/tmp"]\nservice_tier = "default"\n',
+            encoding="utf-8",
+        )
+        assert read_configured_service_tier(config_file) == "priority"
+        config_file.write_text(
+            '[projects."/tmp"]\nservice_tier = "fast"\n',
+            encoding="utf-8",
+        )
+        assert read_configured_service_tier(config_file) == DEFAULT_SERVICE_TIER
 
         gemini_pricing = pricing_for_model("gemini-2.5-pro")[1]
         gemini_standard, gemini_long = standard_rates_for_usage(

@@ -191,6 +191,7 @@ private struct AuditData: Decodable {
     let fallback_model_events: Int
     let fallback_provider_events: Int
     let fallback_service_tier_events: Int
+    let configured_service_tier_fallback: String?
     let repaired_total_events: Int
     let missing_timestamp_events: Int
     let pricing_config_errors: Int
@@ -579,6 +580,17 @@ private func formatTokenRate(_ value: Double) -> String {
     return String(format: "%.2f", value)
 }
 
+private func formatStatusTokenRate(_ value: Double) -> String {
+    if value >= 1_000_000_000 { return String(format: "%.0fB", value / 1_000_000_000) }
+    if value >= 100_000_000 { return String(format: "%.0fM", value / 1_000_000) }
+    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+    if value >= 100_000 { return String(format: "%.0fK", value / 1_000) }
+    if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+    if value >= 100 { return String(format: "%.0f", value) }
+    if value >= 10 { return String(format: "%.1f", value) }
+    return String(format: "%.2f", value)
+}
+
 private func formatUSD(_ value: Double) -> String {
     NumberFormatter.currency.string(from: NSNumber(value: value)) ?? "$0.00"
 }
@@ -761,30 +773,24 @@ private let reportDateFormatter: DateFormatter = {
 }()
 
 private final class LiveStatusBarView: NSView {
-    private let titleField = NSTextField(labelWithString: "TOK/S")
+    private let titleField = NSTextField(labelWithString: "Tokens")
     private let valueField = NSTextField(labelWithString: "0.00")
-    private let activityDot = NSView()
     var onClick: (() -> Void)?
 
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        titleField.font = NSFont.systemFont(ofSize: 7.5, weight: .semibold)
-        titleField.textColor = .secondaryLabelColor
+        titleField.font = NSFont.monospacedSystemFont(ofSize: 6, weight: .medium)
+        titleField.textColor = .labelColor
         titleField.alignment = .center
         titleField.lineBreakMode = .byClipping
-        valueField.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold)
+        valueField.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
         valueField.textColor = .labelColor
         valueField.alignment = .center
         valueField.lineBreakMode = .byClipping
-        activityDot.wantsLayer = true
-        activityDot.layer?.cornerRadius = 2
-        activityDot.layer?.backgroundColor = NSColor.systemGreen.cgColor
-        activityDot.isHidden = true
         addSubview(titleField)
         addSubview(valueField)
-        addSubview(activityDot)
     }
 
     required init?(coder: NSCoder) {
@@ -800,15 +806,12 @@ private final class LiveStatusBarView: NSView {
 
     override func layout() {
         super.layout()
-        let textX: CGFloat = 7
-        titleField.frame = NSRect(x: textX, y: 0, width: max(0, bounds.width - textX - 2), height: 10)
-        valueField.frame = NSRect(x: textX, y: 9, width: max(0, bounds.width - textX - 2), height: 14)
-        activityDot.frame = NSRect(x: 2, y: 14, width: 4, height: 4)
+        titleField.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 9)
+        valueField.frame = NSRect(x: 0, y: 8, width: bounds.width, height: 14)
     }
 
-    func update(rate: Double, active: Bool) {
-        valueField.stringValue = formatTokenRate(rate)
-        activityDot.isHidden = !active
+    func update(rate: Double) {
+        valueField.stringValue = formatStatusTokenRate(rate)
     }
 }
 
@@ -891,6 +894,8 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
     private func setPinned(_ pinned: Bool) {
         guard isPinned != pinned else { return }
         isPinned = pinned
+        level = pinned ? .normal : .floating
+        collectionBehavior = pinned ? [.moveToActiveSpace] : [.moveToActiveSpace, .fullScreenAuxiliary]
         pinnedChanged?(pinned)
     }
 }
@@ -901,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private let toolbarSpinner = NSProgressIndicator()
     private let toolbarStatus = NSTextField(labelWithString: "准备中")
     private var refreshToolbarItem: NSToolbarItem?
-    private weak var liveToolbarSwitch: NSSwitch?
+    private weak var liveToolbarButton: NSButton?
     private weak var liveMenuItem: NSMenuItem?
     @Published fileprivate var generatorRunning = false
     @Published fileprivate var loadingTitleText = "正在刷新 Token 历史"
@@ -1024,19 +1029,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             defer: false
         )
         window.title = "Codex Token Atlas"
-        window.subtitle = "Native AppKit · Fork-safe · Route-aware"
         window.minSize = NSSize(width: 1100, height: 680)
         window.center()
         window.isReleasedWhenClosed = false
+        window.isRestorable = false
         window.delegate = self
         window.contentView = NSHostingView(rootView: AtlasDashboardView(controller: self))
 
-        let toolbar = NSToolbar(identifier: "local.codex.token-atlas.toolbar.v2")
+        let toolbar = NSToolbar(identifier: "local.codex.token-atlas.toolbar.v3")
         toolbar.delegate = self
-        toolbar.displayMode = .iconAndLabel
-        toolbar.allowsUserCustomization = true
-        toolbar.autosavesConfiguration = true
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
         window.toolbar = toolbar
+        toolbar.displayMode = .iconOnly
         window.toolbarStyle = .unified
     }
 
@@ -1049,8 +1055,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         liveMonitor = LiveTokenMonitor(sessionRoot: sessionRoot) { [weak self] snapshot in
             guard let self else { return }
             self.liveSnapshot = snapshot
-            let isActive = snapshot.lastEventAt.map { Date().timeIntervalSince($0) <= LiveTokenSnapshot.windowSeconds } ?? false
-            self.liveStatusView?.update(rate: snapshot.totalRate, active: isActive)
+            self.liveStatusView?.update(rate: snapshot.totalRate)
             self.statusItem?.button?.setAccessibilityLabel("Token rate \(formatTokenRate(snapshot.totalRate)) tokens per second")
         }
         setLiveMonitorEnabled(liveMonitorEnabled, persist: false)
@@ -1058,14 +1063,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func installStatusItem() {
         guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: 62)
+        let item = NSStatusBar.system.statusItem(withLength: 30)
         statusItem = item
         guard let button = item.button else { return }
         button.title = ""
         button.image = nil
         button.target = self
         button.action = #selector(toggleLivePopover(_:))
-        button.toolTip = "Token Rate · 30 秒滚动平均"
+        button.toolTip = "Token Rate · 60 秒滚动平均"
         let statusView = LiveStatusBarView(frame: button.bounds)
         liveStatusView = statusView
         statusView.autoresizingMask = [.width, .height]
@@ -1075,14 +1080,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     @objc private func toggleLiveMonitor(_ sender: Any?) {
-        let enabled = (sender as? NSSwitch).map { $0.state == .on } ?? !liveMonitorEnabled
+        let enabled = (sender as? NSButton).map { $0.state == .on } ?? !liveMonitorEnabled
         setLiveMonitorEnabled(enabled, persist: true)
     }
 
     private func setLiveMonitorEnabled(_ enabled: Bool, persist: Bool) {
         liveMonitorEnabled = enabled
         if persist { UserDefaults.standard.set(enabled, forKey: "liveTokenMonitorEnabledV2") }
-        liveToolbarSwitch?.state = enabled ? .on : .off
+        liveToolbarButton?.state = enabled ? .on : .off
+        liveToolbarButton?.contentTintColor = enabled ? AtlasColor.teal : .secondaryLabelColor
         liveMenuItem?.state = enabled ? .on : .off
         if enabled {
             installStatusItem()
@@ -1140,7 +1146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         switch identifier {
         case .refreshReport:
             let item = NSToolbarItem(itemIdentifier: identifier)
-            item.label = "刷新"
+            item.label = ""
+            item.paletteLabel = "刷新"
             item.toolTip = "重新扫描本地 Codex 会话 (⌘R)"
             item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新统计")
             item.target = self
@@ -1149,34 +1156,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             return item
         case .exportReport:
             let item = NSToolbarItem(itemIdentifier: identifier)
-            item.label = "导出"
+            item.label = ""
+            item.paletteLabel = "导出"
             item.toolTip = "选择格式和保存位置"
             item.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: "导出")
             item.target = self
             item.action = #selector(exportReport(_:))
             return item
         case .liveMonitor:
-            let toggle = NSSwitch()
-            toggle.controlSize = .small
-            toggle.state = liveMonitorEnabled ? .on : .off
-            toggle.target = self
-            toggle.action = #selector(toggleLiveMonitor(_:))
-            liveToolbarSwitch = toggle
-            let label = NSTextField(labelWithString: "顶部栏")
-            label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            label.textColor = .secondaryLabelColor
-            let stack = NSStackView(views: [label, toggle])
-            stack.orientation = .horizontal
-            stack.alignment = .centerY
-            stack.spacing = 7
+            let image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "顶部栏 Token 速率")
+            let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(toggleLiveMonitor(_:)))
+            button.setButtonType(.toggle)
+            button.bezelStyle = .texturedRounded
+            button.controlSize = .regular
+            button.imagePosition = .imageOnly
+            button.state = liveMonitorEnabled ? .on : .off
+            button.contentTintColor = liveMonitorEnabled ? AtlasColor.teal : .secondaryLabelColor
+            button.toolTip = "显示或隐藏顶部栏 Token 速率"
+            button.setAccessibilityLabel("顶部栏 Token 速率")
+            button.widthAnchor.constraint(equalToConstant: 34).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            liveToolbarButton = button
             let item = NSToolbarItem(itemIdentifier: identifier)
-            item.label = "顶部栏速率"
-            item.toolTip = "开启后增量读取 Codex 日志并显示 30 秒 Token 速率"
-            item.view = stack
+            item.label = ""
+            item.paletteLabel = "顶部栏 Token 速率"
+            item.toolTip = "开启后增量读取 Codex 日志并显示 60 秒 Token 速率"
+            item.view = button
             return item
         case .revealExports:
             let item = NSToolbarItem(itemIdentifier: identifier)
-            item.label = "文件"
+            item.label = ""
+            item.paletteLabel = "文件"
             item.toolTip = "显示生成器的中间文件"
             item.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "显示文件")
             item.target = self
@@ -1195,7 +1205,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             stack.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.view = stack
-            item.label = "状态"
+            item.label = ""
+            item.paletteLabel = "状态"
             return item
         default:
             return nil
@@ -2171,14 +2182,9 @@ private struct LiveTokenPopover: View {
                 .font(.system(size: 14, weight: .bold, design: .monospaced))
                 .foregroundStyle(Color(nsColor: AtlasColor.teal))
             Spacer(minLength: 4)
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(isActive ? Color.green : Color(nsColor: AtlasColor.lineStrong))
-                    .frame(width: 6, height: 6)
-                Text(isActive ? "ACTIVE" : "IDLE")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.muted))
-            }
+            Text(isActive ? "ACTIVE" : "IDLE")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.muted))
             if controller.livePanelPinned {
                 LiveIconButton(symbol: "xmark", help: "关闭常驻窗口") {
                     controller.closeLivePanel()
@@ -2221,7 +2227,7 @@ private struct LiveTokenPopover: View {
                 .foregroundStyle(Color(nsColor: AtlasColor.teal))
             Text("\(snapshot.monitoredFiles) · \(String(format: "%.1fms", snapshot.pollDurationMilliseconds))")
             Spacer()
-            Text("30s \(shortNumber(snapshot.windowUsage.totalTokens))")
+            Text("60s \(shortNumber(snapshot.windowUsage.totalTokens))")
             Text("·")
             Text(lastEventLabel)
         }
@@ -2326,61 +2332,62 @@ private struct LiveRateChart: View {
             context.stroke(guides, with: .color(Color(nsColor: AtlasColor.line).opacity(0.7)), style: StrokeStyle(lineWidth: 0.5, dash: [3, 4]))
         }
         .background(Color.white.opacity(0.52))
-        .overlay(alignment: .topLeading) {
-            Text("30S ROLLING RATE")
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                .padding(.horizontal, 4)
-                .padding(.vertical, 3)
-                .background(Color.white.opacity(0.86))
-                .padding(5)
-        }
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 }
 
 private struct AtlasDashboardView: View {
     @ObservedObject var controller: AppDelegate
+    @State private var didResetInitialScroll = false
 
     var body: some View {
         ZStack {
             AtlasGridBackground()
             if let data = controller.dashboard {
-                ScrollView(.vertical) {
-                    VStack(spacing: 14) {
-                        hero(data)
-                        stats(data)
-                        AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
-                            HourlyHeatmap(data: data, controller: controller)
-                        }
-                        AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
-                            DailyHeatmap(data: data, controller: controller)
-                        }
-                        HStack(alignment: .top, spacing: 14) {
-                            AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
-                                modelTable(data)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(spacing: 14) {
+                            hero(data)
+                                .id("dashboard-top")
+                            stats(data)
+                            AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
+                                HourlyHeatmap(data: data, controller: controller)
                             }
-                            AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
-                                topDaysTable(data)
+                            AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
+                                DailyHeatmap(data: data, controller: controller)
                             }
+                            HStack(alignment: .top, spacing: 14) {
+                                AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
+                                    modelTable(data)
+                                }
+                                AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
+                                    topDaysTable(data)
+                                }
+                            }
+                            sessionPanel(data)
+                            pricingPanel(data)
+                            auditPanel(data)
+                            HStack {
+                                Text("Generated \(data.generated_at_label) · \(data.timezone)")
+                                Spacer()
+                                Text("Native SwiftUI · JSON / HTML / CSV export")
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                            .padding(.horizontal, 4)
                         }
-                        sessionPanel(data)
-                        pricingPanel(data)
-                        auditPanel(data)
-                        HStack {
-                            Text("Generated \(data.generated_at_label) · \(data.timezone)")
-                            Spacer()
-                            Text("Native SwiftUI · JSON / HTML / CSV export")
-                        }
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                        .padding(.horizontal, 4)
+                        .frame(minWidth: 1040, maxWidth: 1420)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 24)
+                        .padding(.bottom, 50)
                     }
-                    .frame(minWidth: 1040, maxWidth: 1420)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 24)
-                    .padding(.bottom, 50)
+                    .onAppear {
+                        resetInitialScroll(proxy)
+                    }
+                    .onChange(of: controller.generatorRunning) { running in
+                        if !running { resetInitialScroll(proxy) }
+                    }
                 }
             }
             if controller.generatorRunning {
@@ -2388,6 +2395,14 @@ private struct AtlasDashboardView: View {
             }
         }
         .background(Color(nsColor: AtlasColor.canvas))
+    }
+
+    private func resetInitialScroll(_ proxy: ScrollViewProxy) {
+        guard !didResetInitialScroll, !controller.generatorRunning else { return }
+        didResetInitialScroll = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            proxy.scrollTo("dashboard-top", anchor: .top)
+        }
     }
 
     private var loadingOverlay: some View {
@@ -2406,32 +2421,14 @@ private struct AtlasDashboardView: View {
         let range = controller.activeRange(data)
         let metric = MetricOption.all.first(where: { $0.key == controller.selectedMetric })?.title ?? "Total tokens"
         return VStack(alignment: .leading, spacing: 0) {
-            Text("LOCAL CODEX TELEMETRY / ASIA SHANGHAI")
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(nsColor: AtlasColor.teal))
-            HStack(alignment: .bottom, spacing: 24) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Token Atlas")
-                        .font(.custom("Avenir Next", size: 54).weight(.bold))
-                        .foregroundStyle(Color(nsColor: AtlasColor.ink))
-                    Text("\(range.start) → \(range.end) · \(controller.selectedModel == "all" ? "全部模型" : controller.selectedModel) · \(metric)")
-                        .font(.system(size: 15))
-                        .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
-                }
-                Spacer()
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("FORK SAFE")
-                    Text("MODEL / ROUTE AWARE")
-                    Text("HOURLY RESOLUTION")
-                }
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(nsColor: AtlasColor.statusInk))
-                .padding(.vertical, 11)
-                .padding(.horizontal, 14)
-                .background(Color(nsColor: AtlasColor.coral).opacity(0.08))
-                .overlay(alignment: .leading) { Rectangle().fill(Color(nsColor: AtlasColor.coral)).frame(width: 3) }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Token Atlas")
+                    .font(.custom("Avenir Next", size: 54).weight(.bold))
+                    .foregroundStyle(Color(nsColor: AtlasColor.ink))
+                Text("\(range.start) → \(range.end) · \(controller.selectedModel == "all" ? "全部模型" : controller.selectedModel) · \(metric)")
+                    .font(.system(size: 15))
+                    .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
             }
-            .padding(.top, 10)
             HStack(spacing: 10) {
                 AtlasControl(label: "模型") {
                     AtlasPopup(
@@ -2449,9 +2446,9 @@ private struct AtlasDashboardView: View {
                 }
                 Spacer()
             }
-            .padding(.top, 24)
+            .padding(.top, 18)
         }
-        .padding(.vertical, 27)
+        .padding(.vertical, 22)
         .padding(.horizontal, 34)
         .background(LinearGradient(colors: [Color.white.opacity(0.96), Color(red: 241 / 255, green: 250 / 255, blue: 247 / 255).opacity(0.88)], startPoint: .topLeading, endPoint: .bottomTrailing))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.teal).opacity(0.22)))
@@ -2549,7 +2546,9 @@ private struct AtlasDashboardView: View {
                     MetricCard(title: "CACHE SAVINGS", value: formatUSD(cost.cache_savings_usd), detail: "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write", accent: AtlasColor.amber)
                 }
                 AtlasTable(headers: ["PROVIDER", "MODEL", "TIER", "PRICED AS", "VALUE", "INPUT", "CACHE", "OUTPUT", "CALLS", "UNPRICED"], rows: routes, widths: [110, 145, 140, 200, 110, 75, 75, 75, 75, 95])
-                Text(controller.pricingMode == .simple ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。" : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。")
+                Text(controller.pricingMode == .simple
+                    ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
+                    : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前 Codex 配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
                     .font(.system(size: 11))
                     .foregroundStyle(Color(nsColor: AtlasColor.muted))
                     .textSelection(.enabled)
@@ -2610,6 +2609,10 @@ private struct AtlasDashboardView: View {
                 }
             }
         }
+    }
+
+    private func tierLabel(_ tier: String?) -> String {
+        tier == "priority" ? "Fast / Priority" : (tier ?? "Default")
     }
 }
 
@@ -2955,6 +2958,7 @@ private struct AtlasHeatCell: View {
     let size: CGFloat
     let tooltip: String
     let showsTooltip: Bool
+    let selected: Bool
     let hoverChanged: ((Bool) -> Void)?
     @State private var hovered = false
 
@@ -2963,12 +2967,14 @@ private struct AtlasHeatCell: View {
         size: CGFloat,
         tooltip: String,
         showsTooltip: Bool = true,
+        selected: Bool = false,
         hoverChanged: ((Bool) -> Void)? = nil
     ) {
         self.color = color
         self.size = size
         self.tooltip = tooltip
         self.showsTooltip = showsTooltip
+        self.selected = selected
         self.hoverChanged = hoverChanged
     }
 
@@ -2979,9 +2985,9 @@ private struct AtlasHeatCell: View {
                 .frame(width: size, height: size)
                 .overlay(RoundedRectangle(cornerRadius: 2).stroke(Color(nsColor: AtlasColor.tealDeep).opacity(0.08)))
                 .overlay {
-                    if hovered {
+                    if hovered || selected {
                         RoundedRectangle(cornerRadius: 2)
-                            .stroke(Color(nsColor: AtlasColor.coral), lineWidth: 3)
+                            .stroke(Color(nsColor: AtlasColor.coral), lineWidth: selected ? 2 : 3)
                             .padding(-3)
                     }
                 }
@@ -3004,7 +3010,6 @@ private struct AtlasHeatCell: View {
             hovered = $0
             hoverChanged?($0)
         }
-        .help(tooltip)
     }
 }
 
@@ -3038,10 +3043,60 @@ private struct DailyHoverState {
     let column: Int
 }
 
+private struct DailyHourHoverState {
+    let hour: Int
+    let row: Int
+    let text: String
+}
+
+private struct DailyHourlyStrip: View {
+    let day: String
+    let row: Int
+    let data: DashboardData
+    @ObservedObject var controller: AppDelegate
+    let hoverChanged: (DailyHourHoverState?) -> Void
+
+    var body: some View {
+        let timeline = data.timeline_hourly[controller.selectedModel] ?? [:]
+        let costTimeline = data.pricing.timeline_hourly[controller.selectedModel] ?? [:]
+        let usage = (0..<24).map { timeline["\(day)T\(String(format: "%02d", $0))"] ?? Usage() }
+        let costs = (0..<24).map { costTimeline["\(day)T\(String(format: "%02d", $0))"] ?? Cost() }
+        let cap = percentile(usage.map { Double($0.value(for: controller.selectedMetric)) }, fraction: 0.98)
+
+        HStack(spacing: 3) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(Color(nsColor: AtlasColor.coral))
+                .frame(width: 8)
+            Text("\(String(day.dropFirst(5))) · 24H")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
+                .frame(width: 76, alignment: .leading)
+            ForEach(0..<24, id: \.self) { hour in
+                let item = usage[hour]
+                let tooltip = "\(day) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[hour])))"
+                AtlasHeatCell(
+                    color: heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap),
+                    size: 18,
+                    tooltip: tooltip,
+                    showsTooltip: false,
+                    hoverChanged: { hovering in
+                        hoverChanged(hovering ? DailyHourHoverState(hour: hour, row: row, text: tooltip) : nil)
+                    }
+                )
+            }
+        }
+        .frame(height: 22)
+        .zIndex(100)
+    }
+}
+
 private struct DailyHeatmap: View {
     let data: DashboardData
     @ObservedObject var controller: AppDelegate
     @State private var hoveredTooltip: DailyHoverState?
+    @State private var hourlyTooltip: DailyHourHoverState?
+    @State private var selectedDay: String?
 
     var body: some View {
         let range = controller.activeRange(data)
@@ -3062,33 +3117,54 @@ private struct DailyHeatmap: View {
                     }
                 }
             }
-            HStack(alignment: .top, spacing: 8) {
-                VStack(spacing: 5) {
-                    ForEach(["一", "二", "三", "四", "五", "六", "日"], id: \.self) {
-                        Text($0)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                            .frame(width: 20, height: 22)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(spacing: 5) {
+                        ForEach(["一", "二", "三", "四", "五", "六", "日"], id: \.self) {
+                            Text($0)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                                .frame(width: 20, height: 22)
+                        }
                     }
-                }
-                LazyHGrid(rows: Array(repeating: GridItem(.fixed(22), spacing: 5), count: 7), spacing: 5) {
-                    ForEach(Array(cells.enumerated()), id: \.element.id) { index, cell in
-                        let item = usage[cell.day] ?? Usage()
-                        let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[cell.day] ?? Cost())))" : "不在所选周期内"
-                        AtlasHeatCell(
-                            color: cell.inside ? heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap) : NSColor.gray.withAlphaComponent(0.08),
-                            size: 22,
-                            tooltip: tooltip,
-                            showsTooltip: false,
-                            hoverChanged: { hovering in
-                                hoveredTooltip = hovering
-                                    ? DailyHoverState(text: tooltip, row: index % 7, column: index / 7)
-                                    : nil
+                    LazyHGrid(rows: Array(repeating: GridItem(.fixed(22), spacing: 5), count: 7), spacing: 5) {
+                        ForEach(Array(cells.enumerated()), id: \.element.id) { index, cell in
+                            let item = usage[cell.day] ?? Usage()
+                            let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[cell.day] ?? Cost())))" : "不在所选周期内"
+                            AtlasHeatCell(
+                                color: cell.inside ? heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap) : NSColor.gray.withAlphaComponent(0.08),
+                                size: 22,
+                                tooltip: tooltip,
+                                showsTooltip: false,
+                                selected: cell.inside && selectedDay == cell.day,
+                                hoverChanged: { hovering in
+                                    hoveredTooltip = hovering
+                                        ? DailyHoverState(text: tooltip, row: index % 7, column: index / 7)
+                                        : nil
+                                }
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                guard cell.inside else { return }
+                                hoveredTooltip = nil
+                                hourlyTooltip = nil
+                                selectedDay = selectedDay == cell.day ? nil : cell.day
                             }
-                        )
+                        }
                     }
+                    if let selectedDay,
+                       let index = cells.firstIndex(where: { $0.day == selectedDay }) {
+                        DailyHourlyStrip(
+                            day: selectedDay,
+                            row: index % 7,
+                            data: data,
+                            controller: controller,
+                            hoverChanged: { hourlyTooltip = $0 }
+                        )
+                        .padding(.top, CGFloat(index % 7) * 27)
+                    }
+                    Spacer(minLength: 0)
                 }
-                Spacer()
             }
             HStack(spacing: 8) {
                 Text("0")
@@ -3113,7 +3189,18 @@ private struct DailyHeatmap: View {
                         .offset(x: tooltipX, y: tooltipY)
                         .zIndex(100)
                 }
+                if let hourlyTooltip {
+                    let weekCount = CGFloat(cells.count / 7)
+                    let cellX = CGFloat(121 + hourlyTooltip.hour * 21) + weekCount * 27
+                    let cellY = CGFloat(21 + hourlyTooltip.row * 27)
+                    let tooltipX = min(max(0, cellX), max(0, geometry.size.width - 240))
+                    let tooltipY = hourlyTooltip.row < 2 ? cellY + 30 : max(0, cellY - 68)
+                    AtlasTooltipBubble(text: hourlyTooltip.text)
+                        .offset(x: tooltipX, y: tooltipY)
+                        .zIndex(200)
+                }
             }
+            .allowsHitTesting(false)
         }
     }
 
