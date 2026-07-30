@@ -26,12 +26,12 @@ jobs:
         run: |
           set -euo pipefail
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Info.plist)"
-          tag="v${version}-build.${GITHUB_RUN_NUMBER}"
+          tag="v${version}"
           release_dmg_path="dist/Codex-Token-Atlas.dmg"
           cp "dist/Codex Token Atlas.dmg" "$release_dmg_path"
           (cd dist && shasum -a 256 "Codex-Token-Atlas.dmg" > "Codex-Token-Atlas.dmg.sha256")
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "title=Codex Token Atlas ${version} (build ${GITHUB_RUN_NUMBER})" >> "$GITHUB_OUTPUT"
+          echo "title=Codex Token Atlas ${version}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:

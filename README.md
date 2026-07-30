@@ -95,7 +95,7 @@ Every branch push triggers `.github/workflows/release.yml`. The workflow runs th
 - `Codex-Token-Atlas.dmg`
 - `Codex-Token-Atlas.dmg.sha256`
 
-Release tags use `v<app-version>-build.<workflow-run-number>`, so each push produces a separate installer without rewriting earlier releases.
+Release tags use the semantic app version, such as `v2.1.1`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
 
 ## Generator
 

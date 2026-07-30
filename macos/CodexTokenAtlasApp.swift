@@ -17,7 +17,7 @@ private enum AtlasColor {
     }
 
     static let canvas = rgb(238, 245, 242)
-    static let surface = rgb(255, 255, 255, alpha: 0.88)
+    static let surface = rgb(255, 255, 255)
     static let ink = rgb(16, 42, 42)
     static let inkSoft = rgb(62, 92, 89)
     static let muted = rgb(109, 129, 126)
@@ -772,47 +772,10 @@ private let reportDateFormatter: DateFormatter = {
     return formatter
 }()
 
-private final class LiveStatusBarView: NSView {
-    private let titleField = NSTextField(labelWithString: "Tokens")
-    private let valueField = NSTextField(labelWithString: "0.00")
-    var onClick: (() -> Void)?
-
-    override var isFlipped: Bool { true }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        titleField.font = NSFont.monospacedSystemFont(ofSize: 6, weight: .medium)
-        titleField.textColor = .labelColor
-        titleField.alignment = .center
-        titleField.lineBreakMode = .byClipping
-        valueField.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
-        valueField.textColor = .labelColor
-        valueField.alignment = .center
-        valueField.lineBreakMode = .byClipping
-        addSubview(titleField)
-        addSubview(valueField)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        NSApp.activate(ignoringOtherApps: true)
-        onClick?()
-    }
-
-    override func layout() {
-        super.layout()
-        titleField.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 9)
-        valueField.frame = NSRect(x: 0, y: 8, width: bounds.width, height: 14)
-    }
-
-    func update(rate: Double) {
-        valueField.stringValue = formatStatusTokenRate(rate)
-    }
+private final class LiveMonitorPresentation: ObservableObject {
+    @Published var snapshot = LiveTokenSnapshot.zero
+    @Published var refreshSeconds = 2
+    @Published var panelPinned = false
 }
 
 private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
@@ -918,15 +881,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @Published fileprivate var datePreset = DatePreset.all
     @Published fileprivate var selectedStartDate: Date?
     @Published fileprivate var selectedEndDate: Date?
-    @Published fileprivate var liveSnapshot = LiveTokenSnapshot.zero
-    @Published fileprivate var liveRefreshSeconds = 2
-    @Published fileprivate var livePanelPinned = false
-    @Published fileprivate var liveMonitorEnabled = false
+    fileprivate let livePresentation = LiveMonitorPresentation()
+    fileprivate var liveMonitorEnabled = false
 
     private var statusItem: NSStatusItem?
-    private var liveStatusView: LiveStatusBarView?
+    private var lastStatusRateText: String?
     private var livePanel: LiveMonitorPanel!
     private var liveMonitor: LiveTokenMonitor!
+    private var latestLiveSnapshot = LiveTokenSnapshot.zero
 
     private let fileManager = FileManager.default
     private lazy var homeURL = fileManager.homeDirectoryForCurrentUser
@@ -945,7 +907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     func applicationDidFinishLaunching(_ notification: Notification) {
         pricingMode = PricingMode(rawValue: UserDefaults.standard.integer(forKey: "pricingMode")) ?? .simple
         let storedRefresh = UserDefaults.standard.integer(forKey: "liveTokenRefreshSeconds")
-        liveRefreshSeconds = [1, 2, 5].contains(storedRefresh) ? storedRefresh : 2
+        livePresentation.refreshSeconds = [1, 2, 5].contains(storedRefresh) ? storedRefresh : 2
         liveMonitorEnabled = UserDefaults.standard.bool(forKey: "liveTokenMonitorEnabledV2")
         configureMainMenu()
         configureWindow()
@@ -1048,15 +1010,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func configureLiveMonitor() {
         livePanel = LiveMonitorPanel(contentSize: NSSize(width: 296, height: 270))
-        livePanel.contentViewController = NSHostingController(rootView: LiveTokenPopover(controller: self))
-        livePanel.pinnedChanged = { [weak self] pinned in self?.livePanelPinned = pinned }
+        livePanel.contentViewController = NSHostingController(
+            rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
+        )
+        livePanel.pinnedChanged = { [weak self] pinned in
+            self?.livePresentation.panelPinned = pinned
+        }
 
         let sessionRoot = homeURL.appendingPathComponent(".codex/sessions", isDirectory: true)
         liveMonitor = LiveTokenMonitor(sessionRoot: sessionRoot) { [weak self] snapshot in
             guard let self else { return }
-            self.liveSnapshot = snapshot
-            self.liveStatusView?.update(rate: snapshot.totalRate)
-            self.statusItem?.button?.setAccessibilityLabel("Token rate \(formatTokenRate(snapshot.totalRate)) tokens per second")
+            self.latestLiveSnapshot = snapshot
+            if self.livePanel.isVisible {
+                self.livePresentation.snapshot = snapshot
+            }
+            self.updateStatusItem(rate: snapshot.totalRate)
         }
         setLiveMonitorEnabled(liveMonitorEnabled, persist: false)
     }
@@ -1067,16 +1035,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         statusItem = item
         guard let button = item.button else { return }
         button.title = ""
-        button.image = nil
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
         button.target = self
         button.action = #selector(toggleLivePopover(_:))
+        button.sendAction(on: [.leftMouseUp])
         button.toolTip = "Token Rate · 60 秒滚动平均"
-        let statusView = LiveStatusBarView(frame: button.bounds)
-        liveStatusView = statusView
-        statusView.autoresizingMask = [.width, .height]
-        statusView.setAccessibilityElement(false)
-        statusView.onClick = { [weak self] in self?.toggleLivePopover(nil) }
-        button.addSubview(statusView)
+        updateStatusItem(rate: latestLiveSnapshot.totalRate)
+    }
+
+    private func updateStatusItem(rate: Double) {
+        guard let button = statusItem?.button else { return }
+        let value = formatStatusTokenRate(rate)
+        guard value != lastStatusRateText else { return }
+        lastStatusRateText = value
+
+        let size = NSSize(width: 30, height: NSStatusBar.system.thickness)
+        let image = NSImage(size: size, flipped: true) { _ in
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            paragraph.lineBreakMode = .byClipping
+            let titleAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 6, weight: .medium),
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph
+            ]
+            let valueAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold),
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph
+            ]
+            ("Tokens" as NSString).draw(
+                in: NSRect(x: 0, y: 1, width: size.width, height: 8),
+                withAttributes: titleAttributes
+            )
+            (value as NSString).draw(
+                in: NSRect(x: 0, y: 8, width: size.width, height: 13),
+                withAttributes: valueAttributes
+            )
+            return true
+        }
+        image.isTemplate = true
+        button.image = image
+        button.setAccessibilityLabel("Token rate \(formatTokenRate(rate)) tokens per second")
     }
 
     @objc private func toggleLiveMonitor(_ sender: Any?) {
@@ -1092,14 +1093,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         liveMenuItem?.state = enabled ? .on : .off
         if enabled {
             installStatusItem()
-            liveMonitor.start(interval: TimeInterval(liveRefreshSeconds))
+            liveMonitor.start(interval: TimeInterval(livePresentation.refreshSeconds))
         } else {
             livePanel.dismissAndUnpin()
             liveMonitor.stop()
-            liveSnapshot = .zero
+            latestLiveSnapshot = .zero
+            livePresentation.snapshot = .zero
             if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
             statusItem = nil
-            liveStatusView = nil
+            lastStatusRateText = nil
         }
     }
 
@@ -1108,6 +1110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         if livePanel.isVisible, !livePanel.isPinned {
             livePanel.orderOut(nil)
         } else {
+            livePresentation.snapshot = latestLiveSnapshot
             livePanel.show(relativeTo: button)
         }
     }
@@ -1125,7 +1128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     fileprivate func chooseLiveRefresh(_ seconds: Int) {
         guard [1, 2, 5].contains(seconds) else { return }
-        liveRefreshSeconds = seconds
+        livePresentation.refreshSeconds = seconds
         UserDefaults.standard.set(seconds, forKey: "liveTokenRefreshSeconds")
         liveMonitor.setInterval(TimeInterval(seconds))
     }
@@ -2148,9 +2151,10 @@ private extension NumberFormatter {
 }
 
 private struct LiveTokenPopover: View {
-    @ObservedObject var controller: AppDelegate
+    let controller: AppDelegate
+    @ObservedObject var presentation: LiveMonitorPresentation
 
-    private var snapshot: LiveTokenSnapshot { controller.liveSnapshot }
+    private var snapshot: LiveTokenSnapshot { presentation.snapshot }
     private var isActive: Bool {
         snapshot.lastEventAt.map { Date().timeIntervalSince($0) <= LiveTokenSnapshot.windowSeconds } ?? false
     }
@@ -2185,7 +2189,7 @@ private struct LiveTokenPopover: View {
             Text(isActive ? "ACTIVE" : "IDLE")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.muted))
-            if controller.livePanelPinned {
+            if presentation.panelPinned {
                 LiveIconButton(symbol: "xmark", help: "关闭常驻窗口") {
                     controller.closeLivePanel()
                 }
@@ -2201,7 +2205,7 @@ private struct LiveTokenPopover: View {
             LiveRateMetric(label: "OUTPUT", value: snapshot.outputRate, accent: AtlasColor.amber)
         }
         .padding(.vertical, 8)
-        .background(Color.white.opacity(0.78))
+        .background(Color.white)
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 
@@ -2213,7 +2217,7 @@ private struct LiveTokenPopover: View {
                 .help("日志轮询周期；最近一次扫描耗时 \(String(format: "%.1f ms", snapshot.pollDurationMilliseconds))")
             AtlasSegmentedControl(
                 items: [(1, "1s"), (2, "2s"), (5, "5s")],
-                selection: Binding(get: { controller.liveRefreshSeconds }, set: { controller.chooseLiveRefresh($0) })
+                selection: Binding(get: { presentation.refreshSeconds }, set: { controller.chooseLiveRefresh($0) })
             )
             .frame(width: 180)
             Spacer()
@@ -2331,7 +2335,7 @@ private struct LiveRateChart: View {
             }
             context.stroke(guides, with: .color(Color(nsColor: AtlasColor.line).opacity(0.7)), style: StrokeStyle(lineWidth: 0.5, dash: [3, 4]))
         }
-        .background(Color.white.opacity(0.52))
+        .background(Color.white)
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 }
@@ -2407,7 +2411,7 @@ private struct AtlasDashboardView: View {
 
     private var loadingOverlay: some View {
         ZStack {
-            Color(nsColor: .windowBackgroundColor).opacity(0.92)
+            Color(nsColor: .windowBackgroundColor)
             VStack(spacing: 11) {
                 ProgressView().controlSize(.regular)
                 Text(controller.loadingTitleText).font(.system(size: 18, weight: .semibold))
@@ -2450,9 +2454,8 @@ private struct AtlasDashboardView: View {
         }
         .padding(.vertical, 22)
         .padding(.horizontal, 34)
-        .background(LinearGradient(colors: [Color.white.opacity(0.96), Color(red: 241 / 255, green: 250 / 255, blue: 247 / 255).opacity(0.88)], startPoint: .topLeading, endPoint: .bottomTrailing))
+        .background(Color.white)
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.teal).opacity(0.22)))
-        .shadow(color: Color(nsColor: AtlasColor.tealDeep).opacity(0.09), radius: 25, y: 12)
     }
 
     private func hourlyScaleNote(_ data: DashboardData) -> String {
@@ -2649,7 +2652,7 @@ private struct AtlasControl<Content: View>: View {
         .padding(.leading, 13)
         .padding(.trailing, 8)
         .padding(.vertical, 6)
-        .background(Color.white.opacity(0.90))
+        .background(Color.white)
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
     }
 }
@@ -2788,7 +2791,6 @@ private struct MetricCard: View {
         .padding(.horizontal, 16)
         .background(Color(nsColor: AtlasColor.surface))
         .overlay(alignment: .top) { Rectangle().fill(Color(nsColor: accent)).frame(height: 3) }
-        .shadow(color: Color(nsColor: AtlasColor.tealDeep).opacity(0.055), radius: 11, y: 5)
     }
 }
 
@@ -2821,7 +2823,6 @@ private struct AtlasPanel<Content: View>: View {
         .padding(.horizontal, 24)
         .background(Color(nsColor: AtlasColor.surface))
         .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
-        .shadow(color: Color(nsColor: AtlasColor.tealDeep).opacity(0.055), radius: 15, y: 7)
     }
 }
 
@@ -2991,8 +2992,6 @@ private struct AtlasHeatCell: View {
                             .padding(-3)
                     }
                 }
-                .scaleEffect(hovered ? 1.12 : 1)
-                .shadow(color: hovered ? Color.white : .clear, radius: hovered ? 1 : 0)
             if hovered && showsTooltip {
                 AtlasTooltipBubble(text: tooltip)
                     .offset(
@@ -3000,12 +2999,10 @@ private struct AtlasHeatCell: View {
                         y: size <= 24 ? 0 : -(size / 2 + 43)
                     )
                     .allowsHitTesting(false)
-                    .transition(.opacity)
             }
         }
         .frame(width: size, height: size)
         .zIndex(hovered ? 3 : 0)
-        .animation(.easeOut(duration: 0.12), value: hovered)
         .onHover {
             hovered = $0
             hoverChanged?($0)
@@ -3027,7 +3024,6 @@ private struct AtlasTooltipBubble: View {
             .background(Color(nsColor: AtlasColor.ink).opacity(0.97))
             .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.coral), lineWidth: 1))
             .allowsHitTesting(false)
-            .transition(.opacity)
     }
 }
 
