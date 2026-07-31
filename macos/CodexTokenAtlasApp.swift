@@ -81,6 +81,27 @@ private enum AtlasColor {
     static let heatHigh = adaptive(light: rgb(3, 78, 70), dark: rgb(74, 220, 180))
 }
 
+private extension View {
+    @ViewBuilder
+    func atlasGlass<S: Shape>(
+        in shape: S,
+        tint: Color? = nil,
+        clear: Bool = false,
+        interactive: Bool = false
+    ) -> some View {
+        if #available(macOS 26.0, *) {
+            let glass = clear ? Glass.clear : Glass.regular
+            glassEffect(glass.tint(tint).interactive(interactive), in: shape)
+        } else if clear {
+            background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(0.55), lineWidth: 1))
+        } else {
+            background(.regularMaterial, in: shape)
+                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(0.8), lineWidth: 1))
+        }
+    }
+}
+
 private struct Usage: Decodable {
     let input_tokens: Int64
     let cached_input_tokens: Int64
@@ -857,8 +878,8 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
         title = "Token Rate"
         backgroundColor = .clear
         isOpaque = false
-        hasShadow = true
-        isMovableByWindowBackground = false
+        hasShadow = false
+        isMovableByWindowBackground = true
         isReleasedWhenClosed = false
         hidesOnDeactivate = false
         level = .floating
@@ -881,16 +902,8 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
         setPinned(false)
     }
 
-    func performUserDrag(with event: NSEvent) {
-        let origin = frame.origin
-        performDrag(with: event)
-        if abs(frame.origin.x - origin.x) > 2 || abs(frame.origin.y - origin.y) > 2 {
-            setPinned(true)
-        }
-    }
-
     func windowWillMove(_ notification: Notification) {
-        if !isPositioning { setPinned(true) }
+        if !isPositioning, isVisible { setPinned(true) }
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -1137,6 +1150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = AtlasColor.canvas
         window.contentView = NSHostingView(
             rootView: ScaledContent(scale: dashboardRenderScale) {
                 AtlasDashboardView(controller: self)
@@ -1150,12 +1165,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         toolbar.autosavesConfiguration = false
         window.toolbar = toolbar
         toolbar.displayMode = .iconOnly
-        window.toolbarStyle = .unified
+        window.toolbarStyle = .unifiedCompact
     }
 
     private func configureLiveMonitor() {
         livePresentation.historicalTotalTokens = historicalTotalTokens
-        livePanel = LiveMonitorPanel(contentSize: NSSize(width: 296, height: 270))
+        livePanel = LiveMonitorPanel(contentSize: NSSize(width: 292, height: 246))
         livePanel.contentViewController = NSHostingController(
             rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
         )
@@ -1184,16 +1199,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func installStatusItem() {
         guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: 30)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem = item
         guard let button = item.button else { return }
-        button.title = ""
-        button.imagePosition = .imageOnly
-        button.imageScaling = .scaleNone
+        button.image = nil
+        button.imagePosition = .noImage
+        button.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         button.target = self
         button.action = #selector(toggleLivePopover(_:))
         button.sendAction(on: [.leftMouseUp])
-        button.toolTip = "Token Rate · 60 秒滚动平均"
+        button.toolTip = "60 秒平均 Token 速率"
         updateStatusItem(rate: latestLiveSnapshot.totalRate)
     }
 
@@ -1202,34 +1217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let value = formatStatusTokenRate(rate)
         guard value != lastStatusRateText else { return }
         lastStatusRateText = value
-
-        let size = NSSize(width: 30, height: NSStatusBar.system.thickness)
-        let image = NSImage(size: size, flipped: true) { _ in
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.alignment = .center
-            paragraph.lineBreakMode = .byClipping
-            let titleAttributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 6, weight: .medium),
-                .foregroundColor: NSColor.black,
-                .paragraphStyle: paragraph
-            ]
-            let valueAttributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold),
-                .foregroundColor: NSColor.black,
-                .paragraphStyle: paragraph
-            ]
-            ("Tokens" as NSString).draw(
-                in: NSRect(x: 0, y: 1, width: size.width, height: 8),
-                withAttributes: titleAttributes
-            )
-            (value as NSString).draw(
-                in: NSRect(x: 0, y: 8, width: size.width, height: 13),
-                withAttributes: valueAttributes
-            )
-            return true
-        }
-        image.isTemplate = true
-        button.image = image
+        button.title = value
         button.setAccessibilityLabel("Token rate \(formatTokenRate(rate)) tokens per second")
     }
 
@@ -1344,7 +1332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.settings, .refreshReport, .liveMonitor, .flexibleSpace, .reportStatus, .flexibleSpace, .exportReport, .revealExports]
+        [.settings, .refreshReport, .liveMonitor, .flexibleSpace, .exportReport, .revealExports]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -1352,7 +1340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         case .settings:
             let image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "设置")
             let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(showSettingsMenu(_:)))
-            button.bezelStyle = .texturedRounded
+            button.bezelStyle = .toolbar
             button.controlSize = .regular
             button.imagePosition = .imageOnly
             button.toolTip = "设置"
@@ -1389,7 +1377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             let image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "顶部栏 Token 统计")
             let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(toggleLiveMonitor(_:)))
             button.setButtonType(.toggle)
-            button.bezelStyle = .texturedRounded
+            button.bezelStyle = .toolbar
             button.controlSize = .regular
             button.imagePosition = .imageOnly
             button.state = liveMonitorEnabled ? .on : .off
@@ -2394,41 +2382,36 @@ private struct LiveTokenPopover: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             historySummary
             rateHeader
             LiveRateChart(samples: snapshot.samples)
-                .frame(height: 40)
+                .frame(height: 38)
             rateBreakdown
-            Divider().overlay(Color(nsColor: AtlasColor.line))
+            Divider().opacity(0.55)
             statusLine
         }
-        .padding(12)
-        .frame(width: 296, height: 270)
-        .background(Color(nsColor: AtlasColor.canvas))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(14)
+        .frame(width: 284, height: 238)
+        .atlasGlass(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
+            clear: true
+        )
+        .padding(4)
     }
 
     private var historySummary: some View {
         HStack(alignment: .lastTextBaseline, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("ALL-TIME TOKENS")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(nsColor: AtlasColor.teal))
-                Text("1 MIN")
-                    .font(.system(size: 8, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(nsColor: AtlasColor.muted))
-            }
+            Text("累计 Tokens")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color(nsColor: AtlasColor.muted))
             Spacer()
             Text(shortNumber(presentation.historicalTotalTokens))
-                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                .font(.system(size: 18, weight: .bold, design: .monospaced))
                 .foregroundStyle(Color(nsColor: AtlasColor.ink))
                 .help(formatInt(presentation.historicalTotalTokens))
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 
     private var rateHeader: some View {
@@ -2438,8 +2421,8 @@ private struct LiveTokenPopover: View {
                 .foregroundStyle(Color(nsColor: AtlasColor.ink))
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
-            Text("tok/s")
-                .font(.system(size: 14, weight: .bold, design: .monospaced))
+            Text("Tokens")
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color(nsColor: AtlasColor.teal))
             Spacer(minLength: 4)
             Text(isActive ? "ACTIVE" : "IDLE")
@@ -2454,18 +2437,17 @@ private struct LiveTokenPopover: View {
                 }
             }
         }
-        .background(LivePanelDragRegion())
     }
 
     private var rateBreakdown: some View {
         HStack(spacing: 0) {
             LiveRateMetric(label: "INPUT", value: snapshot.inputRate, accent: AtlasColor.teal)
+            Divider().frame(height: 34).opacity(0.55)
             LiveRateMetric(label: "CACHE", value: snapshot.cachedRate, accent: AtlasColor.coral)
+            Divider().frame(height: 34).opacity(0.55)
             LiveRateMetric(label: "OUTPUT", value: snapshot.outputRate, accent: AtlasColor.amber)
         }
-        .padding(.vertical, 8)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
+        .padding(.vertical, 4)
     }
 
     private var statusLine: some View {
@@ -2491,19 +2473,6 @@ private struct LiveTokenPopover: View {
     }
 }
 
-private struct LivePanelDragRegion: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { LivePanelDragView() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
-
-private final class LivePanelDragView: NSView {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        (window as? LiveMonitorPanel)?.performUserDrag(with: event)
-    }
-}
-
 private struct LiveIconButton: View {
     let symbol: String
     let help: String
@@ -2514,12 +2483,11 @@ private struct LiveIconButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
-                .frame(width: 26, height: 26)
-                .contentShape(Rectangle())
+                .frame(width: 24, height: 24)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .background(Color(nsColor: AtlasColor.canvas))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
+        .atlasGlass(in: Circle(), interactive: true)
         .help(help)
     }
 }
@@ -2539,12 +2507,9 @@ private struct LiveRateMetric: View {
                 .foregroundStyle(Color(nsColor: AtlasColor.ink))
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
-            Text("tok/s")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(Color(nsColor: AtlasColor.muted))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
     }
 }
 
@@ -2579,8 +2544,6 @@ private struct LiveRateChart: View {
             }
             context.stroke(guides, with: .color(Color(nsColor: AtlasColor.line).opacity(0.7)), style: StrokeStyle(lineWidth: 0.5, dash: [3, 4]))
         }
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
     }
 }
 
@@ -2591,41 +2554,52 @@ private struct AtlasDashboardView: View {
         ZStack {
             AtlasGridBackground()
             if let data = controller.dashboard {
-                ScrollView(.vertical) {
-                    VStack(spacing: 14) {
-                        hero(data)
-                        stats(data)
-                        AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
-                            HourlyHeatmap(data: data, controller: controller)
-                        }
-                        AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
-                            DailyHeatmap(data: data, controller: controller)
-                        }
-                        HStack(alignment: .top, spacing: 14) {
-                            AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
-                                modelTable(data)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(spacing: 14) {
+                            Color.clear
+                                .frame(height: 0)
+                                .id("dashboard-top")
+                            hero(data)
+                            stats(data)
+                            AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
+                                HourlyHeatmap(data: data, controller: controller)
                             }
-                            AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
-                                topDaysTable(data)
+                            AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
+                                DailyHeatmap(data: data, controller: controller)
                             }
+                            HStack(alignment: .top, spacing: 0) {
+                                AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
+                                    modelTable(data)
+                                }
+                                Divider()
+                                    .padding(.vertical, 24)
+                                AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
+                                    topDaysTable(data)
+                                }
+                            }
+                            sessionPanel(data)
+                            pricingPanel(data)
+                            auditPanel(data)
+                            HStack {
+                                Text("Generated \(data.generated_at_label) · \(data.timezone)")
+                                Spacer()
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                            .padding(.horizontal, 4)
                         }
-                        sessionPanel(data)
-                        pricingPanel(data)
-                        auditPanel(data)
-                        HStack {
-                            Text("Generated \(data.generated_at_label) · \(data.timezone)")
-                            Spacer()
-                            Text("Native SwiftUI · JSON / HTML / CSV export")
-                        }
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                        .padding(.horizontal, 4)
+                        .frame(minWidth: 1040, maxWidth: 1420)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 24)
+                        .padding(.bottom, 50)
                     }
-                    .frame(minWidth: 1040, maxWidth: 1420)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 24)
-                    .padding(.bottom, 50)
+                    .onAppear {
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("dashboard-top", anchor: .top)
+                        }
+                    }
                 }
                 .id(data.generated_at_label)
             }
@@ -2677,12 +2651,17 @@ private struct AtlasDashboardView: View {
                 }
                 Spacer()
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .atlasGlass(
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
+                clear: true
+            )
             .padding(.top, 18)
         }
-        .padding(.vertical, 22)
-        .padding(.horizontal, 34)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.teal).opacity(0.22)))
+        .padding(.vertical, 18)
+        .padding(.horizontal, 12)
     }
 
     private func hourlyScaleNote(_ data: DashboardData) -> String {
@@ -2700,14 +2679,26 @@ private struct AtlasDashboardView: View {
     private func stats(_ data: DashboardData) -> some View {
         let usage = controller.filteredUsage(scope: controller.selectedModel, data: data)
         let cacheRate = usage.input_tokens > 0 ? Double(usage.cached_input_tokens) / Double(usage.input_tokens) * 100 : 0
-        return HStack(spacing: 10) {
+        return HStack(spacing: 0) {
             MetricCard(title: "TOTAL TOKENS", value: shortNumber(usage.total_tokens), detail: formatInt(usage.total_tokens), accent: AtlasColor.teal)
+            AtlasMetricDivider()
             MetricCard(title: "INPUT", value: shortNumber(usage.input_tokens), detail: formatInt(usage.input_tokens), accent: AtlasColor.teal)
+            AtlasMetricDivider()
             MetricCard(title: "UNCACHED INPUT", value: shortNumber(usage.uncached_input_tokens), detail: "\(shortNumber(usage.cached_input_tokens)) read · \(shortNumber(usage.cache_write_input_tokens)) write", accent: AtlasColor.coral)
+            AtlasMetricDivider()
             MetricCard(title: "OUTPUT", value: shortNumber(usage.output_tokens), detail: "\(shortNumber(usage.reasoning_output_tokens)) reasoning", accent: AtlasColor.amber)
+            AtlasMetricDivider()
             MetricCard(title: "CACHE RATIO", value: String(format: "%.1f%%", cacheRate), detail: "\(shortNumber(usage.cached_input_tokens)) cached", accent: AtlasColor.teal)
+            AtlasMetricDivider()
             MetricCard(title: "UNIQUE CALLS", value: shortNumber(usage.calls), detail: "\(shortNumber(usage.unclassified_tokens)) unclassified", accent: AtlasColor.coral)
         }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .atlasGlass(
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+            tint: Color(nsColor: AtlasColor.teal).opacity(0.01),
+            clear: true
+        )
     }
 
     private func modelTable(_ data: DashboardData) -> some View {
@@ -2769,12 +2760,22 @@ private struct AtlasDashboardView: View {
         return AtlasPanel(title: "官方 API 等价价值", subtitle: "计价和周期在这里选择；全页统计同步更新。", trailing: "OFFICIAL RATES · \(data.pricing.as_of)") {
             VStack(alignment: .leading, spacing: 15) {
                 pricingControls(data)
-                HStack(spacing: 10) {
+                HStack(spacing: 0) {
                     MetricCard(title: controller.pricingMode == .simple ? "SIMPLE OFFICIAL VALUE" : "TIERED OFFICIAL VALUE", value: formatUSD(controller.pricingMode.value(cost)), detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal)
+                    AtlasMetricDivider()
                     MetricCard(title: "STANDARD BASELINE", value: formatUSD(cost.standard_equivalent_cost_usd), detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal)
+                    AtlasMetricDivider()
                     MetricCard(title: "TIER PREMIUM", value: formatUSD(controller.pricingMode == .tiered ? cost.service_tier_premium_usd : 0), detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral)
+                    AtlasMetricDivider()
                     MetricCard(title: "CACHE SAVINGS", value: formatUSD(cost.cache_savings_usd), detail: "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write", accent: AtlasColor.amber)
                 }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 5)
+                .atlasGlass(
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+                    tint: Color(nsColor: AtlasColor.teal).opacity(0.01),
+                    clear: true
+                )
                 AtlasTable(headers: ["PROVIDER", "MODEL", "TIER", "PRICED AS", "VALUE", "INPUT", "CACHE", "OUTPUT", "CALLS", "UNPRICED"], rows: routes, widths: [110, 145, 140, 200, 110, 75, 75, 75, 75, 95])
                 Text(controller.pricingMode == .simple
                     ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
@@ -2819,6 +2820,13 @@ private struct AtlasDashboardView: View {
                 .frame(width: 116, height: 30)
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .atlasGlass(
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+            tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
+            clear: true
+        )
     }
 
     private func auditPanel(_ data: DashboardData) -> some View {
@@ -2848,17 +2856,15 @@ private struct AtlasDashboardView: View {
 
 private struct AtlasGridBackground: View {
     var body: some View {
-        Canvas { context, size in
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(nsColor: AtlasColor.canvas)))
-            var lines = Path()
-            stride(from: CGFloat(0), through: size.width, by: 28).forEach { x in
-                lines.move(to: CGPoint(x: x, y: 0)); lines.addLine(to: CGPoint(x: x, y: size.height))
-            }
-            stride(from: CGFloat(0), through: size.height, by: 28).forEach { y in
-                lines.move(to: CGPoint(x: 0, y: y)); lines.addLine(to: CGPoint(x: size.width, y: y))
-            }
-            context.stroke(lines, with: .color(Color(nsColor: AtlasColor.teal).opacity(0.045)), lineWidth: 0.5)
-        }
+        LinearGradient(
+            colors: [
+                Color(nsColor: AtlasColor.canvas),
+                Color(nsColor: AtlasColor.surface).opacity(0.64),
+                Color(nsColor: AtlasColor.canvas)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
         .ignoresSafeArea()
     }
 }
@@ -2876,11 +2882,7 @@ private struct AtlasControl<Content: View>: View {
             content
         }
         .frame(minHeight: 30)
-        .padding(.leading, 13)
-        .padding(.trailing, 8)
-        .padding(.vertical, 6)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
+        .padding(.horizontal, 4)
     }
 }
 
@@ -2928,29 +2930,62 @@ private struct AtlasSegmentedControl<Value: Hashable>: View {
     @Binding var selection: Value
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                Button {
-                    selection = item.value
-                } label: {
-                    Text(item.title)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(selection == item.value ? Color(nsColor: AtlasColor.onAccent) : Color(nsColor: AtlasColor.inkSoft))
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, minHeight: 30)
-                        .contentShape(Rectangle())
+        Group {
+            if #available(macOS 26.0, *) {
+                GlassEffectContainer(spacing: 4) {
+                    HStack(spacing: 4) {
+                        ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                            if selection == item.value {
+                                Button {
+                                    selection = item.value
+                                } label: {
+                                    segmentLabel(item.title, selected: true)
+                                }
+                                .buttonStyle(.glassProminent)
+                                .tint(Color(nsColor: AtlasColor.teal))
+                                .help(item.title)
+                            } else {
+                                Button {
+                                    selection = item.value
+                                } label: {
+                                    segmentLabel(item.title, selected: false)
+                                }
+                                .buttonStyle(.glass)
+                                .help(item.title)
+                            }
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
-                .background(selection == item.value ? Color(nsColor: AtlasColor.teal) : Color.clear)
-                .help(item.title)
-                if index < items.count - 1 {
-                    Rectangle()
-                        .fill(Color(nsColor: AtlasColor.lineStrong))
-                        .frame(width: 1, height: 20)
+            } else {
+                HStack(spacing: 3) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                        Button {
+                            selection = item.value
+                        } label: {
+                            segmentLabel(item.title, selected: selection == item.value)
+                        }
+                        .buttonStyle(.plain)
+                        .background(
+                            selection == item.value ? Color(nsColor: AtlasColor.teal) : Color.clear,
+                            in: Capsule()
+                        )
+                        .help(item.title)
+                    }
                 }
+                .padding(3)
+                .background(.regularMaterial, in: Capsule())
+                .overlay(Capsule().stroke(Color(nsColor: AtlasColor.line).opacity(0.8), lineWidth: 1))
             }
         }
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
+    }
+
+    private func segmentLabel(_ title: String, selected: Bool) -> some View {
+        Text(title)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(selected ? Color(nsColor: AtlasColor.onAccent) : Color(nsColor: AtlasColor.inkSoft))
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, minHeight: 26)
+            .contentShape(Capsule())
     }
 }
 
@@ -2960,6 +2995,28 @@ private struct AtlasDateControl: View {
     @State private var showingCalendar = false
 
     var body: some View {
+        Group {
+            if #available(macOS 26.0, *) {
+                dateButton
+                    .buttonStyle(.glass)
+            } else {
+                dateButton
+                    .buttonStyle(.plain)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(Color(nsColor: AtlasColor.line).opacity(0.8), lineWidth: 1))
+            }
+        }
+        .help("选择日期")
+        .popover(isPresented: $showingCalendar, arrowEdge: .bottom) {
+            DatePicker("", selection: $selection, in: range, displayedComponents: .date)
+                .datePickerStyle(.graphical)
+                .labelsHidden()
+                .padding(14)
+                .onChange(of: selection) { _ in showingCalendar = false }
+        }
+    }
+
+    private var dateButton: some View {
         Button {
             showingCalendar.toggle()
         } label: {
@@ -2975,19 +3032,8 @@ private struct AtlasDateControl: View {
                     .foregroundStyle(Color(nsColor: AtlasColor.teal))
             }
             .padding(.horizontal, 9)
-            .frame(maxWidth: .infinity, minHeight: 30)
-            .background(Color(nsColor: AtlasColor.canvas).opacity(0.65))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.lineStrong)))
-        .help("选择日期")
-        .popover(isPresented: $showingCalendar, arrowEdge: .bottom) {
-            DatePicker("", selection: $selection, in: range, displayedComponents: .date)
-                .datePickerStyle(.graphical)
-                .labelsHidden()
-                .padding(14)
-                .onChange(of: selection) { _ in showingCalendar = false }
+            .frame(maxWidth: .infinity, minHeight: 28)
+            .contentShape(Capsule())
         }
     }
 
@@ -3008,16 +3054,30 @@ private struct MetricCard: View {
     let accent: NSColor
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(title).font(.system(size: 11, weight: .bold)).foregroundStyle(Color(nsColor: AtlasColor.muted)).lineLimit(1)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Color(nsColor: accent))
+                    .frame(width: 5, height: 5)
+                Text(title)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                    .lineLimit(1)
+            }
             Text(value).font(.system(size: 24, weight: .bold, design: .monospaced)).foregroundStyle(Color(nsColor: AtlasColor.ink)).lineLimit(1).minimumScaleFactor(0.66).textSelection(.enabled)
             Text(detail).font(.system(size: 11)).foregroundStyle(Color(nsColor: AtlasColor.muted)).lineLimit(1).minimumScaleFactor(0.66).textSelection(.enabled)
         }
-        .frame(maxWidth: .infinity, minHeight: 86, alignment: .leading)
-        .padding(.vertical, 15)
-        .padding(.horizontal, 16)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(alignment: .top) { Rectangle().fill(Color(nsColor: accent)).frame(height: 3) }
+        .frame(maxWidth: .infinity, minHeight: 78, alignment: .leading)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 13)
+    }
+}
+
+private struct AtlasMetricDivider: View {
+    var body: some View {
+        Divider()
+            .frame(height: 58)
+            .opacity(0.55)
     }
 }
 
@@ -3047,9 +3107,13 @@ private struct AtlasPanel<Content: View>: View {
             content
         }
         .padding(.vertical, 22)
-        .padding(.horizontal, 24)
-        .background(Color(nsColor: AtlasColor.surface))
-        .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.line)))
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color(nsColor: AtlasColor.line).opacity(0.85))
+                .frame(height: 1)
+        }
     }
 }
 
@@ -3073,9 +3137,8 @@ private struct AtlasTable: View {
                     VStack(spacing: 0) {
                         adaptiveRow(headers, header: true, availableWidth: geometry.size.width, weights: adaptiveWeights)
                         Divider()
-                        ForEach(Array(rows.enumerated()), id: \.offset) { index, values in
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, values in
                             adaptiveRow(values, header: false, availableWidth: geometry.size.width, weights: adaptiveWeights)
-                                .background(index.isMultiple(of: 2) ? Color.clear : Color(nsColor: AtlasColor.canvas).opacity(0.45))
                             Divider()
                         }
                     }
@@ -3086,9 +3149,8 @@ private struct AtlasTable: View {
                     VStack(spacing: 0) {
                         row(headers, header: true)
                         Divider()
-                        ForEach(Array(rows.enumerated()), id: \.offset) { index, values in
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, values in
                             row(values, header: false)
-                                .background(index.isMultiple(of: 2) ? Color.clear : Color(nsColor: AtlasColor.canvas).opacity(0.45))
                             Divider()
                         }
                     }
@@ -3241,6 +3303,7 @@ private struct AtlasTooltipBubble: View {
     let text: String
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
         Text(text)
             .font(.system(size: 11, weight: .medium, design: .monospaced))
             .foregroundStyle(Color(nsColor: AtlasColor.tooltipText))
@@ -3248,8 +3311,8 @@ private struct AtlasTooltipBubble: View {
             .fixedSize(horizontal: true, vertical: true)
             .padding(.horizontal, 11)
             .padding(.vertical, 9)
-            .background(Color(nsColor: AtlasColor.tooltipSurface).opacity(0.97))
-            .overlay(Rectangle().stroke(Color(nsColor: AtlasColor.coral), lineWidth: 1))
+            .background(Color(nsColor: AtlasColor.tooltipSurface).opacity(0.97), in: shape)
+            .overlay(shape.stroke(Color(nsColor: AtlasColor.coral), lineWidth: 1))
             .allowsHitTesting(false)
     }
 }
