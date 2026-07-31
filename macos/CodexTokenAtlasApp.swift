@@ -1490,11 +1490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             dashboard = loadedDashboard
             historicalTotalTokens = max(historicalTotalTokens, loadedDashboard.totals["all"]?.total_tokens ?? 0)
             publishHistoricalTotal()
-            if selectedStartDate == nil || selectedEndDate == nil {
-                selectedStartDate = reportDateFormatter.date(from: loadedDashboard.range.start)
-                selectedEndDate = reportDateFormatter.date(from: loadedDashboard.range.end)
-                datePreset = .all
-            }
+            synchronizeDateSelection(with: loadedDashboard)
             generatorRunning = false
             setLoading(false, title: "", detail: "")
             toolbarStatus.stringValue = "已更新 \(DateFormatter.shortTime.string(from: Date()))"
@@ -1539,9 +1535,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         selectedModel = "all"
         selectedMetric = "total_tokens"
-        selectedStartDate = reportDateFormatter.date(from: data.range.start)
-        selectedEndDate = reportDateFormatter.date(from: data.range.end)
         datePreset = .all
+        selectedStartDate = reportDateFormatter.date(from: data.range.start)
+        selectedEndDate = selectedStartDate
+        synchronizeDateSelection(with: data)
+        try require(activeRange(data).end == data.range.end, "all-time preset did not advance to the latest report date")
         let fullUsage = filteredUsage(scope: "all", data: data)
         let expected = data.totals["all"] ?? Usage()
         try require(fullUsage.total_tokens == expected.total_tokens, "full-range daily total differs from report total")
@@ -2025,18 +2023,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     fileprivate func applyDatePreset(_ preset: DatePreset) {
-        guard let data = dashboard, let first = reportDateFormatter.date(from: data.range.start), let last = reportDateFormatter.date(from: data.range.end) else { return }
+        guard let data = dashboard else { return }
         datePreset = preset
-        selectedEndDate = last
+        synchronizeDateSelection(with: data)
+    }
+
+    private func synchronizeDateSelection(with data: DashboardData) {
+        guard let first = reportDateFormatter.date(from: data.range.start), let last = reportDateFormatter.date(from: data.range.end) else { return }
         switch datePreset {
         case .all:
             selectedStartDate = first
+            selectedEndDate = last
         case .last7:
             selectedStartDate = max(first, Calendar.current.date(byAdding: .day, value: -6, to: last) ?? first)
+            selectedEndDate = last
         case .last30:
             selectedStartDate = max(first, Calendar.current.date(byAdding: .day, value: -29, to: last) ?? first)
+            selectedEndDate = last
         case .custom:
-            break
+            selectedStartDate = min(max(selectedStartDate ?? first, first), last)
+            selectedEndDate = min(max(selectedEndDate ?? last, first), last)
+            if let start = selectedStartDate, let end = selectedEndDate, start > end {
+                selectedStartDate = end
+            }
         }
     }
 
@@ -2577,71 +2586,54 @@ private struct LiveRateChart: View {
 
 private struct AtlasDashboardView: View {
     @ObservedObject var controller: AppDelegate
-    @State private var didResetInitialScroll = false
 
     var body: some View {
         ZStack {
             AtlasGridBackground()
             if let data = controller.dashboard {
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical) {
-                        VStack(spacing: 14) {
-                            hero(data)
-                                .id("dashboard-top")
-                            stats(data)
-                            AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
-                                HourlyHeatmap(data: data, controller: controller)
-                            }
-                            AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
-                                DailyHeatmap(data: data, controller: controller)
-                            }
-                            HStack(alignment: .top, spacing: 14) {
-                                AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
-                                    modelTable(data)
-                                }
-                                AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
-                                    topDaysTable(data)
-                                }
-                            }
-                            sessionPanel(data)
-                            pricingPanel(data)
-                            auditPanel(data)
-                            HStack {
-                                Text("Generated \(data.generated_at_label) · \(data.timezone)")
-                                Spacer()
-                                Text("Native SwiftUI · JSON / HTML / CSV export")
-                            }
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(Color(nsColor: AtlasColor.muted))
-                            .padding(.horizontal, 4)
+                ScrollView(.vertical) {
+                    VStack(spacing: 14) {
+                        hero(data)
+                        stats(data)
+                        AtlasPanel(title: "一周 × 24 小时", subtitle: "按星期与本地小时聚合；悬停显示 token、calls 与当前计价金额。", trailing: hourlyScaleNote(data)) {
+                            HourlyHeatmap(data: data, controller: controller)
                         }
-                        .frame(minWidth: 1040, maxWidth: 1420)
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 20)
-                        .padding(.top, 24)
-                        .padding(.bottom, 50)
+                        AtlasPanel(title: "每日历史", subtitle: "按本地日期排列；同样使用连续色阶，可随模型、指标与周期筛选。", trailing: dailyScaleNote(data)) {
+                            DailyHeatmap(data: data, controller: controller)
+                        }
+                        HStack(alignment: .top, spacing: 14) {
+                            AtlasPanel(title: "模型分布", subtitle: "模型按调用发生时的上下文归属。") {
+                                modelTable(data)
+                            }
+                            AtlasPanel(title: "高用量日期", subtitle: "当前模型、指标与周期筛选。") {
+                                topDaysTable(data)
+                            }
+                        }
+                        sessionPanel(data)
+                        pricingPanel(data)
+                        auditPanel(data)
+                        HStack {
+                            Text("Generated \(data.generated_at_label) · \(data.timezone)")
+                            Spacer()
+                            Text("Native SwiftUI · JSON / HTML / CSV export")
+                        }
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                        .padding(.horizontal, 4)
                     }
-                    .onAppear {
-                        resetInitialScroll(proxy)
-                    }
-                    .onChange(of: controller.generatorRunning) { running in
-                        if !running { resetInitialScroll(proxy) }
-                    }
+                    .frame(minWidth: 1040, maxWidth: 1420)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 24)
+                    .padding(.bottom, 50)
                 }
+                .id(data.generated_at_label)
             }
             if controller.generatorRunning {
                 loadingOverlay
             }
         }
         .background(Color(nsColor: AtlasColor.canvas))
-    }
-
-    private func resetInitialScroll(_ proxy: ScrollViewProxy) {
-        guard !didResetInitialScroll, !controller.generatorRunning else { return }
-        didResetInitialScroll = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            proxy.scrollTo("dashboard-top", anchor: .top)
-        }
     }
 
     private var loadingOverlay: some View {

@@ -17,6 +17,7 @@ All session parsing and report generation happen locally. The repository does no
 - Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. Unknown models remain visible and are marked unpriced.
 - Reads cache hits and cache writes separately when the log schema provides them.
 - Adds date- and model-aware official value columns to session and route reporting.
+- Keeps All Time, last-7-day, and last-30-day ranges anchored to the newest report date after every refresh.
 - Lets the user choose the export format and destination for filtered JSON, daily/hourly/model/route/session CSV, complete HTML, or all formats together.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
 - Adds an optional native menu-bar monitor with a compact 60-second rolling Token rate plus historical total and input/cache/output details in its panel.
@@ -96,7 +97,7 @@ Every branch push triggers `.github/workflows/release.yml`. The workflow runs th
 - `Codex-Token-Atlas.dmg`
 - `Codex-Token-Atlas.dmg.sha256`
 
-Release tags use the semantic app version, such as `v2.1.2`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
+Release tags use the semantic app version, such as `v2.1.3`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
 
 ## Generator
 
