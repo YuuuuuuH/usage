@@ -5,9 +5,13 @@ import SwiftUI
 
 private let showInDockDefaultsKey = "showInDockV1"
 private let appearanceModeDefaultsKey = "appearanceModeV1"
+private let appGlassFrostDefaultsKey = "appGlassFrostAmountV1"
+private let liveGlassFrostDefaultsKey = "glassFrostAmountV1"
 private let historicalTotalDefaultsKey = "historicalTotalTokensV1"
 private let liveRefreshDefaultsKey = "liveTokenRefreshSecondsV2"
 private let dashboardRenderScale: CGFloat = 0.9
+private let defaultAppGlassFrostAmount = 1.0
+private let defaultLiveGlassFrostAmount = 0.58
 
 private enum AppearanceMode: Int, CaseIterable {
     case system, light, dark
@@ -39,6 +43,22 @@ private func preferredAppearanceMode() -> AppearanceMode {
     AppearanceMode(rawValue: UserDefaults.standard.integer(forKey: appearanceModeDefaultsKey)) ?? .system
 }
 
+private func preferredAppGlassFrostAmount() -> Double {
+    let defaults = UserDefaults.standard
+    guard defaults.object(forKey: appGlassFrostDefaultsKey) != nil else {
+        return defaultAppGlassFrostAmount
+    }
+    return min(1, max(0, defaults.double(forKey: appGlassFrostDefaultsKey)))
+}
+
+private func preferredLiveGlassFrostAmount() -> Double {
+    let defaults = UserDefaults.standard
+    guard defaults.object(forKey: liveGlassFrostDefaultsKey) != nil else {
+        return defaultLiveGlassFrostAmount
+    }
+    return min(1, max(0, defaults.double(forKey: liveGlassFrostDefaultsKey)))
+}
+
 private extension NSToolbarItem.Identifier {
     static let settings = NSToolbarItem.Identifier("local.codex.token-atlas.settings")
     static let refreshReport = NSToolbarItem.Identifier("local.codex.token-atlas.refresh")
@@ -59,8 +79,8 @@ private enum AtlasColor {
         }
     }
 
-    static let canvas = adaptive(light: rgb(238, 245, 242), dark: rgb(18, 24, 23))
-    static let surface = adaptive(light: rgb(255, 255, 255), dark: rgb(29, 36, 35))
+    static let canvas = adaptive(light: rgb(235, 242, 239), dark: rgb(23, 31, 32))
+    static let surface = adaptive(light: rgb(253, 254, 251), dark: rgb(34, 43, 43))
     static let ink = adaptive(light: rgb(16, 42, 42), dark: rgb(232, 242, 239))
     static let inkSoft = adaptive(light: rgb(62, 92, 89), dark: rgb(188, 204, 199))
     static let muted = adaptive(light: rgb(109, 129, 126), dark: rgb(139, 158, 153))
@@ -81,24 +101,80 @@ private enum AtlasColor {
     static let heatHigh = adaptive(light: rgb(3, 78, 70), dark: rgb(74, 220, 180))
 }
 
-private extension View {
+private struct AtlasGlassFrostKey: EnvironmentKey {
+    static let defaultValue = defaultAppGlassFrostAmount
+}
+
+private extension EnvironmentValues {
+    var atlasGlassFrostAmount: Double {
+        get { self[AtlasGlassFrostKey.self] }
+        set { self[AtlasGlassFrostKey.self] = newValue }
+    }
+}
+
+private struct AtlasGlassModifier<S: Shape>: ViewModifier {
+    @Environment(\.atlasGlassFrostAmount) private var frostAmount
+
+    let shape: S
+    let tint: Color?
+    let prefersClear: Bool
+    let interactive: Bool
+
     @ViewBuilder
+    func body(content: Content) -> some View {
+        let amount = min(1, max(0, frostAmount))
+        let underlayOpacity = amount * (prefersClear ? 0.34 : 0.25)
+        let borderOpacity = 0.38 + amount * 0.34
+
+        if #available(macOS 26.0, *) {
+            content
+                .background {
+                    ZStack {
+                        shape
+                            .fill(.clear)
+                            .glassEffect(Glass.clear.tint(tint).interactive(interactive), in: shape)
+                            .opacity(1 - amount)
+                        shape
+                            .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
+                            .glassEffect(Glass.regular.tint(tint).interactive(interactive), in: shape)
+                            .opacity(amount)
+                    }
+                }
+                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(borderOpacity), lineWidth: 1))
+        } else {
+            content
+                .background {
+                    ZStack {
+                        shape
+                            .fill(.clear)
+                            .background(.ultraThinMaterial, in: shape)
+                            .opacity(1 - amount)
+                        shape
+                            .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
+                            .background(.regularMaterial, in: shape)
+                            .opacity(amount)
+                    }
+                }
+                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(borderOpacity), lineWidth: 1))
+        }
+    }
+}
+
+private extension View {
     func atlasGlass<S: Shape>(
         in shape: S,
         tint: Color? = nil,
         clear: Bool = false,
         interactive: Bool = false
     ) -> some View {
-        if #available(macOS 26.0, *) {
-            let glass = clear ? Glass.clear : Glass.regular
-            glassEffect(glass.tint(tint).interactive(interactive), in: shape)
-        } else if clear {
-            background(.ultraThinMaterial, in: shape)
-                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(0.55), lineWidth: 1))
-        } else {
-            background(.regularMaterial, in: shape)
-                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(0.8), lineWidth: 1))
-        }
+        modifier(
+            AtlasGlassModifier(
+                shape: shape,
+                tint: tint,
+                prefersClear: clear,
+                interactive: interactive
+            )
+        )
     }
 }
 
@@ -866,6 +942,7 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
     private(set) var isPinned = false
     private var isPositioning = false
     private var transientOrigin: NSPoint?
+    private var suppressPinUntil = Date.distantPast
     override var canBecomeKey: Bool { true }
 
     init(contentSize: NSSize) {
@@ -903,11 +980,15 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
     }
 
     func windowWillMove(_ notification: Notification) {
-        if !isPositioning, isVisible { setPinned(true) }
+        if !isPositioning, isVisible, Date() >= suppressPinUntil { setPinned(true) }
     }
 
     func windowDidMove(_ notification: Notification) {
-        guard !isPositioning, isVisible, let origin = transientOrigin else { return }
+        guard !isPositioning,
+              isVisible,
+              Date() >= suppressPinUntil,
+              let origin = transientOrigin
+        else { return }
         if abs(frame.origin.x - origin.x) > 2 || abs(frame.origin.y - origin.y) > 2 {
             setPinned(true)
         }
@@ -924,9 +1005,12 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
         let x = min(max(sourceRect.midX - frame.width / 2, visibleFrame.minX + 8), visibleFrame.maxX - frame.width - 8)
         let top = sourceRect.minY - 5
         isPositioning = true
+        suppressPinUntil = Date().addingTimeInterval(0.35)
         setFrameTopLeftPoint(NSPoint(x: x, y: top))
         transientOrigin = frame.origin
-        isPositioning = false
+        DispatchQueue.main.async { [weak self] in
+            self?.isPositioning = false
+        }
     }
 
     private func setPinned(_ pinned: Bool) {
@@ -966,16 +1050,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private let toolbarSpinner = NSProgressIndicator()
     private let toolbarStatus = NSTextField(labelWithString: "准备中")
     private var refreshToolbarItem: NSToolbarItem?
-    private weak var settingsToolbarButton: NSButton?
-    private weak var liveToolbarButton: NSButton?
+    private var liveToolbarItem: NSToolbarItem?
     private weak var liveMenuItem: NSMenuItem?
     private weak var dockMenuItem: NSMenuItem?
     private let settingsMenu = NSMenu(title: "设置")
     private var appearanceMenuItems: [AppearanceMode: NSMenuItem] = [:]
     private var refreshMenuItems: [Int: NSMenuItem] = [:]
+    private weak var appGlassFrostSlider: NSSlider?
+    private weak var appGlassFrostValueLabel: NSTextField?
+    private weak var liveGlassFrostSlider: NSSlider?
+    private weak var liveGlassFrostValueLabel: NSTextField?
     @Published fileprivate var generatorRunning = false
     @Published fileprivate var loadingTitleText = "正在刷新 Token 历史"
-    @Published fileprivate var loadingDetailText = "读取本地 Codex 会话并校正 fork 用量…"
+    @Published fileprivate var loadingDetailText = "读取本地 Codex 会话并汇总用量…"
     @Published fileprivate var dashboard: DashboardData?
     @Published fileprivate var selectedModel = "all"
     @Published fileprivate var selectedMetric = "total_tokens"
@@ -983,6 +1070,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @Published fileprivate var datePreset = DatePreset.all
     @Published fileprivate var selectedStartDate: Date?
     @Published fileprivate var selectedEndDate: Date?
+    @Published fileprivate var appGlassFrostAmount = preferredAppGlassFrostAmount()
+    @Published fileprivate var liveGlassFrostAmount = preferredLiveGlassFrostAmount()
     fileprivate let livePresentation = LiveMonitorPresentation()
     fileprivate var liveMonitorEnabled = false
 
@@ -993,6 +1082,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var latestLiveSnapshot = LiveTokenSnapshot.zero
     private var historicalTotalTokens = (UserDefaults.standard.object(forKey: historicalTotalDefaultsKey) as? NSNumber)?.int64Value ?? 0
     private var historicalDisplayTimer: Timer?
+    private var appGlassFrostSaveWorkItem: DispatchWorkItem?
+    private var liveGlassFrostSaveWorkItem: DispatchWorkItem?
     private var showsInDock = preferredDockVisibility()
     private var appearanceMode = preferredAppearanceMode()
 
@@ -1041,6 +1132,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     func applicationWillTerminate(_ notification: Notification) {
         publishHistoricalTotal()
+        appGlassFrostSaveWorkItem?.cancel()
+        liveGlassFrostSaveWorkItem?.cancel()
+        UserDefaults.standard.set(appGlassFrostAmount, forKey: appGlassFrostDefaultsKey)
+        UserDefaults.standard.set(liveGlassFrostAmount, forKey: liveGlassFrostDefaultsKey)
         historicalDisplayTimer?.invalidate()
         liveMonitor?.stop()
     }
@@ -1124,6 +1219,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         appearanceItem.submenu = appearanceMenu
         settingsMenu.addItem(appearanceItem)
 
+        let glassItem = NSMenuItem(title: "液态玻璃", action: nil, keyEquivalent: "")
+        let glassMenu = NSMenu(title: "液态玻璃")
+        let appGlassItem = NSMenuItem(title: "主应用", action: nil, keyEquivalent: "")
+        let appGlassMenu = NSMenu(title: "主应用")
+        let appFrostControlItem = NSMenuItem()
+        let appClearLabel = NSTextField(labelWithString: "清透")
+        appClearLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        appClearLabel.textColor = .secondaryLabelColor
+        let appFrostedLabel = NSTextField(labelWithString: "磨砂")
+        appFrostedLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        appFrostedLabel.textColor = .secondaryLabelColor
+        let appSlider = NSSlider(
+            value: appGlassFrostAmount,
+            minValue: 0,
+            maxValue: 1,
+            target: self,
+            action: #selector(changeAppGlassFrost(_:))
+        )
+        appSlider.isContinuous = true
+        appSlider.numberOfTickMarks = 5
+        appSlider.allowsTickMarkValuesOnly = false
+        appSlider.setAccessibilityLabel("主应用液态玻璃磨砂程度")
+        appSlider.widthAnchor.constraint(equalToConstant: 142).isActive = true
+        appGlassFrostSlider = appSlider
+        let appValueLabel = NSTextField(labelWithString: glassFrostLabel(appGlassFrostAmount))
+        appValueLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        appValueLabel.textColor = .secondaryLabelColor
+        appValueLabel.alignment = .center
+        appGlassFrostValueLabel = appValueLabel
+        let appSliderRow = NSStackView(views: [appClearLabel, appSlider, appFrostedLabel])
+        appSliderRow.orientation = .horizontal
+        appSliderRow.alignment = .centerY
+        appSliderRow.spacing = 8
+        let appFrostStack = NSStackView(views: [appSliderRow, appValueLabel])
+        appFrostStack.orientation = .vertical
+        appFrostStack.alignment = .centerX
+        appFrostStack.spacing = 5
+        appFrostStack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        appFrostStack.frame = NSRect(x: 0, y: 0, width: 226, height: 54)
+        appFrostControlItem.view = appFrostStack
+        appGlassMenu.addItem(appFrostControlItem)
+        appGlassMenu.addItem(.separator())
+        let resetAppGlass = appGlassMenu.addItem(withTitle: "恢复 100%", action: #selector(resetAppGlassFrost(_:)), keyEquivalent: "")
+        resetAppGlass.target = self
+        appGlassItem.submenu = appGlassMenu
+        glassMenu.addItem(appGlassItem)
+
+        let liveGlassItem = NSMenuItem(title: "状态栏卡片", action: nil, keyEquivalent: "")
+        let liveGlassMenu = NSMenu(title: "状态栏卡片")
+        let liveFrostControlItem = NSMenuItem()
+        let liveClearLabel = NSTextField(labelWithString: "清透")
+        liveClearLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        liveClearLabel.textColor = .secondaryLabelColor
+        let liveFrostedLabel = NSTextField(labelWithString: "磨砂")
+        liveFrostedLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        liveFrostedLabel.textColor = .secondaryLabelColor
+        let liveSlider = NSSlider(
+            value: liveGlassFrostAmount,
+            minValue: 0,
+            maxValue: 1,
+            target: self,
+            action: #selector(changeLiveGlassFrost(_:))
+        )
+        liveSlider.isContinuous = true
+        liveSlider.numberOfTickMarks = 5
+        liveSlider.allowsTickMarkValuesOnly = false
+        liveSlider.setAccessibilityLabel("状态栏卡片液态玻璃磨砂程度")
+        liveSlider.widthAnchor.constraint(equalToConstant: 142).isActive = true
+        liveGlassFrostSlider = liveSlider
+        let liveValueLabel = NSTextField(labelWithString: glassFrostLabel(liveGlassFrostAmount))
+        liveValueLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        liveValueLabel.textColor = .secondaryLabelColor
+        liveValueLabel.alignment = .center
+        liveGlassFrostValueLabel = liveValueLabel
+        let liveSliderRow = NSStackView(views: [liveClearLabel, liveSlider, liveFrostedLabel])
+        liveSliderRow.orientation = .horizontal
+        liveSliderRow.alignment = .centerY
+        liveSliderRow.spacing = 8
+        let liveFrostStack = NSStackView(views: [liveSliderRow, liveValueLabel])
+        liveFrostStack.orientation = .vertical
+        liveFrostStack.alignment = .centerX
+        liveFrostStack.spacing = 5
+        liveFrostStack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        liveFrostStack.frame = NSRect(x: 0, y: 0, width: 226, height: 54)
+        liveFrostControlItem.view = liveFrostStack
+        liveGlassMenu.addItem(liveFrostControlItem)
+        liveGlassMenu.addItem(.separator())
+        let resetLiveGlass = liveGlassMenu.addItem(withTitle: "恢复平衡值", action: #selector(resetLiveGlassFrost(_:)), keyEquivalent: "")
+        resetLiveGlass.target = self
+        liveGlassItem.submenu = liveGlassMenu
+        glassMenu.addItem(liveGlassItem)
+
+        glassItem.submenu = glassMenu
+        settingsMenu.addItem(glassItem)
+
         let refreshItem = NSMenuItem(title: "实时刷新", action: nil, keyEquivalent: "")
         let refreshMenu = NSMenu(title: "实时刷新")
         for seconds in [1, 2, 5] {
@@ -1139,7 +1329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func configureWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1152, height: 756),
+            contentRect: NSRect(x: 0, y: 0, width: 1040, height: 756),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -1150,8 +1340,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.delegate = self
-        window.titlebarAppearsTransparent = true
-        window.backgroundColor = AtlasColor.canvas
+        window.titlebarAppearsTransparent = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.contentView = NSHostingView(
             rootView: ScaledContent(scale: dashboardRenderScale) {
                 AtlasDashboardView(controller: self)
@@ -1170,10 +1361,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func configureLiveMonitor() {
         livePresentation.historicalTotalTokens = historicalTotalTokens
-        livePanel = LiveMonitorPanel(contentSize: NSSize(width: 292, height: 246))
-        livePanel.contentViewController = NSHostingController(
+        livePanel = LiveMonitorPanel(contentSize: NSSize(width: 300, height: 254))
+        let liveController = NSHostingController(
             rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
         )
+        liveController.view.wantsLayer = true
+        liveController.view.layer?.cornerRadius = 22
+        liveController.view.layer?.masksToBounds = true
+        livePanel.contentViewController = liveController
         livePanel.pinnedChanged = { [weak self] pinned in
             self?.livePresentation.panelPinned = pinned
         }
@@ -1221,9 +1416,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         button.setAccessibilityLabel("Token rate \(formatTokenRate(rate)) tokens per second")
     }
 
+    private func liveToolbarImage(enabled: Bool) -> NSImage? {
+        let symbol = enabled ? "gauge.with.dots.needle.67percent" : "gauge.with.dots.needle.33percent"
+        guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "顶部栏 Token 统计") else {
+            return nil
+        }
+        guard enabled,
+              let configured = image.withSymbolConfiguration(.init(paletteColors: [AtlasColor.teal]))
+        else { return image }
+        configured.isTemplate = false
+        return configured
+    }
+
     @objc private func toggleLiveMonitor(_ sender: Any?) {
-        let enabled = (sender as? NSButton).map { $0.state == .on } ?? !liveMonitorEnabled
-        setLiveMonitorEnabled(enabled, persist: true)
+        setLiveMonitorEnabled(!liveMonitorEnabled, persist: true)
     }
 
     private func setLiveMonitorEnabled(_ enabled: Bool, persist: Bool, ensureReachability: Bool = true) {
@@ -1232,8 +1438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
         liveMonitorEnabled = enabled
         if persist { UserDefaults.standard.set(enabled, forKey: "liveTokenMonitorEnabledV2") }
-        liveToolbarButton?.state = enabled ? .on : .off
-        liveToolbarButton?.contentTintColor = enabled ? AtlasColor.teal : .secondaryLabelColor
+        liveToolbarItem?.image = liveToolbarImage(enabled: enabled)
         liveMenuItem?.state = enabled ? .on : .off
         if enabled {
             installStatusItem()
@@ -1292,13 +1497,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         livePanel.contentView?.needsDisplay = true
     }
 
-    @objc private func chooseLiveRefreshMenu(_ sender: NSMenuItem) {
-        chooseLiveRefresh(sender.tag)
+    @objc private func changeAppGlassFrost(_ sender: NSSlider) {
+        applyAppGlassFrost(sender.doubleValue)
     }
 
-    @objc private func showSettingsMenu(_ sender: Any?) {
-        guard let button = settingsToolbarButton else { return }
-        settingsMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: button)
+    @objc private func resetAppGlassFrost(_ sender: Any?) {
+        applyAppGlassFrost(defaultAppGlassFrostAmount)
+    }
+
+    private func applyAppGlassFrost(_ value: Double) {
+        let clamped = min(1, max(0, value))
+        withAnimation(.linear(duration: 0.10)) {
+            appGlassFrostAmount = clamped
+        }
+        appGlassFrostSlider?.doubleValue = clamped
+        appGlassFrostValueLabel?.stringValue = glassFrostLabel(clamped)
+        appGlassFrostSaveWorkItem?.cancel()
+        let save = DispatchWorkItem {
+            UserDefaults.standard.set(clamped, forKey: appGlassFrostDefaultsKey)
+        }
+        appGlassFrostSaveWorkItem = save
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: save)
+    }
+
+    @objc private func changeLiveGlassFrost(_ sender: NSSlider) {
+        applyLiveGlassFrost(sender.doubleValue)
+    }
+
+    @objc private func resetLiveGlassFrost(_ sender: Any?) {
+        applyLiveGlassFrost(defaultLiveGlassFrostAmount)
+    }
+
+    private func applyLiveGlassFrost(_ value: Double) {
+        let clamped = min(1, max(0, value))
+        withAnimation(.linear(duration: 0.10)) {
+            liveGlassFrostAmount = clamped
+        }
+        liveGlassFrostSlider?.doubleValue = clamped
+        liveGlassFrostValueLabel?.stringValue = glassFrostLabel(clamped)
+        liveGlassFrostSaveWorkItem?.cancel()
+        let save = DispatchWorkItem {
+            UserDefaults.standard.set(clamped, forKey: liveGlassFrostDefaultsKey)
+        }
+        liveGlassFrostSaveWorkItem = save
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: save)
+    }
+
+    private func glassFrostLabel(_ value: Double) -> String {
+        let descriptor: String
+        switch value {
+        case ..<0.34: descriptor = "清透"
+        case 0.72...: descriptor = "磨砂"
+        default: descriptor = "平衡"
+        }
+        return "\(descriptor) · \(Int((value * 100).rounded()))%"
+    }
+
+    @objc private func chooseLiveRefreshMenu(_ sender: NSMenuItem) {
+        chooseLiveRefresh(sender.tag)
     }
 
     fileprivate func showMainWindow() {
@@ -1338,21 +1594,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch identifier {
         case .settings:
-            let image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "设置")
-            let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(showSettingsMenu(_:)))
-            button.bezelStyle = .toolbar
-            button.controlSize = .regular
-            button.imagePosition = .imageOnly
-            button.toolTip = "设置"
-            button.setAccessibilityLabel("设置")
-            button.widthAnchor.constraint(equalToConstant: 34).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 28).isActive = true
-            settingsToolbarButton = button
-            let item = NSToolbarItem(itemIdentifier: identifier)
+            let item = NSMenuToolbarItem(itemIdentifier: identifier)
             item.label = ""
             item.paletteLabel = "设置"
             item.toolTip = "设置"
-            item.view = button
+            item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "设置")
+            item.menu = settingsMenu
+            item.showsIndicator = false
             return item
         case .refreshReport:
             let item = NSToolbarItem(itemIdentifier: identifier)
@@ -1374,24 +1622,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             item.action = #selector(exportReport(_:))
             return item
         case .liveMonitor:
-            let image = NSImage(systemSymbolName: "gauge.with.dots.needle.33percent", accessibilityDescription: "顶部栏 Token 统计")
-            let button = NSButton(image: image ?? NSImage(), target: self, action: #selector(toggleLiveMonitor(_:)))
-            button.setButtonType(.toggle)
-            button.bezelStyle = .toolbar
-            button.controlSize = .regular
-            button.imagePosition = .imageOnly
-            button.state = liveMonitorEnabled ? .on : .off
-            button.contentTintColor = liveMonitorEnabled ? AtlasColor.teal : .secondaryLabelColor
-            button.toolTip = "显示或隐藏顶部栏 Token 统计"
-            button.setAccessibilityLabel("顶部栏 Token 统计")
-            button.widthAnchor.constraint(equalToConstant: 34).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 28).isActive = true
-            liveToolbarButton = button
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = ""
             item.paletteLabel = "顶部栏 Token 统计"
             item.toolTip = "状态栏显示 60 秒实时速率；展开后同时显示历史累计 Token"
-            item.view = button
+            item.image = liveToolbarImage(enabled: liveMonitorEnabled)
+            item.target = self
+            item.action = #selector(toggleLiveMonitor(_:))
+            liveToolbarItem = item
             return item
         case .revealExports:
             let item = NSToolbarItem(itemIdentifier: identifier)
@@ -1435,7 +1673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         generatorRunning = true
-        setLoading(true, title: "正在刷新 Token 历史", detail: "读取本地 Codex 会话并校正 fork 用量…")
+        setLoading(true, title: "正在刷新 Token 历史", detail: "读取本地 Codex 会话并汇总用量…")
         appendLog("\n[\(timestampLabel())] Native app refresh\nPython: \(pythonURL.path)\n")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2373,7 +2611,7 @@ private extension NumberFormatter {
 }
 
 private struct LiveTokenPopover: View {
-    let controller: AppDelegate
+    @ObservedObject var controller: AppDelegate
     @ObservedObject var presentation: LiveMonitorPresentation
 
     private var snapshot: LiveTokenSnapshot { presentation.snapshot }
@@ -2392,20 +2630,20 @@ private struct LiveTokenPopover: View {
             statusLine
         }
         .padding(14)
-        .frame(width: 284, height: 238)
+        .frame(width: 300, height: 254)
         .atlasGlass(
-            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous),
             tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
             clear: true
         )
-        .padding(4)
+        .environment(\.atlasGlassFrostAmount, controller.liveGlassFrostAmount)
     }
 
     private var historySummary: some View {
         HStack(alignment: .lastTextBaseline, spacing: 8) {
             Text("累计 Tokens")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
             Spacer()
             Text(shortNumber(presentation.historicalTotalTokens))
                 .font(.system(size: 18, weight: .bold, design: .monospaced))
@@ -2427,7 +2665,7 @@ private struct LiveTokenPopover: View {
             Spacer(minLength: 4)
             Text(isActive ? "ACTIVE" : "IDLE")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.muted))
+                .foregroundStyle(Color(nsColor: isActive ? AtlasColor.tealDeep : AtlasColor.inkSoft))
             LiveIconButton(symbol: "macwindow", help: "打开 Token Atlas") {
                 controller.showMainWindow()
             }
@@ -2462,7 +2700,7 @@ private struct LiveTokenPopover: View {
             Text(lastEventLabel)
         }
         .font(.system(size: 10, weight: .medium, design: .monospaced))
-        .foregroundStyle(Color(nsColor: AtlasColor.muted))
+        .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
         .lineLimit(1)
     }
 
@@ -2607,12 +2845,12 @@ private struct AtlasDashboardView: View {
                 loadingOverlay
             }
         }
-        .background(Color(nsColor: AtlasColor.canvas))
+        .environment(\.atlasGlassFrostAmount, controller.appGlassFrostAmount)
     }
 
     private var loadingOverlay: some View {
         ZStack {
-            Color(nsColor: .windowBackgroundColor)
+            AtlasGridBackground()
             VStack(spacing: 11) {
                 ProgressView().controlSize(.regular)
                 Text(controller.loadingTitleText).font(.system(size: 18, weight: .semibold))
@@ -2856,16 +3094,9 @@ private struct AtlasDashboardView: View {
 
 private struct AtlasGridBackground: View {
     var body: some View {
-        LinearGradient(
-            colors: [
-                Color(nsColor: AtlasColor.canvas),
-                Color(nsColor: AtlasColor.surface).opacity(0.64),
-                Color(nsColor: AtlasColor.canvas)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .ignoresSafeArea()
+        Color.clear
+            .atlasGlass(in: Rectangle(), clear: true)
+            .ignoresSafeArea()
     }
 }
 

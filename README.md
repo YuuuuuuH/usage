@@ -21,7 +21,7 @@ All session parsing and report generation happen locally. The repository does no
 - Lets the user choose the export format and destination for filtered JSON, daily/hourly/model/route/session CSV, complete HTML, or all formats together.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
 - Adds an optional native menu-bar monitor with a compact 60-second rolling Token rate plus historical total and input/cache/output details in its panel.
-- Uses native Liquid Glass for macOS 26 toolbars, controls, summary bands, and the live panel, with system-material fallbacks on older supported releases.
+- Uses native Liquid Glass for macOS 26 toolbars, controls, summary bands, and the live panel, with system-material fallbacks on older supported releases. Persistent, independent Settings sliders adjust the main app and menu-bar panel from clear to frosted without stacking extra blur layers; macOS 27 system glass preferences still flow through the native material.
 - Defaults live detection to 5 seconds and provides persistent 1-, 2-, or 5-second choices while reading only bytes appended to local session logs.
 - Places Dock presence, System/Light/Dark appearance, and live refresh controls in the toolbar Settings menu immediately left of Refresh.
 
