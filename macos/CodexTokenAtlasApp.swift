@@ -105,55 +105,105 @@ private struct AtlasGlassFrostKey: EnvironmentKey {
     static let defaultValue = defaultAppGlassFrostAmount
 }
 
+private struct AtlasWindowBackdropKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
 private extension EnvironmentValues {
     var atlasGlassFrostAmount: Double {
         get { self[AtlasGlassFrostKey.self] }
         set { self[AtlasGlassFrostKey.self] = newValue }
     }
+
+    var atlasWindowBackdropActive: Bool {
+        get { self[AtlasWindowBackdropKey.self] }
+        set { self[AtlasWindowBackdropKey.self] = newValue }
+    }
+}
+
+private final class AtlasWindowBackdrop {
+    private typealias MainConnectionID = @convention(c) () -> UInt32
+    private typealias SetBackgroundBlur = @convention(c) (UInt32, UInt32, Int32, Float) -> Int32
+
+    static let shared = AtlasWindowBackdrop()
+
+    private let frameworkHandle: UnsafeMutableRawPointer?
+    private let mainConnectionID: MainConnectionID?
+    private let setBackgroundBlur: SetBackgroundBlur?
+
+    var isAvailable: Bool {
+        frameworkHandle != nil && mainConnectionID != nil && setBackgroundBlur != nil
+    }
+
+    private init() {
+        let path = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        guard let handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL),
+              let mainSymbol = dlsym(handle, "CGSMainConnectionID"),
+              let blurSymbol = dlsym(handle, "CGSSetWindowBackgroundBlurRadiusWithOpacityHint")
+        else {
+            frameworkHandle = nil
+            mainConnectionID = nil
+            setBackgroundBlur = nil
+            return
+        }
+        frameworkHandle = handle
+        mainConnectionID = unsafeBitCast(mainSymbol, to: MainConnectionID.self)
+        setBackgroundBlur = unsafeBitCast(blurSymbol, to: SetBackgroundBlur.self)
+    }
+
+    func apply(windowNumber: Int, blurRadius: Int32, opacityHint: Float) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let mainConnectionID,
+              let setBackgroundBlur,
+              let windowID = UInt32(exactly: windowNumber),
+              windowID > 0,
+              opacityHint.isFinite
+        else { return false }
+
+        let radius = min(64, max(0, blurRadius))
+        let opacity = min(1, max(0, opacityHint))
+        return setBackgroundBlur(mainConnectionID(), windowID, radius, opacity) == 0
+    }
 }
 
 private struct AtlasGlassModifier<S: Shape>: ViewModifier {
     @Environment(\.atlasGlassFrostAmount) private var frostAmount
+    @Environment(\.atlasWindowBackdropActive) private var windowBackdropActive
 
     let shape: S
     let tint: Color?
     let prefersClear: Bool
-    let interactive: Bool
 
     @ViewBuilder
     func body(content: Content) -> some View {
         let amount = min(1, max(0, frostAmount))
-        let underlayOpacity = amount * (prefersClear ? 0.34 : 0.25)
+        let underlayOpacity = amount * (prefersClear ? 0.18 : 0.25)
         let borderOpacity = 0.38 + amount * 0.34
 
-        if #available(macOS 26.0, *) {
+        if windowBackdropActive {
             content
                 .background {
-                    ZStack {
-                        shape
-                            .fill(.clear)
-                            .glassEffect(Glass.clear.tint(tint).interactive(interactive), in: shape)
-                            .opacity(1 - amount)
-                        shape
-                            .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
-                            .glassEffect(Glass.regular.tint(tint).interactive(interactive), in: shape)
-                            .opacity(amount)
-                    }
+                    shape
+                        .fill(Color(nsColor: AtlasColor.surface).opacity(0.12 + amount * 0.16))
+                        .overlay(shape.fill(tint ?? Color.clear))
+                }
+                .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(borderOpacity), lineWidth: 1))
+        } else if #available(macOS 26.0, *) {
+            let glass: Glass = prefersClear ? .clear : .regular
+            content
+                .background {
+                    shape
+                        .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
+                        .glassEffect(glass.tint(tint), in: shape)
                 }
                 .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(borderOpacity), lineWidth: 1))
         } else {
+            let material: Material = prefersClear ? .ultraThin : .regular
             content
                 .background {
-                    ZStack {
-                        shape
-                            .fill(.clear)
-                            .background(.ultraThinMaterial, in: shape)
-                            .opacity(1 - amount)
-                        shape
-                            .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
-                            .background(.regularMaterial, in: shape)
-                            .opacity(amount)
-                    }
+                    shape
+                        .fill(Color(nsColor: AtlasColor.surface).opacity(underlayOpacity))
+                        .background(material, in: shape)
                 }
                 .overlay(shape.stroke(Color(nsColor: AtlasColor.line).opacity(borderOpacity), lineWidth: 1))
         }
@@ -164,15 +214,13 @@ private extension View {
     func atlasGlass<S: Shape>(
         in shape: S,
         tint: Color? = nil,
-        clear: Bool = false,
-        interactive: Bool = false
+        clear: Bool = false
     ) -> some View {
         modifier(
             AtlasGlassModifier(
                 shape: shape,
                 tint: tint,
-                prefersClear: clear,
-                interactive: interactive
+                prefersClear: clear
             )
         )
     }
@@ -1072,6 +1120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @Published fileprivate var selectedEndDate: Date?
     @Published fileprivate var appGlassFrostAmount = preferredAppGlassFrostAmount()
     @Published fileprivate var liveGlassFrostAmount = preferredLiveGlassFrostAmount()
+    @Published fileprivate var usesWindowBackdrop = false
     fileprivate let livePresentation = LiveMonitorPresentation()
     fileprivate var liveMonitorEnabled = false
 
@@ -1083,6 +1132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var historicalTotalTokens = (UserDefaults.standard.object(forKey: historicalTotalDefaultsKey) as? NSNumber)?.int64Value ?? 0
     private var historicalDisplayTimer: Timer?
     private var appGlassFrostSaveWorkItem: DispatchWorkItem?
+    private var windowBackdropUpdateWorkItem: DispatchWorkItem?
     private var liveGlassFrostSaveWorkItem: DispatchWorkItem?
     private var showsInDock = preferredDockVisibility()
     private var appearanceMode = preferredAppearanceMode()
@@ -1121,6 +1171,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         refreshReport(nil)
+        if !generatorRunning {
+            enableWindowBackdrop()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -1133,6 +1186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     func applicationWillTerminate(_ notification: Notification) {
         publishHistoricalTotal()
         appGlassFrostSaveWorkItem?.cancel()
+        windowBackdropUpdateWorkItem?.cancel()
         liveGlassFrostSaveWorkItem?.cancel()
         UserDefaults.standard.set(appGlassFrostAmount, forKey: appGlassFrostDefaultsKey)
         UserDefaults.standard.set(liveGlassFrostAmount, forKey: liveGlassFrostDefaultsKey)
@@ -1341,8 +1395,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         window.isRestorable = false
         window.delegate = self
         window.titlebarAppearsTransparent = false
-        window.isOpaque = false
-        window.backgroundColor = .clear
+        window.isOpaque = true
+        window.backgroundColor = AtlasColor.canvas
         window.contentView = NSHostingView(
             rootView: ScaledContent(scale: dashboardRenderScale) {
                 AtlasDashboardView(controller: self)
@@ -1394,12 +1448,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func installStatusItem() {
         guard statusItem == nil else { return }
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let item = NSStatusBar.system.statusItem(withLength: 30)
         statusItem = item
         guard let button = item.button else { return }
-        button.image = nil
-        button.imagePosition = .noImage
-        button.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
         button.target = self
         button.action = #selector(toggleLivePopover(_:))
         button.sendAction(on: [.leftMouseUp])
@@ -1412,7 +1466,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let value = formatStatusTokenRate(rate)
         guard value != lastStatusRateText else { return }
         lastStatusRateText = value
-        button.title = value
+
+        let size = NSSize(width: 30, height: NSStatusBar.system.thickness)
+        let image = NSImage(size: size, flipped: true) { _ in
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            paragraph.lineBreakMode = .byClipping
+            let titleAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 6, weight: .medium),
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph
+            ]
+            let valueAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold),
+                .foregroundColor: NSColor.black,
+                .paragraphStyle: paragraph
+            ]
+            ("Tokens" as NSString).draw(
+                in: NSRect(x: 0, y: 1, width: size.width, height: 8),
+                withAttributes: titleAttributes
+            )
+            (value as NSString).draw(
+                in: NSRect(x: 0, y: 8, width: size.width, height: 13),
+                withAttributes: valueAttributes
+            )
+            return true
+        }
+        image.isTemplate = true
+        button.image = image
         button.setAccessibilityLabel("Token rate \(formatTokenRate(rate)) tokens per second")
     }
 
@@ -1518,6 +1599,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
         appGlassFrostSaveWorkItem = save
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.20, execute: save)
+
+        windowBackdropUpdateWorkItem?.cancel()
+        let backdropUpdate = DispatchWorkItem { [weak self] in
+            guard let self, !self.generatorRunning else { return }
+            self.enableWindowBackdrop()
+        }
+        windowBackdropUpdateWorkItem = backdropUpdate
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: backdropUpdate)
     }
 
     @objc private func changeLiveGlassFrost(_ sender: NSSlider) {
@@ -1562,6 +1651,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if !generatorRunning {
+            DispatchQueue.main.async { [weak self] in
+                self?.enableWindowBackdrop()
+            }
+        }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard !generatorRunning else { return }
+        enableWindowBackdrop()
     }
 
     private func chooseLiveRefresh(_ seconds: Int) {
@@ -2530,13 +2629,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         refreshToolbarItem?.isEnabled = !loading
         generatorRunning = loading
         if loading {
+            suspendWindowBackdrop()
             loadingTitleText = title
             loadingDetailText = detail
             toolbarSpinner.startAnimation(nil)
             toolbarStatus.stringValue = title
         } else {
             toolbarSpinner.stopAnimation(nil)
+            enableWindowBackdrop()
         }
+    }
+
+    private var windowBackdropConfiguration: (radius: Int32, opacity: Float) {
+        let amount = min(1, max(0, appGlassFrostAmount))
+        return (
+            radius: Int32((8 + amount * 24).rounded()),
+            opacity: Float(0.78 + amount * 0.12)
+        )
+    }
+
+    private func enableWindowBackdrop() {
+        guard window != nil, window.isVisible, !generatorRunning else { return }
+        let configuration = windowBackdropConfiguration
+        window.isOpaque = false
+        window.backgroundColor = NSColor.clear.withAlphaComponent(0.000_000_1)
+
+        if AtlasWindowBackdrop.shared.apply(
+            windowNumber: window.windowNumber,
+            blurRadius: configuration.radius,
+            opacityHint: configuration.opacity
+        ) {
+            usesWindowBackdrop = true
+            window.contentView?.needsDisplay = true
+        } else {
+            suspendWindowBackdrop()
+        }
+    }
+
+    private func suspendWindowBackdrop() {
+        usesWindowBackdrop = false
+        guard window != nil else { return }
+        window.isOpaque = true
+        window.backgroundColor = AtlasColor.canvas
+        if window.windowNumber > 0, AtlasWindowBackdrop.shared.isAvailable {
+            _ = AtlasWindowBackdrop.shared.apply(
+                windowNumber: window.windowNumber,
+                blurRadius: 0,
+                opacityHint: 1
+            )
+        }
+        window.contentView?.needsDisplay = true
     }
 
     private func locatePython() -> URL? {
@@ -2725,7 +2867,7 @@ private struct LiveIconButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .atlasGlass(in: Circle(), interactive: true)
+        .atlasGlass(in: Circle())
         .help(help)
     }
 }
@@ -2846,16 +2988,20 @@ private struct AtlasDashboardView: View {
             }
         }
         .environment(\.atlasGlassFrostAmount, controller.appGlassFrostAmount)
+        .environment(\.atlasWindowBackdropActive, controller.usesWindowBackdrop)
     }
 
     private var loadingOverlay: some View {
         ZStack {
-            AtlasGridBackground()
             VStack(spacing: 11) {
                 ProgressView().controlSize(.regular)
                 Text(controller.loadingTitleText).font(.system(size: 18, weight: .semibold))
                 Text(controller.loadingDetailText).font(.system(size: 12)).foregroundStyle(.secondary)
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            Color(nsColor: AtlasColor.canvas)
         }
         .ignoresSafeArea()
     }
@@ -3093,10 +3239,36 @@ private struct AtlasDashboardView: View {
 }
 
 private struct AtlasGridBackground: View {
+    @Environment(\.atlasGlassFrostAmount) private var frostAmount
+    @Environment(\.atlasWindowBackdropActive) private var windowBackdropActive
+
+    @ViewBuilder
     var body: some View {
-        Color.clear
-            .atlasGlass(in: Rectangle(), clear: true)
+        if windowBackdropActive {
+            let amount = min(1, max(0, frostAmount))
+            let opacity = 0.78 + amount * 0.12
+            LinearGradient(
+                colors: [
+                    Color(nsColor: AtlasColor.canvas).opacity(opacity),
+                    Color(nsColor: AtlasColor.surface).opacity(opacity),
+                    Color(nsColor: AtlasColor.canvas).opacity(opacity)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
             .ignoresSafeArea()
+        } else {
+            LinearGradient(
+                colors: [
+                    Color(nsColor: AtlasColor.canvas),
+                    Color(nsColor: AtlasColor.surface).opacity(0.64),
+                    Color(nsColor: AtlasColor.canvas)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+        }
     }
 }
 
