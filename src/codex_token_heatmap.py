@@ -8,6 +8,7 @@ import csv
 import hashlib
 import html
 import json
+import math
 import os
 import pickle
 import re
@@ -61,7 +62,8 @@ OUTPUT_ARTIFACTS = (
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 REPORT_SCHEMA_VERSION = 3
-INCREMENTAL_CACHE_VERSION = 1
+INCREMENTAL_CACHE_VERSION = 2
+INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, INCREMENTAL_CACHE_VERSION}
 CACHE_ROOT = HOME / "Library" / "Caches" / "CodexTokenAtlas"
 ALL_MODELS_KEY = "all"
 UNKNOWN_MODEL = "(unknown)"
@@ -218,7 +220,7 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
         return None
     if not isinstance(envelope, IncrementalCacheEnvelope):
         return None
-    if envelope.version != INCREMENTAL_CACHE_VERSION:
+    if envelope.version not in INCREMENTAL_CACHE_COMPATIBLE_VERSIONS:
         return None
     if envelope.source_home != str(source.home):
         return None
@@ -226,6 +228,16 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
         return None
     if not isinstance(envelope.report, UsageReport):
         return None
+    if envelope.version == 1:
+        base_catalog = PRICING_USD_PER_MTOK if source.enable_official_pricing else {}
+        _, configured_custom_models, _ = read_pricing_config(
+            source.model_aliases_file,
+            base_catalog,
+        )
+        if configured_custom_models:
+            return None
+    if not hasattr(envelope.report, "custom_pricing_models"):
+        envelope.report.custom_pricing_models = set()
     return envelope.report
 
 
@@ -268,6 +280,7 @@ def pricing_rate(
 ) -> dict[str, Any]:
     return {
         "provider": provider,
+        "pricing_kind": "official",
         "input": input_rate,
         "cached_input": cached_input_rate,
         "cache_write_input": cache_write_input_rate,
@@ -825,6 +838,7 @@ class UsageReport:
     billing_context: dict[str, Any] = field(default_factory=dict)
     configured_service_tier_fallback: str = DEFAULT_SERVICE_TIER
     pricing_catalog: dict[str, dict[str, Any]] = field(default_factory=dict)
+    custom_pricing_models: set[str] = field(default_factory=set)
     pricing_aliases: dict[str, str] = field(default_factory=dict)
     pricing_config_errors: list[str] = field(default_factory=list)
     totals: Counter = field(default_factory=Counter)
@@ -1567,46 +1581,108 @@ def read_billing_context(auth_file: Path = AUTH_FILE) -> dict[str, Any]:
 def optional_rate(value: Any) -> float | None:
     if value is None:
         return None
+    if isinstance(value, bool):
+        return None
     try:
         rate = float(value)
     except (TypeError, ValueError):
         return None
-    return rate if rate >= 0 else None
+    return rate if math.isfinite(rate) and rate >= 0 else None
+
+
+def read_pricing_config(
+    path: Path = MODEL_ALIASES_FILE,
+    base_catalog: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], list[str]]:
+    if not path.exists():
+        return {}, {}, []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {}, {}, [f"Cannot read {path.name}: {error}"]
+    if not isinstance(value, dict):
+        return {}, {}, [f"{path.name} must contain a JSON object"]
+
+    base_models = dict(
+        PRICING_USD_PER_MTOK if base_catalog is None else base_catalog
+    )
+    errors: list[str] = []
+    custom_models: dict[str, dict[str, Any]] = {}
+    model_values = value.get("models") or {}
+    if not isinstance(model_values, dict):
+        errors.append(f"{path.name} models must contain a JSON object")
+        model_values = {}
+    for model, configured in model_values.items():
+        if not isinstance(model, str) or not model.strip():
+            errors.append("Custom model IDs must be non-empty strings")
+            continue
+        model_id = normalized_model_id(model)
+        if model_id in base_models:
+            continue
+        if not isinstance(configured, dict):
+            errors.append(f"Custom model {model!r} must contain a JSON object")
+            continue
+
+        input_rate = optional_rate(configured.get("input"))
+        output_rate = optional_rate(configured.get("output"))
+        if input_rate is None or output_rate is None:
+            errors.append(
+                f"Custom model {model!r} requires non-negative input and output rates"
+            )
+            continue
+
+        cached_input_rate = optional_rate(configured.get("cached_input"))
+        cache_write_rate = optional_rate(configured.get("cache_write_input"))
+        if "cached_input" in configured and cached_input_rate is None:
+            errors.append(f"Custom model {model!r} has an invalid cached_input rate")
+            continue
+        if "cache_write_input" in configured and cache_write_rate is None:
+            errors.append(
+                f"Custom model {model!r} has an invalid cache_write_input rate"
+            )
+            continue
+
+        provider = clean_text(configured.get("provider"), 80) or "Custom"
+        custom_models[model_id] = pricing_rate(
+            input_rate,
+            cached_input_rate if cached_input_rate is not None else input_rate,
+            output_rate,
+            cache_write_input_rate=(
+                cache_write_rate if cache_write_rate is not None else input_rate
+            ),
+            provider=provider,
+            source=path.name,
+        )
+        custom_models[model_id]["pricing_kind"] = "custom"
+
+    effective_catalog = dict(base_models)
+    effective_catalog.update(custom_models)
+    aliases: dict[str, str] = {}
+    alias_values = value.get("aliases") or {}
+    if not isinstance(alias_values, dict):
+        errors.append(f"{path.name} aliases must contain a JSON object")
+        alias_values = {}
+    for key, target in alias_values.items():
+        if isinstance(key, str) and isinstance(target, str) and target.strip():
+            aliases[key.strip().lower()] = normalized_model_id(target)
+        else:
+            errors.append("Pricing aliases must map non-empty strings to model IDs")
+
+    for alias, target in aliases.items():
+        if target not in effective_catalog:
+            errors.append(f"Alias {alias!r} targets unknown priced model {target!r}")
+    aliases = {
+        alias: target
+        for alias, target in aliases.items()
+        if target in effective_catalog
+    }
+    return aliases, custom_models, errors
 
 
 def read_model_aliases(
     path: Path = MODEL_ALIASES_FILE,
 ) -> tuple[dict[str, str], list[str]]:
-    if not path.exists():
-        return {}, []
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        return {}, [f"Cannot read {path.name}: {error}"]
-    if not isinstance(value, dict):
-        return {}, [f"{path.name} must contain a JSON object"]
-
-    aliases: dict[str, str] = {}
-    alias_values = value.get("aliases") or {}
-    if not isinstance(alias_values, dict):
-        alias_values = {}
-    for key, target in alias_values.items():
-        if isinstance(key, str) and isinstance(target, str) and target.strip():
-            aliases[key.strip().lower()] = target.strip().lower()
-
-    errors: list[str] = []
-    if value.get("models"):
-        errors.append(
-            "Custom rates are ignored; aliases may only target built-in official models"
-        )
-    for alias, target in aliases.items():
-        if target not in PRICING_USD_PER_MTOK:
-            errors.append(f"Alias {alias!r} targets unknown official model {target!r}")
-    aliases = {
-        alias: target
-        for alias, target in aliases.items()
-        if target in PRICING_USD_PER_MTOK
-    }
+    aliases, _, errors = read_pricing_config(path, PRICING_USD_PER_MTOK)
     return aliases, errors
 
 
@@ -2052,7 +2128,16 @@ def collect_usage(
     if thread_info is None:
         thread_info = read_thread_info()
     descriptors = discover_sessions(sessions_root, thread_info)
-    model_aliases, pricing_errors = read_model_aliases(model_aliases_file)
+    base_pricing_catalog = (
+        dict(PRICING_USD_PER_MTOK)
+        if pricing_catalog is None
+        else dict(pricing_catalog)
+    )
+    model_aliases, custom_pricing, pricing_errors = read_pricing_config(
+        model_aliases_file,
+        base_pricing_catalog,
+    )
+    base_pricing_catalog.update(custom_pricing)
     configured_service_tier = normalize_service_tier(
         fallback_service_tier
         if fallback_service_tier is not None
@@ -2070,11 +2155,8 @@ def collect_usage(
             else read_billing_context()
         ),
         configured_service_tier_fallback=configured_service_tier,
-        pricing_catalog=(
-            dict(PRICING_USD_PER_MTOK)
-            if pricing_catalog is None
-            else dict(pricing_catalog)
-        ),
+        pricing_catalog=base_pricing_catalog,
+        custom_pricing_models=set(custom_pricing),
         pricing_aliases=model_aliases,
         pricing_config_errors=pricing_errors,
     )
@@ -2779,6 +2861,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
         if pricing_match is None:
             model_details[model] = {
                 "pricing_model": None,
+                "pricing_kind": None,
                 "rates": None,
                 "source": None,
                 "costs": cost_dict(costs),
@@ -2789,6 +2872,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
         model_details[model] = {
             "pricing_provider": pricing.get("provider"),
             "pricing_model": pricing_model,
+            "pricing_kind": pricing.get("pricing_kind", "official"),
             "rates": {
                 "input": float(pricing["input"]),
                 "cached_input": (
@@ -2830,6 +2914,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
             "costs": cost_dict(costs),
             "pricing_provider": None,
             "pricing_model": None,
+            "pricing_kind": None,
             "rates": None,
             "source": None,
             "daily": {
@@ -2854,6 +2939,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
                 {
                     "pricing_provider": pricing.get("provider"),
                     "pricing_model": pricing_model,
+                    "pricing_kind": pricing.get("pricing_kind", "official"),
                     "rates": selected_rates,
                     "source": source,
                     "tier_rate_fallback": tier_fallback,
@@ -2865,6 +2951,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
     return {
         "currency": "USD",
         "as_of": PRICING_AS_OF,
+        "custom_models": sorted(report.custom_pricing_models),
         "long_context_threshold": LONG_CONTEXT_THRESHOLD,
         "scopes": scopes,
         "models": model_details,
@@ -3671,7 +3758,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   <section class="panel">
     <div class="panel-inner">
       <div class="panel-head">
-        <div><h2>官方 API 等价价值</h2><p class="panel-kicker" id="costCaption"></p></div>
+        <div><h2>Token 价值估算</h2><p class="panel-kicker" id="costCaption"></p></div>
         <div class="scale-note" id="pricingAsOf"></div>
       </div>
       <div class="cost-strip">
@@ -3893,6 +3980,9 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     const coverageBase = Number(cost.priced_tokens || 0) + Number(cost.unpriced_tokens || 0);
     const coverage = coverageBase ? Number(cost.priced_tokens || 0) / coverageBase : 0;
     const hasTrustedPricing = Number(cost.priced_tokens || 0) > 0;
+    const hasCustomPricing = pricing.routes.some(route =>
+      (state.model === "all" || route.model === state.model) && route.pricing_kind === "custom"
+    );
     document.getElementById("estimatedCost").textContent = hasTrustedPricing ? usd(cost.estimated_cost_usd) : "未定价";
     document.getElementById("estimatedCostDetail").textContent = `${(coverage * 100).toFixed(1)}% categorized tokens priced`;
     document.getElementById("standardCost").textContent = hasTrustedPricing ? usd(cost.standard_equivalent_cost_usd) : "未定价";
@@ -3902,9 +3992,13 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("cacheSavings").textContent = hasTrustedPricing ? usd(cost.cache_savings_usd) : "—";
     document.getElementById("cacheSavingsDetail").textContent = `${usd(cost.cached_input_cost_usd)} read · ${usd(cost.cache_write_input_cost_usd)} write`;
     document.getElementById("costCaption").textContent = hasTrustedPricing
-      ? `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。`
-      : `${modelLabel(state.model)} · 当前数据目录没有可信官方价格；模型、调用和 token 仍完整统计。`;
-    document.getElementById("pricingAsOf").textContent = hasTrustedPricing ? `OFFICIAL DIRECT RATES · ${pricing.as_of}` : "UNPRICED SOURCE";
+      ? hasCustomPricing
+        ? `${modelLabel(state.model)} · 使用当前数据目录保存的逐模型单价估算文本 token 价值。`
+        : `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。`
+      : `${modelLabel(state.model)} · 当前数据目录尚未配置可用价格；模型、调用和 token 仍完整统计。`;
+    document.getElementById("pricingAsOf").textContent = hasTrustedPricing
+      ? hasCustomPricing ? "CUSTOM MODEL RATES" : `OFFICIAL DIRECT RATES · ${pricing.as_of}`
+      : "UNPRICED SOURCE";
 
     const visibleRoutes = pricing.routes.filter(route => state.model === "all" || route.model === state.model);
     const rateCell = value => value == null ? "—" : usd(value);
@@ -3927,23 +4021,27 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
         : "日志不保存可验证的历史认证方式，因此不能判定每次调用属于订阅还是 API 账单。";
     const aliasPath = pricing.model_aliases.path || "token_atlas_pricing.json";
     const configNote = pricing.model_aliases.aliases
-      ? ` 已加载 ${pricing.model_aliases.aliases} 个官方模型别名映射。`
-      : ` 可用 ${aliasPath} 将内部模型名映射到内置官方型号；不接受中转站自定义单价。`;
-    const configErrorNote = pricing.model_aliases.errors.length ? ` 模型映射配置有 ${pricing.model_aliases.errors.length} 个错误。` : "";
+      ? ` 已加载 ${pricing.model_aliases.aliases} 个模型别名映射。`
+      : ` 可用 ${aliasPath} 保存逐模型单价和模型别名。`;
+    const customRateNote = hasCustomPricing ? ` 已加载 ${pricing.custom_models.length} 个自定义模型价格。` : "";
+    const configErrorNote = pricing.model_aliases.errors.length ? ` 价格配置有 ${pricing.model_aliases.errors.length} 个错误。` : "";
     const inferredTier = pricing.billing_context?.configured_service_tier_fallback === "priority" ? "Fast/Priority" : (pricing.billing_context?.configured_service_tier_fallback || "Default");
     const inferredTierCalls = Number(pricing.billing_context?.inferred_service_tier_calls || 0);
     const inferredTierNote = inferredTierCalls ? ` 日志缺失 tier 的 ${fmt(inferredTierCalls)} 次调用按当前数据目录配置 ${inferredTier} 推断。` : "";
     document.getElementById("costMethod").textContent = hasTrustedPricing
-      ? `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`
-      : `当前来源仅提供用量统计。为避免本地模型与官方模型同名造成误计价，不推断任何 API 费用。${unpricedNote}`;
+      ? hasCustomPricing
+        ? `自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。${customRateNote}${configNote}${configErrorNote}${unpricedNote}`
+        : `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`
+      : `当前来源仅提供用量统计。可在应用设置中为已识别模型填写价格。${configErrorNote}${unpricedNote}`;
     const sourceMap = new Map();
     pricing.sources.forEach(item => {
       if (!sourceMap.has(item.url)) sourceMap.set(item.url, []);
       sourceMap.get(item.url).push(item.model);
     });
     document.getElementById("pricingSources").innerHTML = [...sourceMap].map(([url, labels]) => {
-      const label = `${labels.join(" · ")} 官方价目表`;
-      return /^https?:\/\//i.test(url)
+      const isOfficial = /^https?:\/\//i.test(url);
+      const label = `${labels.join(" · ")} ${isOfficial ? "官方价目表" : "自定义价格"}`;
+      return isOfficial
         ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`
         : `<span>${escapeHtml(label)} · local config</span>`;
     }).join("");
@@ -4585,15 +4683,47 @@ def run_self_test() -> None:
                     "aliases": {
                         "Relay/internal-sol": "gpt-5.6-sol",
                         "bad": "not-an-official-model",
-                    }
+                    },
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "provider": "Custom",
+                            "input": 0,
+                            "output": 0,
+                        },
+                        "Qwen3.8-27B": {
+                            "provider": "Local Qodex",
+                            "input": 0.2,
+                            "cached_input": 0.05,
+                            "cache_write_input": 0.1,
+                            "output": 0.8,
+                        }
+                    },
                 }
             ),
             encoding="utf-8",
         )
-        aliases, alias_errors = read_model_aliases(alias_file)
+        aliases, custom_models, alias_errors = read_pricing_config(
+            alias_file,
+            PRICING_USD_PER_MTOK,
+        )
         assert aliases["relay/internal-sol"] == "gpt-5.6-sol"
         assert "bad" not in aliases
         assert len(alias_errors) == 1
+        assert "gpt-5.6-sol" not in custom_models
+        assert custom_models["qwen3.8-27b"]["pricing_kind"] == "custom"
+        assert custom_models["qwen3.8-27b"]["provider"] == "Local Qodex"
+        custom_catalog = dict(PRICING_USD_PER_MTOK)
+        custom_catalog.update(custom_models)
+        qwen_cost = estimate_usage_cost(
+            "Local Qodex",
+            "Qwen3.8-27B",
+            "default",
+            priced_usage,
+            custom_catalog,
+            aliases,
+        )
+        assert abs(qwen_cost["estimated_cost_usd"] - 0.00021) < 1e-12
+        assert qwen_cost["priced_tokens"] == priced_usage["total_tokens"]
         assert pricing_for_model(
             "internal-sol", "Relay", PRICING_USD_PER_MTOK, aliases
         )[0] == "gpt-5.6-sol"
@@ -4617,7 +4747,7 @@ def run_self_test() -> None:
         assert dashboard["pricing"]["timeline_hourly"]["gpt-5.6-sol"]["2026-01-02T11"]["priority_tier_calls"] == 1
         assert dashboard["pricing"]["daily"]["all"]["2026-01-02"]["unpriced_tokens"] == 30
         assert "一周 × 24 小时" in render_html(report)
-        assert "官方 API 等价价值" in render_html(report)
+        assert "Token 价值估算" in render_html(report)
 
         incremental_last = {
             "input_tokens": 10,
@@ -4744,7 +4874,66 @@ def run_self_test() -> None:
         assert qodex_dashboard["pricing"]["scopes"]["all"]["unpriced_tokens"] == 100
 
         qodex_cache_path = incremental_cache_path(qodex_source)
+        CACHE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        legacy_qodex_report = pickle.loads(pickle.dumps(qodex_report))
+        del legacy_qodex_report.custom_pricing_models
+        with qodex_cache_path.open("wb") as handle:
+            pickle.dump(
+                IncrementalCacheEnvelope(
+                    version=1,
+                    source_home=str(qodex_source.home),
+                    auxiliary_manifest=auxiliary_input_manifest(qodex_source),
+                    report=legacy_qodex_report,
+                ),
+                handle,
+            )
+        qodex_cache_path.chmod(0o600)
+        migrated_qodex_report = load_incremental_cache(qodex_source)
+        assert migrated_qodex_report is not None
+        assert migrated_qodex_report.custom_pricing_models == set()
+        qodex_cache_path.unlink()
+
+        qodex_source.model_aliases_file.write_text(
+            json.dumps(
+                {
+                    "models": {
+                        "gpt-5.6-sol": {
+                            "provider": "Qodex",
+                            "input": 1.0,
+                            "cached_input": 0.25,
+                            "cache_write_input": 1.0,
+                            "output": 2.0,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        qodex_report = collect_source_usage(qodex_source)
+        qodex_dashboard = build_dashboard_data(qodex_report)
+        assert qodex_report.custom_pricing_models == {"gpt-5.6-sol"}
+        assert qodex_dashboard["pricing"]["custom_models"] == ["gpt-5.6-sol"]
+        assert qodex_dashboard["pricing"]["scopes"]["all"]["priced_tokens"] == 100
+        assert qodex_dashboard["pricing"]["scopes"]["all"]["unpriced_tokens"] == 0
+        assert abs(
+            qodex_dashboard["pricing"]["scopes"]["all"]["estimated_cost_usd"]
+            - 0.00011
+        ) < 1e-12
+        assert qodex_dashboard["pricing"]["routes"][0]["pricing_kind"] == "custom"
+
         try:
+            with qodex_cache_path.open("wb") as handle:
+                pickle.dump(
+                    IncrementalCacheEnvelope(
+                        version=1,
+                        source_home=str(qodex_source.home),
+                        auxiliary_manifest=auxiliary_input_manifest(qodex_source),
+                        report=qodex_report,
+                    ),
+                    handle,
+                )
+            qodex_cache_path.chmod(0o600)
+            assert load_incremental_cache(qodex_source) is None
             save_incremental_cache(qodex_source, qodex_report)
             next_qodex_id = "00000000-0000-4000-8000-000000000005"
             next_qodex_path = qodex_session_dir / f"rollout-{next_qodex_id}.jsonl"
@@ -4843,7 +5032,10 @@ def main() -> None:
     if summary is None:
         report = incrementally_refresh_usage(source)
         if report is None:
+            print("Parser cache unavailable; rebuilding full history.")
             report = collect_source_usage(source)
+        else:
+            print("Loaded the source-specific parser cache; processed appended data only.")
         summary = write_outputs(report, input_manifest)
         save_incremental_cache(source, report)
     else:
@@ -4868,11 +5060,12 @@ def main() -> None:
     print(f"Unclassified tokens: {fmt_int(totals['unclassified_tokens'])}")
     print(f"Unique model calls: {fmt_int(totals['calls'])}")
     print()
+    audit = summary.get("audit") or {}
     print(
         "Fork/replay events skipped: "
-        f"{fmt_int(report.duplicate_events)} "
-        f"({fmt_int(report.inherited_events)} inherited, "
-        f"{fmt_int(report.local_duplicate_events)} local duplicates)"
+        f"{fmt_int(audit.get('duplicate_events_skipped', 0))} "
+        f"({fmt_int(audit.get('inherited_fork_events_skipped', 0))} inherited, "
+        f"{fmt_int(audit.get('local_duplicate_events_skipped', 0))} local duplicates)"
     )
     print(f"Models: {', '.join(summary['usage_by_model'])}")
 

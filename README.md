@@ -16,6 +16,7 @@ All session parsing and report generation happen locally. The repository does no
 - Switches between a simple Standard-rate estimate and a service-tier estimate that distinguishes Default from Fast/Priority calls.
 - Separates Standard/default and Priority/Fast API rates where the provider publishes both.
 - Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. Unknown models remain visible and are marked unpriced.
+- Stores optional per-model prices for local and open-source models inside the selected data home, with separate uncached input, cache read, cache write, and output rates.
 - Reads cache hits and cache writes separately when the log schema provides them.
 - Adds date- and model-aware official value columns to session and route reporting.
 - Keeps All Time, last-7-day, and last-30-day ranges anchored to the newest report date after every refresh.
@@ -52,26 +53,36 @@ Channel interpretation remains separate from those controls:
 - **Other provider or relay:** the logged provider and model are retained. A recognized DeepSeek, Gemini, Claude, Grok, or GPT model is valued at that vendor's official direct rate even when it was reached through an OpenAI-compatible relay.
 - **Unknown or internal model:** usage remains in every total and export, but value is unpriced until it can be mapped to a built-in official model.
 
-Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, while official-price comparisons are enabled for the standard Codex home.
+Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, and remain unpriced until a per-model price is saved from Settings. Model names in alternate data homes do not automatically inherit official API prices.
 
 Unclassified tokens are excluded from value. Cache writes use a published write rate when one exists; otherwise they use the uncached input rate. Pricing sources are listed in the generated report.
 
-## Official model aliases
+## Model pricing and aliases
 
-Create `~/.codex/token_atlas_pricing.json` only when a relay logs an internal model name that should map to a known official model. The repository includes [an example](examples/token_atlas_pricing.example.json).
+Use **Settings → Open-source/local model pricing…** to save prices for currently unpriced models in the selected data home. Models already covered by the built-in official catalog are omitted. Prices use USD per one million tokens and are stored in `<data-home>/token_atlas_pricing.json`. Input and output are required; cache read and cache write default to the input rate when left blank.
 
-An alias can be global or scoped to a logged provider:
+The same file can map a relay's internal model name to another priced model. The repository includes [an example](examples/token_atlas_pricing.example.json).
+
+Prices are exact per model, while an alias can be global or scoped to a logged provider:
 
 ```json
 {
+  "models": {
+    "Qwen3.8-27B": {
+      "provider": "Qodex",
+      "input": 0.20,
+      "cached_input": 0.05,
+      "cache_write_input": 0.20,
+      "output": 0.80
+    }
+  },
   "aliases": {
-    "CompanyRelay/internal-gpt": "gpt-5.6-sol",
-    "internal-deepseek": "deepseek-v4-pro"
+    "LocalRelay/qwen-latest": "qwen3.8-27b"
   }
 }
 ```
 
-Alias targets must exist in the app's built-in official catalog. Custom relay prices and contract rates are intentionally rejected, so the report always answers one question: what would the same logged model usage be worth through its official API channel?
+Alias targets must exist in either the app's built-in official catalog or the file's `models` section. In the standard Codex home, built-in official prices take precedence; Qodex and custom data homes use only prices explicitly saved for that source.
 
 The current authentication mode is shown only as context. Codex logs do not preserve enough historical authentication data to prove whether every old call was billed through a plan, an API account, or a relay.
 

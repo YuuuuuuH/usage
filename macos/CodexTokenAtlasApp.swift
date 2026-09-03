@@ -367,17 +367,22 @@ private struct PricingRoute: Decodable {
     let costs: Cost
     let pricing_provider: String?
     let pricing_model: String?
+    let pricing_kind: String?
     let rates: RateSet?
     let daily: [String: RouteDay]
 }
 
 private struct PricingData: Decodable {
     let as_of: String
+    let custom_models: [String]?
     let scopes: [String: Cost]
     let routes: [PricingRoute]
     let hourly: [String: [[Cost]]]
     let daily: [String: [String: Cost]]
     let timeline_hourly: [String: [String: Cost]]
+
+    var customModelCount: Int { custom_models?.count ?? 0 }
+    var hasCustomPricing: Bool { customModelCount > 0 }
 }
 
 private struct DateRange: Decodable {
@@ -718,7 +723,7 @@ private final class HourHeatmapView: NSView {
             for hour in 0..<24 {
                 let item = usage[row][hour]
                 let cost = costs[row][hour]
-                let text = "\(weekdays[row]) \(String(format: "%02d", hour)):00 · \(modelLabel)\n\(formatInt(item.value(for: metricKey))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(cost, pricingMode: pricingMode))"
+                let text = "\(weekdays[row]) \(String(format: "%02d", hour)):00 · \(modelLabel)\n\(formatInt(item.value(for: metricKey))) · \(formatInt(item.calls)) calls\nToken 价值估算 \(formatCostValue(cost, pricingMode: pricingMode))"
                 let token = TooltipToken(text)
                 tooltipTokens.append(token)
                 addToolTip(cellRect(row: row, hour: hour), owner: self, userData: Unmanaged.passUnretained(token).toOpaque())
@@ -806,7 +811,7 @@ private final class CalendarHeatmapView: NSView {
             let item = usage[key] ?? Usage()
             let value = item.value(for: metricKey)
             let cost = costs[key] ?? Cost()
-            let token = TooltipToken("\(key) · \(modelLabel)\n\(formatInt(value)) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(cost, pricingMode: pricingMode))")
+            let token = TooltipToken("\(key) · \(modelLabel)\n\(formatInt(value)) · \(formatInt(item.calls)) calls\nToken 价值估算 \(formatCostValue(cost, pricingMode: pricingMode))")
             tooltipTokens.append(token)
             addToolTip(rect, owner: self, userData: Unmanaged.passUnretained(token).toOpaque())
         }
@@ -1156,6 +1161,173 @@ private struct ScaledContent<Content: View>: View {
     }
 }
 
+private final class ModelPricingEditor: NSObject {
+    private let configuration: [String: Any]
+    private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let inputField = NSTextField(string: "")
+    private let cachedInputField = NSTextField(string: "")
+    private let cacheWriteField = NSTextField(string: "")
+    private let outputField = NSTextField(string: "")
+
+    let view: NSView
+
+    var selectedModel: String {
+        modelPopup.titleOfSelectedItem ?? ""
+    }
+
+    init(models: [String], preferredModel: String?, configurationURL: URL) throws {
+        if FileManager.default.fileExists(atPath: configurationURL.path) {
+            let data = try Data(contentsOf: configurationURL)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw NSError(
+                    domain: "CodexTokenAtlasPricing",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "价格配置必须是 JSON 对象"]
+                )
+            }
+            if let configuredModels = object["models"], !(configuredModels is [String: Any]) {
+                throw NSError(
+                    domain: "CodexTokenAtlasPricing",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "价格配置中的 models 必须是 JSON 对象"]
+                )
+            }
+            configuration = object
+        } else {
+            configuration = [:]
+        }
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 9
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 4, bottom: 4, right: 4)
+        stack.frame = NSRect(x: 0, y: 0, width: 430, height: 230)
+        view = stack
+        super.init()
+
+        let orderedModels = models.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        modelPopup.addItems(withTitles: orderedModels)
+        modelPopup.target = self
+        modelPopup.action = #selector(modelChanged(_:))
+        modelPopup.widthAnchor.constraint(equalToConstant: 292).isActive = true
+
+        for field in [inputField, cachedInputField, cacheWriteField, outputField] {
+            field.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            field.alignment = .right
+            field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            field.placeholderString = "USD / 1M tokens"
+        }
+
+        func row(_ title: String, _ control: NSView) -> NSStackView {
+            let label = NSTextField(labelWithString: title)
+            label.font = .systemFont(ofSize: 12, weight: .medium)
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 112).isActive = true
+            let result = NSStackView(views: [label, control])
+            result.orientation = .horizontal
+            result.alignment = .centerY
+            result.spacing = 10
+            return result
+        }
+
+        stack.addArrangedSubview(row("模型", modelPopup))
+        stack.addArrangedSubview(row("未缓存输入", inputField))
+        stack.addArrangedSubview(row("缓存读取", cachedInputField))
+        stack.addArrangedSubview(row("缓存写入", cacheWriteField))
+        stack.addArrangedSubview(row("输出", outputField))
+
+        let hint = NSTextField(wrappingLabelWithString: "价格单位为 USD / 100 万 tokens。输入和输出必填；缓存价格留空时使用输入价格。配置仅作用于当前数据目录。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 408
+        stack.addArrangedSubview(hint)
+
+        if let preferredModel, orderedModels.contains(preferredModel) {
+            modelPopup.selectItem(withTitle: preferredModel)
+        } else {
+            modelPopup.selectItem(at: 0)
+        }
+        loadSelectedModel()
+    }
+
+    @objc private func modelChanged(_ sender: Any?) {
+        loadSelectedModel()
+    }
+
+    private func configuredModel() -> [String: Any]? {
+        guard let models = configuration["models"] as? [String: Any] else { return nil }
+        let target = selectedModel.lowercased()
+        for (model, value) in models where model.lowercased() == target {
+            return value as? [String: Any]
+        }
+        return nil
+    }
+
+    private func loadSelectedModel() {
+        let configured = configuredModel()
+        inputField.stringValue = rateText(configured?["input"])
+        cachedInputField.stringValue = rateText(configured?["cached_input"])
+        cacheWriteField.stringValue = rateText(configured?["cache_write_input"])
+        outputField.stringValue = rateText(configured?["output"])
+    }
+
+    private func rateText(_ value: Any?) -> String {
+        guard let number = value as? NSNumber else { return "" }
+        return String(format: "%.9g", number.doubleValue)
+    }
+
+    private func parsedRate(_ field: NSTextField, name: String, required: Bool) throws -> Double? {
+        let raw = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty, !required { return nil }
+        let normalized = raw.replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(normalized), value.isFinite, value >= 0 else {
+            throw NSError(
+                domain: "CodexTokenAtlasPricing",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "\(name)价格需要填写非负数字"]
+            )
+        }
+        return value
+    }
+
+    func updatedConfiguration(provider: String, removing: Bool) throws -> [String: Any] {
+        var result = configuration
+        var models = result["models"] as? [String: Any] ?? [:]
+        for key in Array(models.keys) where key.lowercased() == selectedModel.lowercased() {
+            models.removeValue(forKey: key)
+        }
+
+        if !removing {
+            guard let input = try parsedRate(inputField, name: "输入", required: true),
+                  let output = try parsedRate(outputField, name: "输出", required: true)
+            else {
+                throw NSError(
+                    domain: "CodexTokenAtlasPricing",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "输入和输出价格为必填项"]
+                )
+            }
+            let cachedInput = try parsedRate(cachedInputField, name: "缓存读取", required: false) ?? input
+            let cacheWrite = try parsedRate(cacheWriteField, name: "缓存写入", required: false) ?? input
+            models[selectedModel] = [
+                "provider": provider,
+                "input": input,
+                "cached_input": cachedInput,
+                "cache_write_input": cacheWrite,
+                "output": output
+            ]
+        }
+
+        if models.isEmpty {
+            result.removeValue(forKey: "models")
+        } else {
+            result["models"] = models
+        }
+        return result
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, ObservableObject {
     private var window: NSWindow!
     private var scrollView: NSScrollView!
@@ -1165,6 +1337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var liveToolbarItem: NSToolbarItem?
     private weak var liveMenuItem: NSMenuItem?
     private weak var dockMenuItem: NSMenuItem?
+    private weak var modelPricingMenuItem: NSMenuItem?
     private let settingsMenu = NSMenu(title: "设置")
     private var appearanceMenuItems: [AppearanceMode: NSMenuItem] = [:]
     private var refreshMenuItems: [Int: NSMenuItem] = [:]
@@ -1220,6 +1393,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private var dataHomeURL: URL {
         normalizedDataHomeURL(URL(fileURLWithPath: dataHomePath, isDirectory: true))
+    }
+
+    private var pricingConfigurationURL: URL {
+        dataHomeURL.appendingPathComponent("token_atlas_pricing.json")
     }
 
     private var dataHomeHistoryKey: String { dataHomeURL.path }
@@ -1361,6 +1538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         refreshToolbarItem?.toolTip = "重新扫描当前数据目录 \(dataHomeDisplayPath)（⌘R）"
         if changed {
             dashboard = nil
+            updateModelPricingMenuItem()
             selectedModel = "all"
             datePreset = .all
             selectedStartDate = nil
@@ -1501,6 +1679,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         appearanceItem.submenu = appearanceMenu
         settingsMenu.addItem(appearanceItem)
 
+        let modelPricingItem = settingsMenu.addItem(withTitle: "开源/本地模型价格…", action: #selector(editModelPricing(_:)), keyEquivalent: "")
+        modelPricingItem.target = self
+        modelPricingMenuItem = modelPricingItem
+        updateModelPricingMenuItem()
+        settingsMenu.addItem(.separator())
+
         let glassItem = NSMenuItem(title: "液态玻璃", action: nil, keyEquivalent: "")
         let glassMenu = NSMenu(title: "液态玻璃")
         let appGlassItem = NSMenuItem(title: "主应用", action: nil, keyEquivalent: "")
@@ -1607,6 +1791,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
         refreshItem.submenu = refreshMenu
         settingsMenu.addItem(refreshItem)
+    }
+
+    private func updateModelPricingMenuItem() {
+        let models = editableModelPricingModels()
+        modelPricingMenuItem?.isEnabled = !models.isEmpty && !generatorRunning
+        modelPricingMenuItem?.toolTip = models.isEmpty
+            ? "当前数据目录中的模型均已使用内置价格"
+            : "为未定价的开源或本地模型设置价格"
+    }
+
+    private func editableModelPricingModels() -> [String] {
+        guard let data = dashboard else { return [] }
+        return data.models.filter { model in
+            let routes = data.pricing.routes.filter { $0.model == model }
+            return routes.isEmpty || routes.contains { $0.pricing_kind != "official" }
+        }
+    }
+
+    @objc private func editModelPricing(_ sender: Any?) {
+        guard !generatorRunning, dashboard != nil else {
+            presentError("请先完成当前数据目录的统计刷新。")
+            return
+        }
+        let editableModels = editableModelPricingModels()
+        guard !editableModels.isEmpty else {
+            presentError("当前数据目录中的模型均已使用内置价格。")
+            return
+        }
+
+        do {
+            let preferredModel = editableModels.contains(selectedModel) ? selectedModel : nil
+            let editor = try ModelPricingEditor(
+                models: editableModels,
+                preferredModel: preferredModel,
+                configurationURL: pricingConfigurationURL
+            )
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "设置模型价格"
+            alert.informativeText = "\(currentDataSourceLabel) · \(dataHomeDisplayPath)"
+            alert.accessoryView = editor.view
+            alert.addButton(withTitle: "保存并刷新")
+            alert.addButton(withTitle: "移除该模型价格")
+            alert.addButton(withTitle: "取消")
+
+            let response = alert.runModal()
+            guard response != .alertThirdButtonReturn else { return }
+            let removing = response == .alertSecondButtonReturn
+            let updated = try editor.updatedConfiguration(
+                provider: currentDataSourceLabel,
+                removing: removing
+            )
+            var encoded = try JSONSerialization.data(
+                withJSONObject: updated,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+            encoded.append(0x0A)
+            try encoded.write(to: pricingConfigurationURL, options: .atomic)
+            try? fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: Int16(0o600))],
+                ofItemAtPath: pricingConfigurationURL.path
+            )
+            toolbarStatus.stringValue = removing
+                ? "已移除 \(editor.selectedModel) 的价格"
+                : "已保存 \(editor.selectedModel) 的价格"
+            refreshReport(nil)
+        } catch {
+            presentError("模型价格保存失败：\(error.localizedDescription)")
+        }
     }
 
     private func configureWindow() {
@@ -2049,6 +2302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         generatorRunning = true
+        updateModelPricingMenuItem()
         setLoading(true, title: "正在刷新 Token 历史", detail: dataHomeLoadingDetail)
         appendLog("\n[\(timestampLabel())] Native app refresh\nData home: \(selectedDataHome.path)\nPython: \(pythonURL.path)\n")
 
@@ -2070,6 +2324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                         self.loadGeneratedReport()
                     } else {
                         self.generatorRunning = false
+                        self.updateModelPricingMenuItem()
                         self.setLoading(false, title: "", detail: "")
                         self.presentError("生成报表失败，退出状态为 \(process.terminationStatus)。")
                     }
@@ -2078,6 +2333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 logHandle?.closeFile()
                 DispatchQueue.main.async {
                     self.generatorRunning = false
+                    self.updateModelPricingMenuItem()
                     self.setLoading(false, title: "", detail: "")
                     self.presentError("无法启动统计生成器：\(error.localizedDescription)")
                 }
@@ -2129,6 +2385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
             synchronizeDateSelection(with: loadedDashboard)
             generatorRunning = false
+            updateModelPricingMenuItem()
             setLoading(false, title: "", detail: "")
             toolbarStatus.stringValue = "\(currentDataSourceLabel) · 已更新 \(DateFormatter.shortTime.string(from: Date()))"
             if ProcessInfo.processInfo.environment["TOKEN_ATLAS_SMOKE_TEST"] == "1" {
@@ -2144,6 +2401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
         } catch {
             generatorRunning = false
+            updateModelPricingMenuItem()
             setLoading(false, title: "", detail: "")
             presentError("原生仪表盘数据载入失败：\(error.localizedDescription)")
         }
@@ -2200,7 +2458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         try require(sessionUsage.total_tokens == fullUsage.total_tokens, "session total differs from overall total")
 
         let fullCost = filteredCost(scope: "all", data: data)
-        if currentDataSourceID == "qodex" {
+        if currentDataSourceID == "qodex", data.pricing.customModelCount == 0 {
             try require(fullCost.priced_tokens == 0, "Qodex local usage was assigned an official price")
             try require(fullCost.unpriced_tokens == fullUsage.total_tokens, "Qodex unpriced total differs from usage")
         }
@@ -2541,13 +2799,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let cost = filteredCost(scope: selectedModel, data: data)
         let coverageBase = cost.priced_tokens + cost.unpriced_tokens
         let coverage = coverageBase > 0 ? Double(cost.priced_tokens) / Double(coverageBase) * 100 : 0
-        let selectedValue = pricingMode.value(cost)
-        let premium = pricingMode == .tiered ? cost.service_tier_premium_usd : 0
+        let hasPricing = cost.priced_tokens > 0
+        let hasCustomPricing = data.pricing.routes.contains {
+            (selectedModel == "all" || $0.model == selectedModel) && $0.pricing_kind == "custom"
+        }
+        let selectedValue = hasPricing ? formatUSD(pricingMode.value(cost)) : "未定价"
+        let standardValue = hasPricing ? formatUSD(cost.standard_equivalent_cost_usd) : "未定价"
+        let premium = hasPricing ? formatUSD(pricingMode == .tiered ? cost.service_tier_premium_usd : 0) : "—"
+        let cacheSavings = hasPricing ? formatUSD(cost.cache_savings_usd) : "—"
         let cards = NSStackView(views: [
-            makeMetricCard(title: pricingMode == .simple ? "Simple official value" : "Tiered official value", value: formatUSD(selectedValue), detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal),
-            makeMetricCard(title: "Standard baseline", value: formatUSD(cost.standard_equivalent_cost_usd), detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal),
-            makeMetricCard(title: "Tier premium", value: formatUSD(premium), detail: pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral),
-            makeMetricCard(title: "Cache savings", value: formatUSD(cost.cache_savings_usd), detail: "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write", accent: AtlasColor.amber)
+            makeMetricCard(title: pricingMode == .simple ? "Simple value" : "Tiered value", value: selectedValue, detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal),
+            makeMetricCard(title: "Standard baseline", value: standardValue, detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal),
+            makeMetricCard(title: "Tier premium", value: premium, detail: pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral),
+            makeMetricCard(title: "Cache savings", value: cacheSavings, detail: hasPricing ? "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write" : "配置价格后计算", accent: AtlasColor.amber)
         ])
         cards.orientation = .horizontal
         cards.distribution = .fillEqually
@@ -2556,8 +2820,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let pricingControl = NSSegmentedControl(labels: [PricingMode.simple.title, PricingMode.tiered.title], trackingMode: .selectOne, target: self, action: #selector(pricingModeChanged(_:)))
         pricingControl.selectedSegment = pricingMode.rawValue
         pricingControl.segmentStyle = .rounded
-        pricingControl.setToolTip("全部调用按官方 Standard 价计算", forSegment: 0)
-        pricingControl.setToolTip("Default 使用 Standard；Fast/Priority 使用官方 Priority 价", forSegment: 1)
+        pricingControl.setToolTip("全部调用按模型基础价格计算", forSegment: 0)
+        pricingControl.setToolTip("Default 使用基础价格；Fast/Priority 使用可用的分层价格", forSegment: 1)
         pricingControl.widthAnchor.constraint(equalToConstant: 300).isActive = true
         let dateSegments = NSSegmentedControl(labels: ["全部", "近 7 天", "近 30 天", "自定义"], trackingMode: .selectOne, target: self, action: #selector(datePresetChanged(_:)))
         dateSegments.selectedSegment = datePreset.rawValue
@@ -2597,9 +2861,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
         let table = makeTable(headers: ["PROVIDER", "MODEL", "TIER", "PRICED AS", "VALUE", "INPUT", "CACHE", "OUTPUT", "CALLS", "UNPRICED"], rows: routes, widths: [120, 160, 150, 220, 130, 90, 90, 90, 90, 110])
         let method = makeLabel(
-            pricingMode == .simple
-                ? "简单计价：所有可分类 token 均按对应模型官方 Standard API 价格估算，不区分日志中的 Default/Fast。"
-                : "分层计价：Default 使用官方 Standard；Fast/Priority 使用官方 Priority。无对应 Priority 价格时回退 Standard 并计入审计。",
+            hasCustomPricing
+                ? "自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。"
+                : pricingMode == .simple
+                    ? "简单计价：所有可分类 token 均按对应模型官方 Standard API 价格估算，不区分日志中的 Default/Fast。"
+                    : "分层计价：Default 使用官方 Standard；Fast/Priority 使用官方 Priority。无对应 Priority 价格时回退 Standard 并计入审计。",
             size: 11,
             color: AtlasColor.muted,
             selectable: true,
@@ -2613,7 +2879,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         cards.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         table.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         method.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-        return makePanel(title: "官方 API 等价价值", subtitle: "只使用官方渠道价格，不计算中转站账单或 ChatGPT 订阅账单。", content: content, trailing: "RATES · \(data.pricing.as_of)")
+        let subtitle = hasCustomPricing
+            ? "使用当前数据目录中保存的逐模型价格。"
+            : "使用官方渠道价格，不计算中转站账单或 ChatGPT 订阅账单。"
+        let trailing = hasPricing
+            ? hasCustomPricing ? "CUSTOM MODEL RATES" : "OFFICIAL RATES · \(data.pricing.as_of)"
+            : "UNPRICED SOURCE"
+        return makePanel(title: "Token 价值估算", subtitle: subtitle, content: content, trailing: trailing)
     }
 
     private func makeAuditPanel(_ data: DashboardData) -> NSView {
@@ -3587,6 +3859,9 @@ private struct AtlasDashboardView: View {
         let coverageBase = cost.priced_tokens + cost.unpriced_tokens
         let coverage = coverageBase > 0 ? Double(cost.priced_tokens) / Double(coverageBase) * 100 : 0
         let hasTrustedPricing = cost.priced_tokens > 0
+        let hasCustomPricing = data.pricing.routes.contains {
+            (controller.selectedModel == "all" || $0.model == controller.selectedModel) && $0.pricing_kind == "custom"
+        }
         let selectedValue = hasTrustedPricing ? formatUSD(controller.pricingMode.value(cost)) : "未定价"
         let standardValue = hasTrustedPricing ? formatUSD(cost.standard_equivalent_cost_usd) : "未定价"
         let secondaryValue = hasTrustedPricing ? formatUSD(controller.pricingMode == .tiered ? cost.service_tier_premium_usd : 0) : "—"
@@ -3598,20 +3873,26 @@ private struct AtlasDashboardView: View {
             return [route.route_provider, route.model, route.service_tier == "priority" ? "priority / fast" : route.service_tier, route.pricing_model.map { "\(route.pricing_provider ?? "") / \($0)" } ?? "Not priced", filtered.1.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(filtered.1)) : "—", route.rates?.input.map(formatUSD) ?? "—", route.rates?.cached_input.map(formatUSD) ?? "—", route.rates?.output.map(formatUSD) ?? "—", formatInt(filtered.0.calls), shortNumber(filtered.1.unpriced_tokens)]
         }
         return AtlasPanel(
-            title: "官方 API 等价价值",
-            subtitle: hasTrustedPricing ? "计价和周期在这里选择；全页统计同步更新。" : "当前数据目录没有可信官方价格；模型、调用和 Token 仍完整统计。",
-            trailing: hasTrustedPricing ? "OFFICIAL RATES · \(data.pricing.as_of)" : "UNPRICED SOURCE"
+            title: "Token 价值估算",
+            subtitle: hasTrustedPricing
+                ? hasCustomPricing
+                    ? "使用当前数据目录中保存的逐模型价格；周期和模型筛选会同步更新。"
+                    : "计价和周期在这里选择；全页统计同步更新。"
+                : "当前数据目录尚未配置可用价格；模型、调用和 Token 仍完整统计。",
+            trailing: hasTrustedPricing
+                ? hasCustomPricing ? "CUSTOM MODEL RATES" : "OFFICIAL RATES · \(data.pricing.as_of)"
+                : "UNPRICED SOURCE"
         ) {
             VStack(alignment: .leading, spacing: 15) {
                 pricingControls(data)
                 HStack(spacing: 0) {
-                    MetricCard(title: controller.pricingMode == .simple ? "SIMPLE OFFICIAL VALUE" : "TIERED OFFICIAL VALUE", value: selectedValue, detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal)
+                    MetricCard(title: controller.pricingMode == .simple ? "SIMPLE VALUE" : "TIERED VALUE", value: selectedValue, detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal)
                     AtlasMetricDivider()
                     MetricCard(title: "STANDARD BASELINE", value: standardValue, detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal)
                     AtlasMetricDivider()
                     MetricCard(title: "TIER PREMIUM", value: secondaryValue, detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral)
                     AtlasMetricDivider()
-                    MetricCard(title: "CACHE SAVINGS", value: cacheValue, detail: hasTrustedPricing ? "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write" : "无可信价格时不估算", accent: AtlasColor.amber)
+                    MetricCard(title: "CACHE SAVINGS", value: cacheValue, detail: hasTrustedPricing ? "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write" : "配置价格后计算", accent: AtlasColor.amber)
                 }
                 .padding(.horizontal, 6)
                 .padding(.vertical, 5)
@@ -3622,8 +3903,10 @@ private struct AtlasDashboardView: View {
                 )
                 AtlasTable(headers: ["PROVIDER", "MODEL", "TIER", "PRICED AS", "VALUE", "INPUT", "CACHE", "OUTPUT", "CALLS", "UNPRICED"], rows: routes, widths: [110, 145, 140, 200, 110, 75, 75, 75, 75, 95])
                 Text(!hasTrustedPricing
-                    ? "当前来源仅提供用量统计。为避免本地模型与官方模型同名造成误计价，本页不会推断任何 API 费用。"
-                    : controller.pricingMode == .simple
+                    ? "当前来源仅提供用量统计。可在设置中为已识别模型填写价格。"
+                    : hasCustomPricing
+                        ? "自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。"
+                        : controller.pricingMode == .simple
                         ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
                         : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
                     .font(.system(size: 11))
@@ -4090,7 +4373,7 @@ private struct HourlyHeatmap: View {
                         AtlasHeatCell(
                             color: heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap),
                             size: 36,
-                            tooltip: "\(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day]) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[day][hour], pricingMode: controller.pricingMode))"
+                            tooltip: "\(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day]) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\nToken 价值估算 \(formatCostValue(costs[day][hour], pricingMode: controller.pricingMode))"
                         )
                     }
                 }
@@ -4227,7 +4510,7 @@ private struct DailyHourlyStrip: View {
                 .frame(width: 76, alignment: .leading)
             ForEach(0..<24, id: \.self) { hour in
                 let item = usage[hour]
-                let tooltip = "\(day) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[hour], pricingMode: controller.pricingMode))"
+                let tooltip = "\(day) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\nToken 价值估算 \(formatCostValue(costs[hour], pricingMode: controller.pricingMode))"
                 AtlasHeatCell(
                     color: heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap),
                     size: 18,
@@ -4283,7 +4566,7 @@ private struct DailyHeatmap: View {
                     LazyHGrid(rows: Array(repeating: GridItem(.fixed(22), spacing: 5), count: 7), spacing: 5) {
                         ForEach(Array(cells.enumerated()), id: \.element.id) { index, cell in
                             let item = usage[cell.day] ?? Usage()
-                            let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[cell.day] ?? Cost(), pricingMode: controller.pricingMode))" : "不在所选周期内"
+                            let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\nToken 价值估算 \(formatCostValue(costs[cell.day] ?? Cost(), pricingMode: controller.pricingMode))" : "不在所选周期内"
                             AtlasHeatCell(
                                 color: cell.inside ? heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap) : NSColor.gray.withAlphaComponent(0.08),
                                 size: 22,
