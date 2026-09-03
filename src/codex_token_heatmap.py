@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Build a fork-safe, model-aware Codex token usage dashboard."""
+"""Build a fork-safe, model-aware dashboard from a Codex-compatible data home."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import html
 import json
+import os
+import pickle
 import re
 import sqlite3
 import tempfile
@@ -16,14 +20,27 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+try:
+    import orjson as _fast_json
+except ImportError:
+    _fast_json = None
+
 
 HOME = Path.home()
-SESSIONS_ROOT = HOME / ".codex" / "sessions"
-STATE_DB = HOME / ".codex" / "state_5.sqlite"
-SESSION_INDEX = HOME / ".codex" / "session_index.jsonl"
-AUTH_FILE = HOME / ".codex" / "auth.json"
-CONFIG_FILE = HOME / ".codex" / "config.toml"
-MODEL_ALIASES_FILE = HOME / ".codex" / "token_atlas_pricing.json"
+CODEX_HOME = HOME / ".codex"
+QODEX_HOME = HOME / ".qodex"
+SESSIONS_ROOT = CODEX_HOME / "sessions"
+STATE_DB = CODEX_HOME / "state_5.sqlite"
+SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
+AUTH_FILE = CODEX_HOME / "auth.json"
+CONFIG_FILE = CODEX_HOME / "config.toml"
+MODEL_ALIASES_FILE = CODEX_HOME / "token_atlas_pricing.json"
+TOKENIZER_MAP_FILE = "token_atlas_tokenizers.json"
+TOKENIZER_SEARCH_ROOTS = (
+    HOME / ".lmstudio" / "models",
+    HOME / ".cache" / "huggingface" / "hub",
+    HOME / ".cache" / "modelscope" / "hub" / "models",
+)
 
 OUTPUT_HTML = HOME / "codex_token_heatmap.html"
 OUTPUT_DAILY_CSV = HOME / "codex_token_usage_by_day.csv"
@@ -32,12 +49,25 @@ OUTPUT_MODEL_CSV = HOME / "codex_token_usage_by_model.csv"
 OUTPUT_ROUTE_CSV = HOME / "codex_token_usage_by_route.csv"
 OUTPUT_SESSION_CSV = HOME / "codex_token_usage_by_session.csv"
 OUTPUT_JSON = HOME / "codex_token_usage_summary.json"
+OUTPUT_ARTIFACTS = (
+    OUTPUT_HTML,
+    OUTPUT_DAILY_CSV,
+    OUTPUT_HOURLY_CSV,
+    OUTPUT_MODEL_CSV,
+    OUTPUT_ROUTE_CSV,
+    OUTPUT_SESSION_CSV,
+    OUTPUT_JSON,
+)
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+REPORT_SCHEMA_VERSION = 3
+INCREMENTAL_CACHE_VERSION = 1
+CACHE_ROOT = HOME / "Library" / "Caches" / "CodexTokenAtlas"
 ALL_MODELS_KEY = "all"
 UNKNOWN_MODEL = "(unknown)"
 UNKNOWN_PROVIDER = "(unknown provider)"
 DEFAULT_SERVICE_TIER = "default"
+
 
 RAW_USAGE_FIELDS = (
     "input_tokens",
@@ -53,9 +83,174 @@ DERIVED_USAGE_FIELDS = (
 )
 USAGE_FIELDS = RAW_USAGE_FIELDS + DERIVED_USAGE_FIELDS + ("calls",)
 
+RELEVANT_USAGE_LINE_MARKERS = tuple(
+    marker.encode("ascii")
+    for event_type in (
+        "turn_context",
+        "thread_settings_applied",
+        "task_started",
+        "token_count",
+        "reasoning",
+    )
+    for marker in (f'"type":"{event_type}"', f'"type": "{event_type}"')
+) + (b"<think",)
+
 PRICING_AS_OF = "2026-07-29"
 LONG_CONTEXT_THRESHOLD = 272_000
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
+
+
+def decode_json(value: str | bytes) -> Any:
+    if _fast_json is not None:
+        return _fast_json.loads(value)
+    return json.loads(value)
+
+
+def relevant_usage_line(line: bytes) -> bool:
+    return any(marker in line for marker in RELEVANT_USAGE_LINE_MARKERS)
+
+
+def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
+    entries: list[list[str | int]] = []
+    for path in sorted(source.sessions_root.rglob("*.jsonl")):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append(
+            [
+                str(path.relative_to(source.home)),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            ]
+        )
+    metadata_paths = [source.state_db, source.session_index, source.model_aliases_file]
+    if source.read_service_tier:
+        metadata_paths.append(source.config_file)
+    if source.read_billing_context:
+        metadata_paths.append(source.auth_file)
+    metadata_paths.append(source.home / TOKENIZER_MAP_FILE)
+    for path in metadata_paths:
+        try:
+            stat = path.stat()
+            size, modified = int(stat.st_size), int(stat.st_mtime_ns)
+        except OSError:
+            size, modified = -1, -1
+        entries.append([f"@{path.name}", size, modified])
+    return entries
+
+
+def cached_summary(
+    source: UsageSource,
+    manifest: list[list[str | int]],
+) -> dict[str, Any] | None:
+    if any(not path.is_file() for path in OUTPUT_ARTIFACTS):
+        return None
+    try:
+        payload = decode_json(OUTPUT_JSON.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != REPORT_SCHEMA_VERSION:
+        return None
+    if payload.get("source_id") != source.key:
+        return None
+    if payload.get("sessions_root") != str(source.sessions_root):
+        return None
+    if payload.get("input_manifest") != manifest:
+        return None
+    return payload
+
+
+def auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
+    paths = [source.model_aliases_file, source.home / TOKENIZER_MAP_FILE]
+    if source.read_service_tier:
+        paths.append(source.config_file)
+    if source.read_billing_context:
+        paths.append(source.auth_file)
+    result: list[list[str | int]] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            size, modified = int(stat.st_size), int(stat.st_mtime_ns)
+        except OSError:
+            size, modified = -1, -1
+        result.append([str(path), size, modified])
+    for root in TOKENIZER_SEARCH_ROOTS:
+        if not root.is_dir():
+            continue
+        try:
+            tokenizer_paths = sorted(root.rglob("tokenizer.json"))
+        except OSError:
+            continue
+        for path in tokenizer_paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            result.append([str(path), int(stat.st_size), int(stat.st_mtime_ns)])
+    return result
+
+
+def incremental_cache_path(source: UsageSource) -> Path:
+    digest = hashlib.sha256(str(source.home).encode("utf-8")).hexdigest()[:20]
+    return CACHE_ROOT / f"usage-{digest}.pickle"
+
+
+def load_incremental_cache(source: UsageSource) -> UsageReport | None:
+    path = incremental_cache_path(source)
+    try:
+        stat = path.lstat()
+        if path.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+            return None
+        with path.open("rb") as handle:
+            envelope = pickle.load(handle)
+    except (
+        OSError,
+        EOFError,
+        pickle.PickleError,
+        AttributeError,
+        ImportError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    if not isinstance(envelope, IncrementalCacheEnvelope):
+        return None
+    if envelope.version != INCREMENTAL_CACHE_VERSION:
+        return None
+    if envelope.source_home != str(source.home):
+        return None
+    if envelope.auxiliary_manifest != auxiliary_input_manifest(source):
+        return None
+    if not isinstance(envelope.report, UsageReport):
+        return None
+    return envelope.report
+
+
+def save_incremental_cache(source: UsageSource, report: UsageReport) -> None:
+    envelope = IncrementalCacheEnvelope(
+        version=INCREMENTAL_CACHE_VERSION,
+        source_home=str(source.home),
+        auxiliary_manifest=auxiliary_input_manifest(source),
+        report=report,
+    )
+    CACHE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="usage-cache-",
+        suffix=".tmp",
+        dir=CACHE_ROOT,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            pickle.dump(envelope, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.chmod(0o600)
+        temporary_path.replace(incremental_cache_path(source))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def pricing_rate(
@@ -459,18 +654,105 @@ class ThreadInfo:
     model: str = ""
 
 
+@dataclass(frozen=True)
+class UsageSource:
+    key: str
+    label: str
+    home: Path
+    read_billing_context: bool = True
+    read_service_tier: bool = True
+    enable_official_pricing: bool = True
+
+    @property
+    def sessions_root(self) -> Path:
+        return self.home / "sessions"
+
+    @property
+    def state_db(self) -> Path:
+        return self.home / "state_5.sqlite"
+
+    @property
+    def session_index(self) -> Path:
+        return self.home / "session_index.jsonl"
+
+    @property
+    def auth_file(self) -> Path:
+        return self.home / "auth.json"
+
+    @property
+    def config_file(self) -> Path:
+        return self.home / "config.toml"
+
+    @property
+    def model_aliases_file(self) -> Path:
+        return self.home / "token_atlas_pricing.json"
+
+
+def usage_source_from_home(home: Path) -> UsageSource:
+    home = home.expanduser().resolve(strict=False)
+    is_qodex = home == QODEX_HOME.resolve(strict=False) or home.name.lower() == ".qodex"
+    if is_qodex:
+        # Qodex can point at a local provider. Token accounting does not require
+        # reading its credential-bearing auth or provider configuration files.
+        return UsageSource(
+            "qodex",
+            "Qodex",
+            home,
+            read_billing_context=False,
+            read_service_tier=False,
+            enable_official_pricing=False,
+        )
+    if home == CODEX_HOME.resolve(strict=False):
+        return UsageSource("codex", "Codex", home)
+    label = (
+        "Codex"
+        if home.name.lower() == ".codex"
+        else clean_text(home.name.lstrip("."), 80) or "Custom"
+    )
+    key = re.sub(r"[^a-z0-9_-]+", "-", label.lower()).strip("-") or "custom"
+    return UsageSource(
+        key,
+        label,
+        home,
+        read_billing_context=False,
+        read_service_tier=False,
+        enable_official_pricing=False,
+    )
+
+
+def normalize_data_home(path: Path) -> Path:
+    data_home = path.expanduser().resolve(strict=False)
+    if data_home.name == "sessions" and not (data_home / "sessions").is_dir():
+        return data_home.parent
+    return data_home
+
+
+def counter_map() -> defaultdict[Any, Counter]:
+    return defaultdict(Counter)
+
+
+def nested_counter_map() -> defaultdict[Any, defaultdict[Any, Counter]]:
+    return defaultdict(counter_map)
+
+
 @dataclass
 class SessionDescriptor:
     path: Path
     session_id: str
     parent_id: str
     root_id: str
+    dedupe_root_id: str
     lineage_depth: int
     created_at: str
     model_provider: str = ""
     cli_version: str = ""
     originator: str = ""
     source: str = ""
+    thread_source: str = ""
+    physical_parent_id: str = ""
+    conversation_id: str = ""
+    is_internal: bool = False
+    orphan_internal: bool = False
     context_window: int = 0
     thread: ThreadInfo = field(default_factory=ThreadInfo)
 
@@ -479,20 +761,18 @@ class SessionDescriptor:
 class SessionStats:
     descriptor: SessionDescriptor
     total: Counter = field(default_factory=Counter)
-    by_model: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    by_provider: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    by_service_tier: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    by_reasoning_effort: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    by_route: dict[tuple[str, str, str], Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
-    by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    by_model: dict[str, Counter] = field(default_factory=counter_map)
+    by_provider: dict[str, Counter] = field(default_factory=counter_map)
+    by_service_tier: dict[str, Counter] = field(default_factory=counter_map)
+    by_reasoning_effort: dict[str, Counter] = field(default_factory=counter_map)
+    by_route: dict[tuple[str, str, str], Counter] = field(default_factory=counter_map)
+    by_day: dict[date, Counter] = field(default_factory=counter_map)
     by_day_model: dict[date, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    costs_by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    costs_by_day: dict[date, Counter] = field(default_factory=counter_map)
     costs_by_day_model: dict[date, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
     raw_events: int = 0
     unique_events: int = 0
@@ -505,69 +785,85 @@ class SessionStats:
     cached_over_input_events: int = 0
     cache_write_over_input_events: int = 0
     reasoning_over_output_events: int = 0
+    inferred_reasoning_events: int = 0
+    inferred_reasoning_tokens: int = 0
+    heuristic_reasoning_events: int = 0
     missing_timestamp_events: int = 0
     fallback_provider_events: int = 0
     fallback_service_tier_events: int = 0
     first_timestamp: str | None = None
     last_timestamp: str | None = None
+    rollout_files: int = 1
+    internal_thread_count: int = 0
+
+
+@dataclass
+class FileParserState:
+    descriptor: SessionDescriptor
+    offset: int = 0
+    size: int = 0
+    mtime_ns: int = 0
+    logical_owner_id: str = ""
+    active_turn: str = ""
+    active_model: str = ""
+    active_provider: str = ""
+    active_service_tier: str = DEFAULT_SERVICE_TIER
+    active_reasoning_effort: str = ""
+    provider_from_event: bool = False
+    service_tier_from_event: bool = False
+    previous_cumulative: Counter = field(default_factory=Counter)
+    pending_reasoning_parts: list[str] = field(default_factory=list)
 
 
 @dataclass
 class UsageReport:
     sessions: list[SessionStats]
+    source_key: str = "codex"
+    source_label: str = "Codex"
+    sessions_root: Path = SESSIONS_ROOT
+    model_aliases_path: Path = MODEL_ALIASES_FILE
+    billing_context: dict[str, Any] = field(default_factory=dict)
     configured_service_tier_fallback: str = DEFAULT_SERVICE_TIER
     pricing_catalog: dict[str, dict[str, Any]] = field(default_factory=dict)
     pricing_aliases: dict[str, str] = field(default_factory=dict)
     pricing_config_errors: list[str] = field(default_factory=list)
     totals: Counter = field(default_factory=Counter)
-    totals_by_model: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    totals_by_provider: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    totals_by_service_tier: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    totals_by_reasoning_effort: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    usage_by_route: dict[tuple[str, str, str], Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
+    totals_by_model: dict[str, Counter] = field(default_factory=counter_map)
+    totals_by_provider: dict[str, Counter] = field(default_factory=counter_map)
+    totals_by_service_tier: dict[str, Counter] = field(default_factory=counter_map)
+    totals_by_reasoning_effort: dict[str, Counter] = field(default_factory=counter_map)
+    usage_by_route: dict[tuple[str, str, str], Counter] = field(default_factory=counter_map)
     usage_by_day_route: dict[date, dict[tuple[str, str, str], Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    by_day: dict[date, Counter] = field(default_factory=counter_map)
     by_day_model: dict[date, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    by_hour: dict[datetime, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    by_hour: dict[datetime, Counter] = field(default_factory=counter_map)
     by_hour_model: dict[datetime, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    weekday_hour: dict[tuple[int, int], Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
+    weekday_hour: dict[tuple[int, int], Counter] = field(default_factory=counter_map)
     weekday_hour_model: dict[tuple[int, int], dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    costs_by_model: dict[str, Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
-    costs_by_route: dict[tuple[str, str, str], Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
-    costs_by_day: dict[date, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    costs_by_model: dict[str, Counter] = field(default_factory=counter_map)
+    costs_by_route: dict[tuple[str, str, str], Counter] = field(default_factory=counter_map)
+    costs_by_day: dict[date, Counter] = field(default_factory=counter_map)
     costs_by_day_model: dict[date, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
     costs_by_day_route: dict[date, dict[tuple[str, str, str], Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    costs_by_hour: dict[datetime, Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
+    costs_by_hour: dict[datetime, Counter] = field(default_factory=counter_map)
     costs_by_hour_model: dict[datetime, dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
-    costs_weekday_hour: dict[tuple[int, int], Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
+    costs_weekday_hour: dict[tuple[int, int], Counter] = field(default_factory=counter_map)
     costs_weekday_hour_model: dict[tuple[int, int], dict[str, Counter]] = field(
-        default_factory=lambda: defaultdict(lambda: defaultdict(Counter))
+        default_factory=nested_counter_map
     )
     raw_events: int = 0
     duplicate_events: int = 0
@@ -580,11 +876,31 @@ class UsageReport:
     cached_over_input_events: int = 0
     cache_write_over_input_events: int = 0
     reasoning_over_output_events: int = 0
+    inferred_reasoning_events: int = 0
+    inferred_reasoning_tokens: int = 0
+    heuristic_reasoning_events: int = 0
     missing_timestamp_events: int = 0
     fallback_provider_events: int = 0
     fallback_service_tier_events: int = 0
     fork_sessions: int = 0
+    rollout_files: int = 0
+    conversation_sessions: int = 0
+    internal_threads: int = 0
+    orphan_internal_threads: int = 0
     sqlite_threads_total_tokens: int = 0
+    file_states: dict[str, FileParserState] = field(default_factory=dict, repr=False)
+    seen_fingerprints: dict[tuple[Any, ...], str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
+
+@dataclass
+class IncrementalCacheEnvelope:
+    version: int
+    source_home: str
+    auxiliary_manifest: list[list[str | int]]
+    report: UsageReport
 
 
 def fmt_int(value: int) -> str:
@@ -683,8 +999,8 @@ def read_session_index_names(path: Path = SESSION_INDEX) -> dict[str, str]:
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
+                row = decode_json(line)
+            except ValueError:
                 continue
             if not isinstance(row, dict):
                 continue
@@ -767,8 +1083,8 @@ def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
+                obj = decode_json(line)
+            except ValueError:
                 if metadata:
                     break
                 continue
@@ -786,15 +1102,53 @@ def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
                     break
                 continue
             source = payload.get("source") or payload.get("thread_source")
+            thread_source = clean_text(payload.get("thread_source")).lower()
+            source_parent_id = ""
+            source_payload = payload.get("source")
+            if isinstance(source_payload, dict):
+                pending: list[Any] = [source_payload]
+                while pending and not source_parent_id:
+                    node = pending.pop()
+                    if isinstance(node, dict):
+                        source_parent_id = str(node.get("parent_thread_id") or "")
+                        pending.extend(node.values())
+                    elif isinstance(node, list):
+                        pending.extend(node)
+            top_parent_id = str(payload.get("parent_thread_id") or "")
+            forked_from_id = str(payload.get("forked_from_id") or "")
+            conversation_id = str(payload.get("session_id") or "")
+            source_has_subagent = (
+                isinstance(source_payload, dict) and "subagent" in source_payload
+            )
+            is_internal = bool(
+                thread_source == "subagent"
+                or source_has_subagent
+                or top_parent_id
+                or source_parent_id
+            )
+            physical_parent_id = (
+                top_parent_id or source_parent_id or forked_from_id
+            )
+            if (
+                is_internal
+                and not physical_parent_id
+                and conversation_id
+                and conversation_id != str(payload.get("id") or "")
+            ):
+                physical_parent_id = conversation_id
             metadata.append(
                 {
                     "id": str(payload.get("id") or ""),
-                    "parent_id": str(payload.get("forked_from_id") or ""),
+                    "parent_id": "" if is_internal else forked_from_id,
+                    "physical_parent_id": physical_parent_id,
+                    "conversation_id": conversation_id,
+                    "is_internal": is_internal,
                     "timestamp": str(payload.get("timestamp") or obj.get("timestamp") or ""),
                     "model_provider": clean_text(payload.get("model_provider")),
                     "cli_version": clean_text(payload.get("cli_version")),
                     "originator": clean_text(payload.get("originator")),
                     "source": source_text(source),
+                    "thread_source": thread_source,
                     "context_window": safe_int(payload.get("context_window")),
                 }
             )
@@ -836,14 +1190,17 @@ def discover_sessions(
 ) -> list[SessionDescriptor]:
     paths = sorted(sessions_root.rglob("*.jsonl"))
     leading_meta: dict[Path, list[dict[str, Any]]] = {}
-    parent_map: dict[str, str] = {}
+    physical_parent_map: dict[str, str] = {}
+    user_parent_map: dict[str, str] = {}
 
     for path in paths:
         rows = read_leading_session_meta(path)
         leading_meta[path] = rows
         for row in rows:
             if row["id"]:
-                parent_map[row["id"]] = row["parent_id"]
+                physical_parent_map[row["id"]] = row["physical_parent_id"]
+                if not row["is_internal"]:
+                    user_parent_map[row["id"]] = row["parent_id"]
 
     descriptors: list[SessionDescriptor] = []
     for path in paths:
@@ -851,19 +1208,25 @@ def discover_sessions(
         first = rows[0] if rows else {}
         session_id = str(first.get("id") or session_id_from_filename(path))
         parent_id = str(first.get("parent_id") or "")
+        physical_parent_id = str(first.get("physical_parent_id") or parent_id)
         created_at = str(first.get("timestamp") or "")
         descriptors.append(
             SessionDescriptor(
                 path=path,
                 session_id=session_id,
                 parent_id=parent_id,
-                root_id=lineage_root(session_id, parent_map),
-                lineage_depth=lineage_depth(session_id, parent_map),
+                root_id=lineage_root(session_id, user_parent_map),
+                dedupe_root_id=lineage_root(session_id, physical_parent_map),
+                lineage_depth=lineage_depth(session_id, user_parent_map),
                 created_at=created_at,
                 model_provider=str(first.get("model_provider") or ""),
                 cli_version=str(first.get("cli_version") or ""),
                 originator=str(first.get("originator") or ""),
                 source=str(first.get("source") or ""),
+                thread_source=str(first.get("thread_source") or ""),
+                physical_parent_id=physical_parent_id,
+                conversation_id=str(first.get("conversation_id") or ""),
+                is_internal=bool(first.get("is_internal")),
                 context_window=safe_int(first.get("context_window")),
                 thread=thread_info.get(normalized_path(path), ThreadInfo()),
             )
@@ -872,7 +1235,7 @@ def discover_sessions(
     return sorted(
         descriptors,
         key=lambda item: (
-            item.root_id,
+            item.dedupe_root_id,
             item.lineage_depth,
             item.created_at,
             str(item.path),
@@ -883,7 +1246,165 @@ def discover_sessions(
 def raw_usage_tuple(value: dict[str, Any] | None) -> tuple[int, ...] | None:
     if not isinstance(value, dict):
         return None
-    return tuple(int(value.get(field) or 0) for field in RAW_USAGE_FIELDS)
+    return tuple(
+        reasoning_tokens_from_values(value)
+        if field == "reasoning_output_tokens"
+        else int(value.get(field) or 0)
+        for field in RAW_USAGE_FIELDS
+    )
+
+
+def reasoning_tokens_from_values(value: dict[str, Any]) -> int:
+    direct = int(value.get("reasoning_output_tokens") or 0)
+    if direct:
+        return direct
+    details = value.get("output_tokens_details")
+    if isinstance(details, dict):
+        return int(details.get("reasoning_tokens") or 0)
+    return 0
+
+
+def normalized_usage_values(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(value)
+    nested_reasoning = reasoning_tokens_from_values(value)
+    if nested_reasoning:
+        normalized["reasoning_output_tokens"] = nested_reasoning
+    return normalized
+
+
+def response_reasoning_text(payload: dict[str, Any]) -> str:
+    def content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        return "".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+
+    if payload.get("type") == "reasoning":
+        return content_text(payload.get("content"))
+    if payload.get("type") == "message" and payload.get("role") == "assistant":
+        text = content_text(payload.get("content"))
+        return "\n".join(
+            match.group(1)
+            for match in re.finditer(
+                r"<think\b[^>]*>(.*?)</think\s*>",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+    return ""
+
+
+def heuristic_text_tokens(text: str) -> int:
+    compact = "".join(character for character in text if not character.isspace())
+    if not compact:
+        return 0
+    ascii_characters = sum(character.isascii() for character in compact)
+    non_ascii_characters = len(compact) - ascii_characters
+    return max(1, non_ascii_characters + (ascii_characters + 3) // 4)
+
+
+class ReasoningTokenCounter:
+    def __init__(
+        self,
+        data_home: Path,
+        search_roots: Iterable[Path] = TOKENIZER_SEARCH_ROOTS,
+    ) -> None:
+        self.data_home = data_home
+        self.search_roots = tuple(search_roots)
+        self.explicit_paths = self._read_explicit_paths()
+        self.candidates: list[Path] | None = None
+        self.tokenizers: dict[Path, Any | None] = {}
+
+    @staticmethod
+    def model_key(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def _read_explicit_paths(self) -> dict[str, Path]:
+        path = self.data_home / TOKENIZER_MAP_FILE
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict) and isinstance(payload.get("models"), dict):
+            payload = payload["models"]
+        if not isinstance(payload, dict):
+            return {}
+        result: dict[str, Path] = {}
+        for model, configured in payload.items():
+            if isinstance(configured, dict):
+                configured = configured.get("tokenizer")
+            if not isinstance(configured, str) or not configured.strip():
+                continue
+            configured_path = Path(configured).expanduser()
+            if not configured_path.is_absolute():
+                configured_path = path.parent / configured_path
+            if configured_path.is_dir():
+                configured_path /= "tokenizer.json"
+            result[str(model).lower()] = configured_path.resolve(strict=False)
+        return result
+
+    def _candidate_paths(self) -> list[Path]:
+        if self.candidates is not None:
+            return self.candidates
+        candidates: set[Path] = set()
+        direct = self.data_home / "tokenizer.json"
+        if direct.is_file():
+            candidates.add(direct)
+        roots = (self.data_home / "tokenizers",) + self.search_roots
+        for root in roots:
+            if not root.is_dir():
+                continue
+            try:
+                candidates.update(root.rglob("tokenizer.json"))
+            except OSError:
+                continue
+        self.candidates = sorted(candidates)
+        return self.candidates
+
+    def _path_for_model(self, model: str) -> Path | None:
+        explicit = self.explicit_paths.get(model.lower())
+        if explicit and explicit.is_file():
+            return explicit
+        needle = self.model_key(model)
+        if not needle:
+            return None
+        matches = [
+            path
+            for path in self._candidate_paths()
+            if needle in self.model_key(str(path.parent))
+        ]
+        if not matches:
+            return None
+        return min(matches, key=lambda path: (len(str(path)), str(path)))
+
+    def _load(self, path: Path) -> Any | None:
+        if path in self.tokenizers:
+            return self.tokenizers[path]
+        tokenizer = None
+        try:
+            from tokenizers import Tokenizer
+
+            tokenizer = Tokenizer.from_file(str(path))
+        except (ImportError, OSError, ValueError):
+            pass
+        self.tokenizers[path] = tokenizer
+        return tokenizer
+
+    def count(self, model: str, text: str) -> tuple[int, str]:
+        path = self._path_for_model(model)
+        if path is not None:
+            tokenizer = self._load(path)
+            if tokenizer is not None:
+                try:
+                    return len(tokenizer.encode(text, add_special_tokens=False).ids), "tokenizer"
+                except (TypeError, ValueError):
+                    pass
+        return heuristic_text_tokens(text), "heuristic"
 
 
 def usage_from_values(
@@ -894,7 +1415,7 @@ def usage_from_values(
     cached_tokens = int(value.get("cached_input_tokens") or 0)
     cache_write_tokens = int(value.get("cache_write_input_tokens") or 0)
     output_tokens = int(value.get("output_tokens") or 0)
-    reasoning_tokens = int(value.get("reasoning_output_tokens") or 0)
+    reasoning_tokens = reasoning_tokens_from_values(value)
     reported_total = value.get("total_tokens")
     known_total = input_tokens + output_tokens
     total_tokens = int(reported_total) if reported_total is not None else known_total
@@ -1102,7 +1623,7 @@ def pricing_for_model(
     catalog: dict[str, dict[str, Any]] | None = None,
     aliases: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
-    catalog = catalog or PRICING_USD_PER_MTOK
+    catalog = PRICING_USD_PER_MTOK if catalog is None else catalog
     aliases = aliases or {}
     normalized = normalized_model_id(model)
     route_key = f"{route_provider.strip().lower()}/{normalized}" if route_provider else ""
@@ -1391,15 +1912,147 @@ def add_usage(
     report.costs_weekday_hour_model[weekday_hour][model].update(cost)
 
 
+def merge_session_stats(target: SessionStats, source: SessionStats) -> None:
+    target.total.update(source.total)
+    for attribute in (
+        "by_model",
+        "by_provider",
+        "by_service_tier",
+        "by_reasoning_effort",
+        "by_route",
+        "by_day",
+        "costs_by_day",
+    ):
+        target_map = getattr(target, attribute)
+        for key, value in getattr(source, attribute).items():
+            target_map[key].update(value)
+    for attribute in (
+        "by_day_model",
+        "costs_by_day_model",
+    ):
+        target_map = getattr(target, attribute)
+        for outer_key, nested in getattr(source, attribute).items():
+            for inner_key, value in nested.items():
+                target_map[outer_key][inner_key].update(value)
+
+    for attribute in (
+        "raw_events",
+        "unique_events",
+        "inherited_events",
+        "local_duplicate_events",
+        "null_usage_events",
+        "fallback_delta_events",
+        "fallback_model_events",
+        "repaired_total_events",
+        "cached_over_input_events",
+        "cache_write_over_input_events",
+        "reasoning_over_output_events",
+        "inferred_reasoning_events",
+        "inferred_reasoning_tokens",
+        "heuristic_reasoning_events",
+        "missing_timestamp_events",
+        "fallback_provider_events",
+        "fallback_service_tier_events",
+    ):
+        setattr(target, attribute, getattr(target, attribute) + getattr(source, attribute))
+
+    timestamps = [
+        value
+        for value in (target.first_timestamp, source.first_timestamp)
+        if value
+    ]
+    target.first_timestamp = min(timestamps) if timestamps else None
+    timestamps = [
+        value
+        for value in (target.last_timestamp, source.last_timestamp)
+        if value
+    ]
+    target.last_timestamp = max(timestamps) if timestamps else None
+    target.rollout_files += source.rollout_files
+    target.internal_thread_count += source.internal_thread_count + 1
+
+
+def logical_owner_ids(
+    descriptors: Iterable[SessionDescriptor],
+) -> dict[str, str]:
+    descriptors = list(descriptors)
+    by_id = {descriptor.session_id: descriptor for descriptor in descriptors}
+    visible_ids = {
+        descriptor.session_id for descriptor in descriptors if not descriptor.is_internal
+    }
+    result: dict[str, str] = {}
+    for descriptor in descriptors:
+        if not descriptor.is_internal:
+            result[descriptor.session_id] = descriptor.session_id
+            continue
+        candidate = descriptor.conversation_id
+        if candidate and candidate != descriptor.session_id and candidate in visible_ids:
+            result[descriptor.session_id] = candidate
+            continue
+        current = descriptor.physical_parent_id
+        visited: set[str] = set()
+        while current and current not in visited:
+            visited.add(current)
+            if current in visible_ids:
+                break
+            parent = by_id.get(current)
+            current = parent.physical_parent_id if parent is not None else ""
+        result[descriptor.session_id] = current if current in visible_ids else descriptor.session_id
+    return result
+
+
+def aggregate_internal_threads(report: UsageReport) -> None:
+    """Roll physical worker threads into their user-visible conversation."""
+    physical_stats = list(report.sessions)
+    visible_by_id = {
+        stats.descriptor.session_id: stats
+        for stats in physical_stats
+        if not stats.descriptor.is_internal
+    }
+    owner_ids = logical_owner_ids(stats.descriptor for stats in physical_stats)
+
+    logical_sessions = [
+        stats for stats in physical_stats if not stats.descriptor.is_internal
+    ]
+    for stats in physical_stats:
+        if not stats.descriptor.is_internal:
+            continue
+        owner = visible_by_id.get(owner_ids.get(stats.descriptor.session_id, ""))
+        if owner is not None:
+            merge_session_stats(owner, stats)
+            continue
+        stats.descriptor.orphan_internal = True
+        stats.internal_thread_count = max(1, stats.internal_thread_count)
+        report.orphan_internal_threads += 1
+        logical_sessions.append(stats)
+
+    report.sessions = sorted(
+        logical_sessions,
+        key=lambda item: (
+            item.descriptor.root_id,
+            item.descriptor.lineage_depth,
+            item.descriptor.created_at,
+            str(item.descriptor.path),
+        ),
+    )
+
+
 def collect_usage(
     sessions_root: Path = SESSIONS_ROOT,
     thread_info: dict[str, ThreadInfo] | None = None,
     fallback_service_tier: str | None = None,
+    *,
+    source_key: str = "codex",
+    source_label: str = "Codex",
+    model_aliases_file: Path = MODEL_ALIASES_FILE,
+    billing_context: dict[str, Any] | None = None,
+    pricing_catalog: dict[str, dict[str, Any]] | None = None,
+    reasoning_counter: ReasoningTokenCounter | None = None,
 ) -> UsageReport:
     if thread_info is None:
         thread_info = read_thread_info()
     descriptors = discover_sessions(sessions_root, thread_info)
-    model_aliases, pricing_errors = read_model_aliases()
+    model_aliases, pricing_errors = read_model_aliases(model_aliases_file)
     configured_service_tier = normalize_service_tier(
         fallback_service_tier
         if fallback_service_tier is not None
@@ -1407,15 +2060,34 @@ def collect_usage(
     )
     report = UsageReport(
         sessions=[],
+        source_key=source_key,
+        source_label=source_label,
+        sessions_root=sessions_root,
+        model_aliases_path=model_aliases_file,
+        billing_context=(
+            dict(billing_context)
+            if billing_context is not None
+            else read_billing_context()
+        ),
         configured_service_tier_fallback=configured_service_tier,
-        pricing_catalog=dict(PRICING_USD_PER_MTOK),
+        pricing_catalog=(
+            dict(PRICING_USD_PER_MTOK)
+            if pricing_catalog is None
+            else dict(pricing_catalog)
+        ),
         pricing_aliases=model_aliases,
         pricing_config_errors=pricing_errors,
     )
-    report.fork_sessions = sum(bool(item.parent_id) for item in descriptors)
+    report.rollout_files = len(descriptors)
+    report.conversation_sessions = sum(not item.is_internal for item in descriptors)
+    report.internal_threads = sum(item.is_internal for item in descriptors)
+    report.fork_sessions = sum(
+        bool(item.parent_id) for item in descriptors if not item.is_internal
+    )
     report.sqlite_threads_total_tokens = sum(
         item.thread.tokens_used or 0 for item in descriptors
     )
+    reasoning_counter = reasoning_counter or ReasoningTokenCounter(sessions_root.parent)
 
     seen: dict[tuple[Any, ...], str] = {}
     for descriptor in descriptors:
@@ -1428,16 +2100,24 @@ def collect_usage(
         provider_from_event = bool(descriptor.model_provider)
         service_tier_from_event = False
         previous_cumulative = Counter()
+        pending_reasoning_parts: list[str] = []
         fallback_timestamp = parse_timestamp(
             descriptor.created_at,
             datetime.fromtimestamp(descriptor.path.stat().st_mtime, tz=LOCAL_TZ),
         )
 
-        with descriptor.path.open("r", encoding="utf-8", errors="replace") as fh:
+        file_offset = 0
+        with descriptor.path.open("rb") as fh:
             for line in fh:
+                file_offset += len(line)
+                if not line.endswith(b"\n"):
+                    file_offset -= len(line)
+                    break
+                if not relevant_usage_line(line):
+                    continue
                 try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
+                    obj = decode_json(line)
+                except ValueError:
                     continue
                 if not isinstance(obj, dict):
                     continue
@@ -1446,6 +2126,10 @@ def collect_usage(
                 if not isinstance(payload, dict):
                     continue
                 obj_type = obj.get("type")
+                if obj_type == "response_item":
+                    reasoning_text = response_reasoning_text(payload)
+                    if reasoning_text:
+                        pending_reasoning_parts.append(reasoning_text)
                 if obj_type == "event_msg" and payload.get("type") == "thread_settings_applied":
                     settings = payload.get("thread_settings")
                     if not isinstance(settings, dict):
@@ -1483,6 +2167,8 @@ def collect_usage(
                 if obj_type != "event_msg" or payload.get("type") != "token_count":
                     continue
 
+                pending_reasoning_text = "\n".join(pending_reasoning_parts)
+                pending_reasoning_parts.clear()
                 stats.raw_events += 1
                 report.raw_events += 1
                 info = payload.get("info")
@@ -1490,13 +2176,19 @@ def collect_usage(
                     stats.null_usage_events += 1
                     report.null_usage_events += 1
                     continue
-                current_usage = info.get("total_token_usage")
-                if not isinstance(current_usage, dict):
+                raw_current_usage = info.get("total_token_usage")
+                if not isinstance(raw_current_usage, dict):
                     stats.null_usage_events += 1
                     report.null_usage_events += 1
                     continue
+                current_usage = normalized_usage_values(raw_current_usage)
 
-                last_usage = info.get("last_token_usage")
+                raw_last_usage = info.get("last_token_usage")
+                last_usage = (
+                    normalized_usage_values(raw_last_usage)
+                    if isinstance(raw_last_usage, dict)
+                    else None
+                )
                 model = active_model
                 if not model:
                     model = descriptor.thread.model
@@ -1508,15 +2200,54 @@ def collect_usage(
                 provider_fallback = not provider_from_event
                 service_tier = normalize_service_tier(active_service_tier)
                 service_tier_fallback = not service_tier_from_event
+                if isinstance(last_usage, dict):
+                    output_for_call = int(last_usage.get("output_tokens") or 0)
+                    reported_reasoning = reasoning_tokens_from_values(last_usage)
+                else:
+                    output_for_call = max(
+                        0,
+                        int(current_usage.get("output_tokens") or 0)
+                        - previous_cumulative["output_tokens"],
+                    )
+                    reported_reasoning = 0
+                inferred_reasoning = 0
+                inference_method = ""
+                if pending_reasoning_text and not reported_reasoning and output_for_call:
+                    inferred_reasoning, inference_method = reasoning_counter.count(
+                        model,
+                        pending_reasoning_text,
+                    )
+                    inferred_reasoning = min(output_for_call, inferred_reasoning)
+                    if isinstance(last_usage, dict):
+                        last_usage["reasoning_output_tokens"] = inferred_reasoning
+
+                current_total = int(current_usage.get("total_tokens") or 0)
+                cumulative_reset = current_total < previous_cumulative["total_tokens"]
+                if not reasoning_tokens_from_values(current_usage):
+                    previous_reasoning = (
+                        0
+                        if cumulative_reset
+                        else previous_cumulative["reasoning_output_tokens"]
+                    )
+                    call_reasoning = (
+                        reasoning_tokens_from_values(last_usage)
+                        if isinstance(last_usage, dict)
+                        else inferred_reasoning
+                    )
+                    if current_total == previous_cumulative["total_tokens"]:
+                        call_reasoning = 0
+                    current_usage["reasoning_output_tokens"] = (
+                        previous_reasoning + call_reasoning
+                    )
                 fingerprint = event_fingerprint(
-                    descriptor.root_id,
+                    descriptor.dedupe_root_id,
                     active_turn,
                     route_provider,
                     model,
                     service_tier,
                     active_reasoning_effort,
-                    current_usage,
-                    last_usage if isinstance(last_usage, dict) else None,
+                    raw_current_usage,
+                    raw_last_usage if isinstance(raw_last_usage, dict) else None,
                     info.get("model_context_window"),
                 )
                 owner = seen.get(fingerprint)
@@ -1541,6 +2272,11 @@ def collect_usage(
                     stats.fallback_provider_events += 1
                 if service_tier_fallback:
                     stats.fallback_service_tier_events += 1
+                if inferred_reasoning:
+                    stats.inferred_reasoning_events += 1
+                    stats.inferred_reasoning_tokens += inferred_reasoning
+                    if inference_method == "heuristic":
+                        stats.heuristic_reasoning_events += 1
 
                 if isinstance(last_usage, dict):
                     usage = usage_from_values(last_usage, stats)
@@ -1576,11 +2312,429 @@ def collect_usage(
         report.cached_over_input_events += stats.cached_over_input_events
         report.cache_write_over_input_events += stats.cache_write_over_input_events
         report.reasoning_over_output_events += stats.reasoning_over_output_events
+        report.inferred_reasoning_events += stats.inferred_reasoning_events
+        report.inferred_reasoning_tokens += stats.inferred_reasoning_tokens
+        report.heuristic_reasoning_events += stats.heuristic_reasoning_events
         report.missing_timestamp_events += stats.missing_timestamp_events
         report.fallback_provider_events += stats.fallback_provider_events
         report.fallback_service_tier_events += stats.fallback_service_tier_events
         report.sessions.append(stats)
 
+        try:
+            file_stat = descriptor.path.stat()
+            file_size = int(file_stat.st_size)
+            file_mtime_ns = int(file_stat.st_mtime_ns)
+        except OSError:
+            file_size = file_offset
+            file_mtime_ns = 0
+        report.file_states[normalized_path(descriptor.path)] = FileParserState(
+            descriptor=descriptor,
+            offset=file_offset,
+            size=file_size,
+            mtime_ns=file_mtime_ns,
+            active_turn=active_turn,
+            active_model=active_model,
+            active_provider=active_provider,
+            active_service_tier=active_service_tier,
+            active_reasoning_effort=active_reasoning_effort,
+            provider_from_event=provider_from_event,
+            service_tier_from_event=service_tier_from_event,
+            previous_cumulative=Counter(previous_cumulative),
+            pending_reasoning_parts=list(pending_reasoning_parts),
+        )
+
+    owner_ids = logical_owner_ids(
+        state.descriptor for state in report.file_states.values()
+    )
+    for state in report.file_states.values():
+        state.logical_owner_id = owner_ids.get(
+            state.descriptor.session_id,
+            state.descriptor.session_id,
+        )
+    report.seen_fingerprints = dict(seen)
+    aggregate_internal_threads(report)
+    return report
+
+
+def descriptor_cache_identity(descriptor: SessionDescriptor) -> tuple[Any, ...]:
+    return (
+        descriptor.session_id,
+        descriptor.parent_id,
+        descriptor.root_id,
+        descriptor.dedupe_root_id,
+        descriptor.lineage_depth,
+        descriptor.created_at,
+        descriptor.model_provider,
+        descriptor.cli_version,
+        descriptor.originator,
+        descriptor.source,
+        descriptor.thread_source,
+        descriptor.physical_parent_id,
+        descriptor.conversation_id,
+        descriptor.is_internal,
+        descriptor.context_window,
+    )
+
+
+def process_incremental_file(
+    report: UsageReport,
+    state: FileParserState,
+    target: SessionStats,
+    reasoning_counter: ReasoningTokenCounter,
+) -> None:
+    descriptor = state.descriptor
+    fallback_timestamp = parse_timestamp(
+        descriptor.created_at,
+        datetime.fromtimestamp(descriptor.path.stat().st_mtime, tz=LOCAL_TZ),
+    )
+    audit_side_effects = (
+        "fallback_delta_events",
+        "repaired_total_events",
+        "cached_over_input_events",
+        "cache_write_over_input_events",
+        "reasoning_over_output_events",
+    )
+
+    with descriptor.path.open("rb") as handle:
+        handle.seek(state.offset)
+        while True:
+            line_start = handle.tell()
+            line = handle.readline()
+            if not line:
+                break
+            state.offset = handle.tell()
+            if not line.endswith(b"\n"):
+                state.offset = line_start
+                break
+            if not relevant_usage_line(line):
+                continue
+            try:
+                obj = decode_json(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            obj_type = obj.get("type")
+            if obj_type == "response_item":
+                reasoning_text = response_reasoning_text(payload)
+                if reasoning_text:
+                    state.pending_reasoning_parts.append(reasoning_text)
+            if obj_type == "event_msg" and payload.get("type") == "thread_settings_applied":
+                settings = payload.get("thread_settings")
+                if not isinstance(settings, dict):
+                    continue
+                settings_model = clean_text(settings.get("model"))
+                if settings_model:
+                    state.active_model = settings_model
+                settings_provider = clean_text(settings.get("model_provider_id"))
+                if settings_provider:
+                    state.active_provider = normalize_provider(settings_provider)
+                    state.provider_from_event = True
+                if "service_tier" in settings:
+                    state.active_service_tier = normalize_service_tier(
+                        settings.get("service_tier")
+                    )
+                    state.service_tier_from_event = True
+                settings_effort = clean_text(
+                    settings.get("reasoning_effort") or settings.get("effort")
+                )
+                if settings_effort:
+                    state.active_reasoning_effort = settings_effort
+                continue
+            if obj_type == "turn_context":
+                state.active_turn = str(payload.get("turn_id") or state.active_turn)
+                context_model = active_model_from_context(payload)
+                if context_model:
+                    state.active_model = context_model
+                context_effort = active_effort_from_context(payload)
+                if context_effort:
+                    state.active_reasoning_effort = context_effort
+                continue
+            if obj_type == "event_msg" and payload.get("type") == "task_started":
+                state.active_turn = str(payload.get("turn_id") or state.active_turn)
+                continue
+            if obj_type != "event_msg" or payload.get("type") != "token_count":
+                continue
+
+            pending_reasoning_text = "\n".join(state.pending_reasoning_parts)
+            state.pending_reasoning_parts.clear()
+            target.raw_events += 1
+            report.raw_events += 1
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                target.null_usage_events += 1
+                report.null_usage_events += 1
+                continue
+            raw_current_usage = info.get("total_token_usage")
+            if not isinstance(raw_current_usage, dict):
+                target.null_usage_events += 1
+                report.null_usage_events += 1
+                continue
+            current_usage = normalized_usage_values(raw_current_usage)
+            raw_last_usage = info.get("last_token_usage")
+            last_usage = (
+                normalized_usage_values(raw_last_usage)
+                if isinstance(raw_last_usage, dict)
+                else None
+            )
+
+            model = state.active_model
+            if not model:
+                model = descriptor.thread.model
+                if model:
+                    target.fallback_model_events += 1
+                    report.fallback_model_events += 1
+            if not model:
+                model = UNKNOWN_MODEL
+            route_provider = normalize_provider(state.active_provider)
+            provider_fallback = not state.provider_from_event
+            service_tier = normalize_service_tier(state.active_service_tier)
+            service_tier_fallback = not state.service_tier_from_event
+
+            if isinstance(last_usage, dict):
+                output_for_call = int(last_usage.get("output_tokens") or 0)
+                reported_reasoning = reasoning_tokens_from_values(last_usage)
+            else:
+                output_for_call = max(
+                    0,
+                    int(current_usage.get("output_tokens") or 0)
+                    - state.previous_cumulative["output_tokens"],
+                )
+                reported_reasoning = 0
+            inferred_reasoning = 0
+            inference_method = ""
+            if pending_reasoning_text and not reported_reasoning and output_for_call:
+                inferred_reasoning, inference_method = reasoning_counter.count(
+                    model,
+                    pending_reasoning_text,
+                )
+                inferred_reasoning = min(output_for_call, inferred_reasoning)
+                if isinstance(last_usage, dict):
+                    last_usage["reasoning_output_tokens"] = inferred_reasoning
+
+            current_total = int(current_usage.get("total_tokens") or 0)
+            cumulative_reset = current_total < state.previous_cumulative["total_tokens"]
+            if not reasoning_tokens_from_values(current_usage):
+                previous_reasoning = (
+                    0
+                    if cumulative_reset
+                    else state.previous_cumulative["reasoning_output_tokens"]
+                )
+                call_reasoning = (
+                    reasoning_tokens_from_values(last_usage)
+                    if isinstance(last_usage, dict)
+                    else inferred_reasoning
+                )
+                if current_total == state.previous_cumulative["total_tokens"]:
+                    call_reasoning = 0
+                current_usage["reasoning_output_tokens"] = (
+                    previous_reasoning + call_reasoning
+                )
+
+            fingerprint = event_fingerprint(
+                descriptor.dedupe_root_id,
+                state.active_turn,
+                route_provider,
+                model,
+                service_tier,
+                state.active_reasoning_effort,
+                raw_current_usage,
+                raw_last_usage if isinstance(raw_last_usage, dict) else None,
+                info.get("model_context_window"),
+            )
+            owner = report.seen_fingerprints.get(fingerprint)
+            current_cumulative = Counter(
+                {
+                    field: int(current_usage.get(field) or 0)
+                    for field in RAW_USAGE_FIELDS
+                }
+            )
+            if owner is not None:
+                state.previous_cumulative = current_cumulative
+                report.duplicate_events += 1
+                if owner == descriptor.session_id:
+                    target.local_duplicate_events += 1
+                    report.local_duplicate_events += 1
+                else:
+                    target.inherited_events += 1
+                    report.inherited_events += 1
+                continue
+            report.seen_fingerprints[fingerprint] = descriptor.session_id
+            if provider_fallback:
+                target.fallback_provider_events += 1
+                report.fallback_provider_events += 1
+            if service_tier_fallback:
+                target.fallback_service_tier_events += 1
+                report.fallback_service_tier_events += 1
+            if inferred_reasoning:
+                target.inferred_reasoning_events += 1
+                target.inferred_reasoning_tokens += inferred_reasoning
+                report.inferred_reasoning_events += 1
+                report.inferred_reasoning_tokens += inferred_reasoning
+                if inference_method == "heuristic":
+                    target.heuristic_reasoning_events += 1
+                    report.heuristic_reasoning_events += 1
+
+            before = {attribute: getattr(target, attribute) for attribute in audit_side_effects}
+            if isinstance(last_usage, dict):
+                usage = usage_from_values(last_usage, target)
+            else:
+                usage = fallback_delta_usage(
+                    current_usage,
+                    state.previous_cumulative,
+                    target,
+                )
+            for attribute in audit_side_effects:
+                setattr(
+                    report,
+                    attribute,
+                    getattr(report, attribute)
+                    + getattr(target, attribute)
+                    - before[attribute],
+                )
+            state.previous_cumulative = current_cumulative
+
+            timestamp_text = str(obj.get("timestamp") or "")
+            if not timestamp_text:
+                target.missing_timestamp_events += 1
+                report.missing_timestamp_events += 1
+            timestamp = parse_timestamp(timestamp_text, fallback_timestamp)
+            target.first_timestamp = target.first_timestamp or timestamp.isoformat()
+            target.last_timestamp = timestamp.isoformat()
+            target.unique_events += 1
+            add_usage(
+                report,
+                target,
+                route_provider,
+                model,
+                service_tier,
+                state.active_reasoning_effort,
+                timestamp,
+                usage,
+            )
+
+    try:
+        stat = descriptor.path.stat()
+        state.size = int(stat.st_size)
+        state.mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        state.size = state.offset
+        state.mtime_ns = 0
+
+
+def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
+    report = load_incremental_cache(source)
+    if report is None or not report.file_states or not report.seen_fingerprints:
+        return None
+
+    thread_info = read_thread_info(source.state_db, source.session_index)
+    descriptors = discover_sessions(source.sessions_root, thread_info)
+    descriptors_by_path = {
+        normalized_path(descriptor.path): descriptor for descriptor in descriptors
+    }
+    if not set(report.file_states).issubset(descriptors_by_path):
+        return None
+
+    owner_ids = logical_owner_ids(descriptors)
+    for path_key, state in report.file_states.items():
+        descriptor = descriptors_by_path[path_key]
+        if descriptor_cache_identity(descriptor) != descriptor_cache_identity(state.descriptor):
+            return None
+        if owner_ids.get(descriptor.session_id, descriptor.session_id) != state.logical_owner_id:
+            return None
+        try:
+            stat = descriptor.path.stat()
+        except OSError:
+            return None
+        if stat.st_size < state.offset:
+            return None
+        if stat.st_size == state.size and stat.st_mtime_ns != state.mtime_ns:
+            return None
+        state.descriptor = descriptor
+
+    logical_by_id = {
+        stats.descriptor.session_id: stats for stats in report.sessions
+    }
+    for stats in report.sessions:
+        current = next(
+            (
+                descriptor
+                for descriptor in descriptors
+                if descriptor.session_id == stats.descriptor.session_id
+            ),
+            None,
+        )
+        if current is not None:
+            stats.descriptor.thread = current.thread
+
+    new_descriptors = [
+        descriptor
+        for descriptor in descriptors
+        if normalized_path(descriptor.path) not in report.file_states
+    ]
+    for descriptor in new_descriptors:
+        owner_id = owner_ids.get(descriptor.session_id, descriptor.session_id)
+        if owner_id != descriptor.session_id:
+            continue
+        stats = SessionStats(descriptor=descriptor)
+        if descriptor.is_internal:
+            descriptor.orphan_internal = True
+            stats.internal_thread_count = 1
+            report.orphan_internal_threads += 1
+        report.sessions.append(stats)
+        logical_by_id[descriptor.session_id] = stats
+
+    for descriptor in new_descriptors:
+        owner_id = owner_ids.get(descriptor.session_id, descriptor.session_id)
+        target = logical_by_id.get(owner_id)
+        if target is None:
+            return None
+        if owner_id != descriptor.session_id:
+            target.rollout_files += 1
+            target.internal_thread_count += 1
+        report.rollout_files += 1
+        if descriptor.is_internal:
+            report.internal_threads += 1
+        else:
+            report.conversation_sessions += 1
+            if descriptor.parent_id:
+                report.fork_sessions += 1
+        report.file_states[normalized_path(descriptor.path)] = FileParserState(
+            descriptor=descriptor,
+            logical_owner_id=owner_id,
+            active_provider=normalize_provider(descriptor.model_provider),
+            active_service_tier=report.configured_service_tier_fallback,
+            provider_from_event=bool(descriptor.model_provider),
+        )
+
+    reasoning_counter = ReasoningTokenCounter(source.home)
+    for descriptor in descriptors:
+        state = report.file_states[normalized_path(descriptor.path)]
+        try:
+            current_size = descriptor.path.stat().st_size
+        except OSError:
+            return None
+        if current_size <= state.offset:
+            continue
+        target = logical_by_id.get(state.logical_owner_id)
+        if target is None:
+            return None
+        process_incremental_file(report, state, target, reasoning_counter)
+
+    report.sqlite_threads_total_tokens = sum(
+        descriptor.thread.tokens_used or 0 for descriptor in descriptors
+    )
+    report.sessions.sort(
+        key=lambda item: (
+            item.descriptor.root_id,
+            item.descriptor.lineage_depth,
+            item.descriptor.created_at,
+            str(item.descriptor.path),
+        )
+    )
     return report
 
 
@@ -1716,12 +2870,12 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
         "models": model_details,
         "routes": route_details,
         "billing_context": {
-            **read_billing_context(),
+            **report.billing_context,
             "configured_service_tier_fallback": report.configured_service_tier_fallback,
             "inferred_service_tier_calls": report.fallback_service_tier_events,
         },
         "model_aliases": {
-            "path": str(MODEL_ALIASES_FILE),
+            "path": str(report.model_aliases_path),
             "aliases": len(report.pricing_aliases),
             "errors": report.pricing_config_errors,
         },
@@ -1825,8 +2979,8 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
             for hour in sorted(report.by_hour)
             if (
                 scope == ALL_MODELS_KEY
-                or report.by_hour_model[hour][scope]["priced_calls"]
-                or report.by_hour_model[hour][scope]["unpriced_calls"]
+                or report.costs_by_hour_model[hour][scope]["priced_calls"]
+                or report.costs_by_hour_model[hour][scope]["unpriced_calls"]
             )
         }
         for scope in [ALL_MODELS_KEY, *models]
@@ -1849,6 +3003,9 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
                 "cli_version": descriptor.cli_version,
                 "originator": descriptor.originator,
                 "source": descriptor.source,
+                "thread_source": descriptor.thread_source,
+                "thread_kind": "internal" if descriptor.is_internal else "user",
+                "orphan_internal": descriptor.orphan_internal,
                 "context_window": descriptor.context_window,
                 "title": title or "(untitled)",
                 "title_source": descriptor.thread.title_source,
@@ -1898,11 +3055,15 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
                 "unique_events": stats.unique_events,
                 "inherited_events": stats.inherited_events,
                 "local_duplicate_events": stats.local_duplicate_events,
+                "rollout_files": stats.rollout_files,
+                "internal_thread_count": stats.internal_thread_count,
             }
         )
 
     generated_at = datetime.now(LOCAL_TZ)
     return {
+        "source_id": report.source_key,
+        "source_label": report.source_label,
         "generated_at": generated_at.isoformat(),
         "generated_at_label": generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "timezone": LOCAL_TZ.key,
@@ -1932,10 +3093,14 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
         "daily": daily,
         "sessions": sessions,
         "audit": {
-            "session_files": len(report.sessions),
+            "session_files": report.rollout_files,
             "sessions_with_usage": sum(
                 stats.total["total_tokens"] > 0 for stats in report.sessions
             ),
+            "conversation_sessions": report.conversation_sessions,
+            "logical_sessions": len(report.sessions),
+            "internal_threads": report.internal_threads,
+            "orphan_internal_threads": report.orphan_internal_threads,
             "fork_sessions": report.fork_sessions,
             "raw_token_events": report.raw_events,
             "unique_model_calls": int(report.totals["calls"]),
@@ -1949,6 +3114,9 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
             "cached_over_input_events": report.cached_over_input_events,
             "cache_write_over_input_events": report.cache_write_over_input_events,
             "reasoning_over_output_events": report.reasoning_over_output_events,
+            "inferred_reasoning_events": report.inferred_reasoning_events,
+            "inferred_reasoning_tokens": report.inferred_reasoning_tokens,
+            "heuristic_reasoning_events": report.heuristic_reasoning_events,
             "missing_timestamp_events": report.missing_timestamp_events,
             "fallback_provider_events": report.fallback_provider_events,
             "fallback_service_tier_events": report.fallback_service_tier_events,
@@ -2435,7 +3603,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
 <body>
 <main class="shell">
   <header class="masthead">
-    <div class="eyebrow">Local Codex Telemetry / Asia Shanghai</div>
+    <div class="eyebrow">Local __SOURCE_LABEL__ Telemetry / Asia Shanghai</div>
     <div class="masthead-row">
       <div>
         <h1>Token Atlas</h1>
@@ -2495,7 +3663,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
 
   <section class="panel">
     <div class="panel-inner">
-      <div class="panel-head"><div><h2>会话用量</h2><p class="panel-kicker">fork 会话仅显示分叉后新增的独占用量；继承历史不会再次计入。</p></div><div class="scale-note">TOP 30 / CURRENT FILTER</div></div>
+      <div class="panel-head"><div><h2>会话用量</h2><p class="panel-kicker">每行是一段用户可见会话；内部线程归并到所属会话，显式用户 fork 单独列出。</p></div><div class="scale-note">TOP 30 / CURRENT FILTER</div></div>
       <div class="table-wrap"><table><thead><tr><th>Session</th><th>Models</th><th>Routing</th><th id="sessionMetric">Metric</th><th>Calls</th><th>Branch</th></tr></thead><tbody id="sessionRows"></tbody></table></div>
     </div>
   </section>
@@ -2522,7 +3690,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     <div class="panel-inner">
       <div class="panel-head"><div><h2>统计审计</h2><p class="panel-kicker">所有异常与去重结果都留在这里，便于核对数据口径。</p></div></div>
       <div class="audit-grid" id="auditGrid"></div>
-      <p class="method">口径：每个有效 token_count 读取单次增量 last_token_usage，并关联当时最近的 provider、model、service tier 与 reasoning effort。父会话与 fork 文件中重复出现的历史事件只计第一次。total 大于 input + output 的差额保留为 Unclassified；reasoning 是 output 的子集，不重复加入 total。</p>
+      <p class="method">口径：每个有效 token_count 读取单次增量 last_token_usage，并关联当时最近的 provider、model、service tier 与 reasoning effort。父会话与 fork 文件中重复出现的历史事件只计第一次。total 大于 input + output 的差额保留为 Unclassified；reasoning 是 output 的子集，不重复加入 total。兼容供应商把 reasoning 计为 0 但保留明文 reasoning item 时，使用匹配的本地 tokenizer 推导，fallback 会在审计区单独标记。</p>
     </div>
   </section>
 
@@ -2591,7 +3759,8 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   function tooltipText(title, usage, cost = zeroCost) {
     const selected = `${metrics[state.metric].label}: ${fmt(metricValue(usage))}`;
     const unpriced = cost.unpriced_tokens ? ` · ${short(cost.unpriced_tokens)} unpriced` : "";
-    return `${title}<br>${selected}<br>Total: ${fmt(usage.total_tokens)} · Calls: ${fmt(usage.calls)}<br>Official API value: ${usd(cost.estimated_cost_usd)}${unpriced}`;
+    const value = cost.priced_tokens ? usd(cost.estimated_cost_usd) : "Unpriced";
+    return `${title}<br>${selected}<br>Total: ${fmt(usage.total_tokens)} · Calls: ${fmt(usage.calls)}<br>Official API value: ${value}${unpriced}`;
   }
   function heatButton(className, value, cap, tooltip, aria) {
     return `<button type="button" class="heat-cell ${className}" style="background:${colorFor(value, cap)}" data-tooltip="${escapeHtml(tooltip)}" aria-label="${escapeHtml(aria)}"></button>`;
@@ -2633,7 +3802,9 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       cells.push(`<div class="day-label">${weekdays[weekday]}</div>`);
       row.forEach((usage, hour) => {
         const title = `${weekdays[weekday]} ${String(hour).padStart(2,"0")}:00–${String(hour).padStart(2,"0")}:59 · ${modelLabel(state.model)}`;
-        cells.push(heatButton("hourly-cell", metricValue(usage), cap, tooltipText(title, usage, costMatrix[weekday][hour]), `${title}, ${metrics[state.metric].label} ${fmt(metricValue(usage))}, official API value ${usd(costMatrix[weekday][hour].estimated_cost_usd)}`));
+        const cost = costMatrix[weekday][hour];
+        const costLabel = cost.priced_tokens ? usd(cost.estimated_cost_usd) : "unpriced";
+        cells.push(heatButton("hourly-cell", metricValue(usage), cap, tooltipText(title, usage, cost), `${title}, ${metrics[state.metric].label} ${fmt(metricValue(usage))}, official API value ${costLabel}`));
       });
     });
     document.getElementById("hourGrid").innerHTML = cells.join("");
@@ -2668,7 +3839,8 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       const outside = current < first || current > last;
       const title = `${key} · ${modelLabel(state.model)}`;
       const cost = outside ? zeroCost : (costsByDate[key] || zeroCost);
-      cells.push(heatButton(`calendar-cell${outside ? " outside" : ""}`, outside ? 0 : metricValue(usage), cap, tooltipText(title, usage, cost), `${title}, ${metrics[state.metric].label} ${fmt(metricValue(usage))}, official API value ${usd(cost.estimated_cost_usd)}`));
+      const costLabel = cost.priced_tokens ? usd(cost.estimated_cost_usd) : "unpriced";
+      cells.push(heatButton(`calendar-cell${outside ? " outside" : ""}`, outside ? 0 : metricValue(usage), cap, tooltipText(title, usage, cost), `${title}, ${metrics[state.metric].label} ${fmt(metricValue(usage))}, official API value ${costLabel}`));
       if (offset % 7 === 0 && current.getUTCMonth() !== previousMonth) {
         months.push(`<span style="grid-column:${Math.floor(offset / 7) + 1}">${current.toLocaleString("zh-CN", {month:"short", timeZone:"UTC"})}</span>`);
         previousMonth = current.getUTCMonth();
@@ -2709,9 +3881,9 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       const models = Object.entries(session.by_model).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([model]) => `<span class="badge">${escapeHtml(model)}</span>`).join("");
       const providers = Object.entries(session.by_provider || {}).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([provider]) => `<span class="badge provider-badge">${escapeHtml(provider)}</span>`).join("");
       const tiers = Object.entries(session.by_service_tier || {}).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([tier]) => `<span class="badge tier-badge">${escapeHtml(tierLabel(tier))}</span>`).join("");
-      const branch = session.parent_id ? `<span class="badge fork-badge">fork +${session.lineage_depth}</span>` : `<span class="badge">root</span>`;
-      const inherited = session.inherited_events ? `<span class="session-id">${fmt(session.inherited_events)} inherited skipped</span>` : "";
-      return `<tr><td><span class="session-title" data-tooltip="${escapeHtml(session.path)}">${escapeHtml(session.title)}</span><span class="session-id">${escapeHtml(session.id)}</span></td><td>${models}</td><td>${providers}${tiers}</td><td>${fmt(metricValue(usage))}</td><td>${fmt(usage.calls)}</td><td>${branch}${inherited}</td></tr>`;
+      const branch = session.parent_id ? `<span class="badge fork-badge">user fork +${session.lineage_depth}</span>` : `<span class="badge">conversation</span>`;
+      const lineage = `<span class="session-id">${fmt(session.rollout_files || 1)} files · ${fmt(session.internal_thread_count || 0)} internal</span>`;
+      return `<tr><td><span class="session-title" data-tooltip="${escapeHtml(session.path)}">${escapeHtml(session.title)}</span><span class="session-id">${escapeHtml(session.id)}</span></td><td>${models}</td><td>${providers}${tiers}</td><td>${fmt(metricValue(usage))}</td><td>${fmt(usage.calls)}</td><td>${branch}${lineage}</td></tr>`;
     }).join("") || `<tr><td colspan="6">No usage for this filter</td></tr>`;
   }
 
@@ -2720,16 +3892,19 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     const cost = pricing.scopes[state.model] || zeroCost;
     const coverageBase = Number(cost.priced_tokens || 0) + Number(cost.unpriced_tokens || 0);
     const coverage = coverageBase ? Number(cost.priced_tokens || 0) / coverageBase : 0;
-    document.getElementById("estimatedCost").textContent = usd(cost.estimated_cost_usd);
+    const hasTrustedPricing = Number(cost.priced_tokens || 0) > 0;
+    document.getElementById("estimatedCost").textContent = hasTrustedPricing ? usd(cost.estimated_cost_usd) : "未定价";
     document.getElementById("estimatedCostDetail").textContent = `${(coverage * 100).toFixed(1)}% categorized tokens priced`;
-    document.getElementById("standardCost").textContent = usd(cost.standard_equivalent_cost_usd);
+    document.getElementById("standardCost").textContent = hasTrustedPricing ? usd(cost.standard_equivalent_cost_usd) : "未定价";
     document.getElementById("standardCostDetail").textContent = `${fmt(cost.default_tier_calls)} default · ${fmt(cost.long_context_calls)} long context`;
-    document.getElementById("tierPremium").textContent = usd(cost.service_tier_premium_usd);
+    document.getElementById("tierPremium").textContent = hasTrustedPricing ? usd(cost.service_tier_premium_usd) : "—";
     document.getElementById("tierPremiumDetail").textContent = `${fmt(cost.priority_tier_calls)} priority / fast calls · ${fmt(cost.tier_rate_fallback_calls)} fallback`;
-    document.getElementById("cacheSavings").textContent = usd(cost.cache_savings_usd);
+    document.getElementById("cacheSavings").textContent = hasTrustedPricing ? usd(cost.cache_savings_usd) : "—";
     document.getElementById("cacheSavingsDetail").textContent = `${usd(cost.cached_input_cost_usd)} read · ${usd(cost.cache_write_input_cost_usd)} write`;
-    document.getElementById("costCaption").textContent = `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。`;
-    document.getElementById("pricingAsOf").textContent = `OFFICIAL DIRECT RATES · ${pricing.as_of}`;
+    document.getElementById("costCaption").textContent = hasTrustedPricing
+      ? `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。`
+      : `${modelLabel(state.model)} · 当前数据目录没有可信官方价格；模型、调用和 token 仍完整统计。`;
+    document.getElementById("pricingAsOf").textContent = hasTrustedPricing ? `OFFICIAL DIRECT RATES · ${pricing.as_of}` : "UNPRICED SOURCE";
 
     const visibleRoutes = pricing.routes.filter(route => state.model === "all" || route.model === state.model);
     const rateCell = value => value == null ? "—" : usd(value);
@@ -2740,7 +3915,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
         ? `${escapeHtml(detail.pricing_provider || "")}${detail.pricing_provider ? " / " : ""}${escapeHtml(detail.pricing_model)}`
         : `<span class="cost-warning">Not priced</span>`;
       const valueTooltip = `Input: ${usd(routeCost.uncached_input_cost_usd)} · Cache read: ${usd(routeCost.cached_input_cost_usd)} · Cache write: ${usd(routeCost.cache_write_input_cost_usd)} · Output: ${usd(routeCost.output_cost_usd)}`;
-      return `<tr><td><span class="badge provider-badge">${escapeHtml(detail.route_provider)}</span></td><td>${escapeHtml(detail.model)}</td><td><span class="badge tier-badge">${escapeHtml(tierLabel(detail.service_tier))}</span></td><td>${pricedAs}</td><td data-tooltip="${escapeHtml(valueTooltip)}">${usd(routeCost.estimated_cost_usd)}</td><td>${rateCell(rates?.input)}</td><td>${rateCell(rates?.cached_input)}</td><td>${rateCell(rates?.cache_write_input)}</td><td>${rateCell(rates?.output)}</td><td>${fmt(detail.usage.calls)}</td><td>${short(routeCost.unpriced_tokens)}</td></tr>`;
+      return `<tr><td><span class="badge provider-badge">${escapeHtml(detail.route_provider)}</span></td><td>${escapeHtml(detail.model)}</td><td><span class="badge tier-badge">${escapeHtml(tierLabel(detail.service_tier))}</span></td><td>${pricedAs}</td><td data-tooltip="${escapeHtml(valueTooltip)}">${routeCost.priced_tokens ? usd(routeCost.estimated_cost_usd) : "—"}</td><td>${rateCell(rates?.input)}</td><td>${rateCell(rates?.cached_input)}</td><td>${rateCell(rates?.cache_write_input)}</td><td>${rateCell(rates?.output)}</td><td>${fmt(detail.usage.calls)}</td><td>${short(routeCost.unpriced_tokens)}</td></tr>`;
     }).join("") || `<tr><td colspan="11">No usage for this filter</td></tr>`;
 
     const unpricedNote = cost.unpriced_tokens ? ` ${fmt(cost.unpriced_tokens)} 个无法分类或暂无官方价格的 token 未计价。` : "";
@@ -2750,14 +3925,17 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       : authMode.includes("chatgpt")
         ? "当前认证为 ChatGPT；这里仍只显示 API 等价价值，无法从 token 日志还原订阅账单或 credits。"
         : "日志不保存可验证的历史认证方式，因此不能判定每次调用属于订阅还是 API 账单。";
+    const aliasPath = pricing.model_aliases.path || "token_atlas_pricing.json";
     const configNote = pricing.model_aliases.aliases
       ? ` 已加载 ${pricing.model_aliases.aliases} 个官方模型别名映射。`
-      : " 可用 ~/.codex/token_atlas_pricing.json 将内部模型名映射到内置官方型号；不接受中转站自定义单价。";
+      : ` 可用 ${aliasPath} 将内部模型名映射到内置官方型号；不接受中转站自定义单价。`;
     const configErrorNote = pricing.model_aliases.errors.length ? ` 模型映射配置有 ${pricing.model_aliases.errors.length} 个错误。` : "";
     const inferredTier = pricing.billing_context?.configured_service_tier_fallback === "priority" ? "Fast/Priority" : (pricing.billing_context?.configured_service_tier_fallback || "Default");
     const inferredTierCalls = Number(pricing.billing_context?.inferred_service_tier_calls || 0);
-    const inferredTierNote = inferredTierCalls ? ` 日志缺失 tier 的 ${fmt(inferredTierCalls)} 次调用按当前 Codex 配置 ${inferredTier} 推断。` : "";
-    document.getElementById("costMethod").textContent = `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`;
+    const inferredTierNote = inferredTierCalls ? ` 日志缺失 tier 的 ${fmt(inferredTierCalls)} 次调用按当前数据目录配置 ${inferredTier} 推断。` : "";
+    document.getElementById("costMethod").textContent = hasTrustedPricing
+      ? `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`
+      : `当前来源仅提供用量统计。为避免本地模型与官方模型同名造成误计价，不推断任何 API 费用。${unpricedNote}`;
     const sourceMap = new Map();
     pricing.sources.forEach(item => {
       if (!sourceMap.has(item.url)) sourceMap.set(item.url, []);
@@ -2774,11 +3952,13 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   function renderAudit() {
     const a = data.audit;
     const entries = [
-      ["Session files", a.session_files], ["Fork sessions", a.fork_sessions], ["Raw events", a.raw_token_events],
-      ["Unique calls", a.unique_model_calls], ["Fork history skipped", a.inherited_events], ["Local duplicates", a.local_duplicate_events],
+      ["Rollout files", a.session_files], ["Conversations", a.conversation_sessions], ["User forks", a.fork_sessions],
+      ["Internal threads", a.internal_threads], ["Orphan internal", a.orphan_internal_threads], ["Raw events", a.raw_token_events],
+      ["Unique calls", a.unique_model_calls], ["Replay skipped", a.inherited_events], ["Local duplicates", a.local_duplicate_events],
       ["Null usage", a.null_usage_events], ["Delta fallbacks", a.fallback_delta_events], ["Model fallbacks", a.fallback_model_events],
       ["Provider fallbacks", a.fallback_provider_events], ["Tier fallbacks", a.fallback_service_tier_events], ["Priority calls", data.pricing.scopes.all.priority_tier_calls],
-      ["Tier price fallbacks", data.pricing.scopes.all.tier_rate_fallback_calls], ["Cache writes", data.totals.all.cache_write_input_tokens], ["Pricing config errors", a.pricing_config_errors],
+      ["Tier price fallbacks", data.pricing.scopes.all.tier_rate_fallback_calls], ["Reasoning inferred", a.inferred_reasoning_events || 0], ["Inferred reasoning tokens", a.inferred_reasoning_tokens || 0],
+      ["Heuristic reasoning", a.heuristic_reasoning_events || 0], ["Cache writes", data.totals.all.cache_write_input_tokens], ["Pricing config errors", a.pricing_config_errors],
       ["Total repairs", a.repaired_total_events], ["Missing timestamps", a.missing_timestamp_events], ["Unclassified", data.totals.all.unclassified_tokens]
     ];
     document.getElementById("auditGrid").innerHTML = entries.map(([label,value]) => `<div class="audit-item"><span>${label}</span><strong>${short(value)}</strong></div>`).join("");
@@ -2831,11 +4011,15 @@ def render_html(report: UsageReport) -> str:
     dashboard_data = build_dashboard_data(report)
     encoded = json.dumps(dashboard_data, ensure_ascii=False, separators=(",", ":"))
     encoded = encoded.replace("<", "\\u003c").replace("&", "\\u0026")
-    return HTML_TEMPLATE.replace("__DATA_JSON__", encoded)
+    return (
+        HTML_TEMPLATE
+        .replace("__DATA_JSON__", encoded)
+        .replace("__SOURCE_LABEL__", html.escape(report.source_label))
+    )
 
 
-def write_daily_csv(report: UsageReport) -> None:
-    with OUTPUT_DAILY_CSV.open("w", newline="", encoding="utf-8") as fh:
+def write_daily_csv(report: UsageReport, path: Path = OUTPUT_DAILY_CSV) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["date", *USAGE_FIELDS])
         for day in sorted(report.by_day):
@@ -2843,8 +4027,8 @@ def write_daily_csv(report: UsageReport) -> None:
             writer.writerow([day.isoformat(), *(usage[field] for field in USAGE_FIELDS)])
 
 
-def write_hourly_csv(report: UsageReport) -> None:
-    with OUTPUT_HOURLY_CSV.open("w", newline="", encoding="utf-8") as fh:
+def write_hourly_csv(report: UsageReport, path: Path = OUTPUT_HOURLY_CSV) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["date", "hour", "timezone", "model", *USAGE_FIELDS])
         for hour in sorted(report.by_hour_model):
@@ -2861,8 +4045,8 @@ def write_hourly_csv(report: UsageReport) -> None:
                 )
 
 
-def write_model_csv(report: UsageReport) -> None:
-    with OUTPUT_MODEL_CSV.open("w", newline="", encoding="utf-8") as fh:
+def write_model_csv(report: UsageReport, path: Path = OUTPUT_MODEL_CSV) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["model", *USAGE_FIELDS])
         for model, usage in sorted(
@@ -2873,8 +4057,8 @@ def write_model_csv(report: UsageReport) -> None:
             writer.writerow([model, *(usage[field] for field in USAGE_FIELDS)])
 
 
-def write_route_csv(report: UsageReport) -> None:
-    with OUTPUT_ROUTE_CSV.open("w", newline="", encoding="utf-8") as fh:
+def write_route_csv(report: UsageReport, path: Path = OUTPUT_ROUTE_CSV) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(
             [
@@ -2922,13 +4106,13 @@ def write_route_csv(report: UsageReport) -> None:
             )
 
 
-def write_session_csv(report: UsageReport) -> None:
+def write_session_csv(report: UsageReport, path: Path = OUTPUT_SESSION_CSV) -> None:
     sessions = sorted(
         report.sessions,
         key=lambda item: item.total["total_tokens"],
         reverse=True,
     )
-    with OUTPUT_SESSION_CSV.open("w", newline="", encoding="utf-8") as fh:
+    with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(
             [
@@ -2939,6 +4123,8 @@ def write_session_csv(report: UsageReport) -> None:
                 "parent_session_id",
                 "lineage_root_id",
                 "lineage_depth",
+                "rollout_files",
+                "internal_threads",
                 "session_file",
                 "first_timestamp",
                 "last_timestamp",
@@ -2999,6 +4185,8 @@ def write_session_csv(report: UsageReport) -> None:
                     descriptor.parent_id,
                     descriptor.root_id,
                     descriptor.lineage_depth,
+                    stats.rollout_files,
+                    stats.internal_thread_count,
                     descriptor.path.name,
                     stats.first_timestamp or "",
                     stats.last_timestamp or "",
@@ -3022,7 +4210,10 @@ def write_session_csv(report: UsageReport) -> None:
             )
 
 
-def summary_payload(report: UsageReport) -> dict[str, Any]:
+def summary_payload(
+    report: UsageReport,
+    input_manifest: list[list[str | int]] | None = None,
+) -> dict[str, Any]:
     active_days = sorted(report.by_day)
     models = {
         model: counter_dict(usage)
@@ -3033,11 +4224,21 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
         )
     }
     return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "input_manifest": input_manifest,
         "generated_at": datetime.now(LOCAL_TZ).isoformat(),
         "timezone": LOCAL_TZ.key,
-        "accounting_method": "sum unique last_token_usage events",
-        "deduplication_key": "lineage_root + turn_id + cumulative_usage + last_usage + context_window",
-        "sessions_root": str(SESSIONS_ROOT),
+        "accounting_method": (
+            "sum unique last_token_usage events; roll internal threads into "
+            "their user-visible conversation"
+        ),
+        "deduplication_key": (
+            "physical_lineage_root + turn_id + route + cumulative_usage + "
+            "last_usage + context_window"
+        ),
+        "source_id": report.source_key,
+        "source_label": report.source_label,
+        "sessions_root": str(report.sessions_root),
         "dashboard": build_dashboard_data(report),
         "totals": counter_dict(report.totals),
         "usage_by_model": models,
@@ -3060,7 +4261,11 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
             "active_days": len(active_days),
         },
         "audit": {
-            "session_files": len(report.sessions),
+            "session_files": report.rollout_files,
+            "conversation_sessions": report.conversation_sessions,
+            "logical_sessions": len(report.sessions),
+            "internal_threads": report.internal_threads,
+            "orphan_internal_threads": report.orphan_internal_threads,
             "fork_sessions": report.fork_sessions,
             "raw_token_count_events": report.raw_events,
             "unique_model_calls": int(report.totals["calls"]),
@@ -3074,6 +4279,9 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
             "cached_over_input_events": report.cached_over_input_events,
             "cache_write_over_input_events": report.cache_write_over_input_events,
             "reasoning_over_output_events": report.reasoning_over_output_events,
+            "inferred_reasoning_events": report.inferred_reasoning_events,
+            "inferred_reasoning_tokens": report.inferred_reasoning_tokens,
+            "heuristic_reasoning_events": report.heuristic_reasoning_events,
             "missing_timestamp_events": report.missing_timestamp_events,
             "fallback_provider_events": report.fallback_provider_events,
             "fallback_service_tier_events": report.fallback_service_tier_events,
@@ -3093,14 +4301,17 @@ def summary_payload(report: UsageReport) -> dict[str, Any]:
     }
 
 
-def write_outputs(report: UsageReport) -> dict[str, Any]:
+def write_outputs(
+    report: UsageReport,
+    input_manifest: list[list[str | int]] | None = None,
+) -> dict[str, Any]:
     OUTPUT_HTML.write_text(render_html(report), encoding="utf-8")
     write_daily_csv(report)
     write_hourly_csv(report)
     write_model_csv(report)
     write_route_csv(report)
     write_session_csv(report)
-    summary = summary_payload(report)
+    summary = summary_payload(report, input_manifest)
     OUTPUT_JSON.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -3128,11 +4339,13 @@ def run_self_test() -> None:
         child_dir.mkdir(parents=True)
         parent_id = "00000000-0000-4000-8000-000000000001"
         child_id = "00000000-0000-4000-8000-000000000002"
+        user_fork_id = "00000000-0000-4000-8000-000000000003"
 
         def meta(
             session_id: str,
             parent: str = "",
             source: Any = "cli",
+            provider: str = "OpenAI",
         ) -> str:
             return synthetic_event(
                 "2026-01-01T00:00:00Z",
@@ -3141,7 +4354,7 @@ def run_self_test() -> None:
                     "id": session_id,
                     "forked_from_id": parent or None,
                     "timestamp": "2026-01-01T00:00:00Z",
-                    "model_provider": "OpenAI",
+                    "model_provider": provider,
                     "cli_version": "0.test",
                     "originator": "codex_cli_rs",
                     "source": source,
@@ -3258,6 +4471,10 @@ def run_self_test() -> None:
             "\n".join(child_lines) + "\n",
             encoding="utf-8",
         )
+        (child_dir / f"rollout-{user_fork_id}.jsonl").write_text(
+            meta(user_fork_id, parent_id) + "\n",
+            encoding="utf-8",
+        )
 
         report = collect_usage(
             root,
@@ -3278,18 +4495,31 @@ def run_self_test() -> None:
         assert report.inherited_events == 2
         assert report.local_duplicate_events == 1
         assert report.fallback_delta_events == 1
-        child_stats = next(
+        parent_stats = next(
             stats
             for stats in report.sessions
-            if stats.descriptor.session_id == child_id
+            if stats.descriptor.session_id == parent_id
         )
-        assert child_stats.descriptor.source == "subagent / thread_spawn"
+        assert len(report.sessions) == 2
+        assert parent_stats.total["total_tokens"] == 200
+        assert parent_stats.rollout_files == 2
+        assert parent_stats.internal_thread_count == 1
+        assert report.rollout_files == 3
+        assert report.conversation_sessions == 2
+        assert report.internal_threads == 1
+        assert report.fork_sessions == 1
+        assert report.orphan_internal_threads == 0
+        assert next(
+            stats for stats in report.sessions
+            if stats.descriptor.session_id == user_fork_id
+        ).descriptor.parent_id == parent_id
         assert clean_text({"unexpected": "object"}) == ""
         assert pricing_for_model("gpt-5.6-luna-2026-07-01")[0] == "gpt-5.6-luna"
         assert pricing_for_model("gpt-4o-mini-2024-07-18")[0] == "gpt-4o-mini"
         assert pricing_for_model("gpt-4o-2024-05-13")[0] == "gpt-4o-2024-05-13"
         assert pricing_for_model("gpt-3.5-turbo-0125")[0] == "gpt-3.5-turbo-0125"
         assert pricing_for_model("gpt-future") is None
+        assert pricing_for_model("gpt-5.6-sol", "qwen_local", {}) is None
 
         priced_usage = Counter(
             {
@@ -3371,10 +4601,12 @@ def run_self_test() -> None:
         dashboard = build_dashboard_data(report)
         assert summary_payload(report)["dashboard"]["totals"]["all"]["total_tokens"] == 200
         assert dashboard["timeline_hourly"]["all"]["2026-01-02T11"]["total_tokens"] == 20
-        child_dashboard = next(item for item in dashboard["sessions"] if item["id"] == child_id)
-        assert child_dashboard["by_day"]["2026-01-02"]["total_tokens"] == 50
-        assert child_dashboard["costs_by_day"]["2026-01-02"]["priority_tier_calls"] == 1
-        assert child_dashboard["costs_by_day_model"]["2026-01-02"]["gpt-5.6-sol"]["standard_equivalent_cost_usd"] > 0
+        parent_dashboard = next(item for item in dashboard["sessions"] if item["id"] == parent_id)
+        assert parent_dashboard["by_day"]["2026-01-02"]["total_tokens"] == 50
+        assert parent_dashboard["costs_by_day"]["2026-01-02"]["priority_tier_calls"] == 1
+        assert parent_dashboard["costs_by_day_model"]["2026-01-02"]["gpt-5.6-sol"]["standard_equivalent_cost_usd"] > 0
+        assert parent_dashboard["internal_thread_count"] == 1
+        assert dashboard["audit"]["conversation_sessions"] == 2
         priority_route = next(
             item
             for item in dashboard["pricing"]["routes"]
@@ -3382,10 +4614,204 @@ def run_self_test() -> None:
         )
         assert priority_route["daily"]["2026-01-02"]["usage"]["total_tokens"] == 20
         assert dashboard["pricing"]["hourly"]["all"][4][11]["priority_tier_calls"] == 1
+        assert dashboard["pricing"]["timeline_hourly"]["gpt-5.6-sol"]["2026-01-02T11"]["priority_tier_calls"] == 1
         assert dashboard["pricing"]["daily"]["all"]["2026-01-02"]["unpriced_tokens"] == 30
         assert "一周 × 24 小时" in render_html(report)
         assert "官方 API 等价价值" in render_html(report)
-    print("Self-test passed: fork deduplication, route attribution, cache writes, official pricing, aliases, and total-only usage.")
+
+        incremental_last = {
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 20,
+        }
+        parent_path = parent_dir / f"rollout-{parent_id}.jsonl"
+        with parent_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        context("turn-incremental", "gpt-a", "2026-01-01T02:00:00Z"),
+                        synthetic_event(
+                            "2026-01-01T02:00:01Z",
+                            "response_item",
+                            {
+                                "type": "reasoning",
+                                "content": [
+                                    {"type": "reasoning_text", "text": "plan"}
+                                ],
+                            },
+                        ),
+                        usage_event(170, incremental_last, "2026-01-01T02:00:02Z"),
+                    ]
+                )
+                + "\n"
+            )
+        parent_state = report.file_states[normalized_path(parent_path)]
+        process_incremental_file(
+            report,
+            parent_state,
+            parent_stats,
+            ReasoningTokenCounter(Path(temp_dir), search_roots=()),
+        )
+        assert report.totals["total_tokens"] == 220
+        assert report.totals["calls"] == 5
+        assert report.totals["reasoning_output_tokens"] > 0
+        assert report.inferred_reasoning_events == 1
+        assert parent_stats.total["total_tokens"] == 220
+        fresh_report = collect_usage(
+            root,
+            thread_info={},
+            fallback_service_tier=DEFAULT_SERVICE_TIER,
+            reasoning_counter=ReasoningTokenCounter(Path(temp_dir), search_roots=()),
+        )
+        assert counter_dict(report.totals) == counter_dict(fresh_report.totals)
+        assert {
+            model: counter_dict(usage)
+            for model, usage in report.totals_by_model.items()
+        } == {
+            model: counter_dict(usage)
+            for model, usage in fresh_report.totals_by_model.items()
+        }
+        assert report.inferred_reasoning_events == fresh_report.inferred_reasoning_events
+        assert report.inferred_reasoning_tokens == fresh_report.inferred_reasoning_tokens
+        assert [counter_dict(stats.total) for stats in report.sessions] == [
+            counter_dict(stats.total) for stats in fresh_report.sessions
+        ]
+
+        qodex_home = Path(temp_dir) / ".qodex"
+        qodex_session_dir = qodex_home / "sessions" / "2026" / "01" / "03"
+        qodex_session_dir.mkdir(parents=True)
+        qodex_id = "00000000-0000-4000-8000-000000000004"
+        (qodex_session_dir / f"rollout-{qodex_id}.jsonl").write_text(
+            "\n".join(
+                [
+                    meta(qodex_id, provider="qwen_local"),
+                    settings(
+                        "gpt-5.6-sol",
+                        "qwen_local",
+                        "default",
+                        "ultra",
+                        "2026-01-03T00:00:00Z",
+                    ),
+                    context(
+                        "turn-qodex",
+                        "gpt-5.6-sol",
+                        "2026-01-03T00:00:01Z",
+                    ),
+                    synthetic_event(
+                        "2026-01-03T00:00:01.500Z",
+                        "response_item",
+                        {
+                            "type": "reasoning",
+                            "content": [
+                                {"type": "reasoning_text", "text": "check the plan"}
+                            ],
+                        },
+                    ),
+                    usage_event(100, first_last, "2026-01-03T00:00:02Z"),
+                    synthetic_event(
+                        "2026-01-03T00:00:02.500Z",
+                        "response_item",
+                        {
+                            "type": "reasoning",
+                            "content": [
+                                {"type": "reasoning_text", "text": "check the plan"}
+                            ],
+                        },
+                    ),
+                    usage_event(100, first_last, "2026-01-03T00:00:03Z"),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+        qodex_source = usage_source_from_home(qodex_home)
+        qodex_report = collect_source_usage(qodex_source)
+        qodex_dashboard = build_dashboard_data(qodex_report)
+        assert qodex_source.key == "qodex"
+        assert not qodex_source.read_billing_context
+        assert not qodex_source.read_service_tier
+        assert not qodex_source.enable_official_pricing
+        assert qodex_report.billing_context == {}
+        assert qodex_report.fork_sessions == 0
+        assert qodex_report.internal_threads == 0
+        assert qodex_dashboard["models"] == ["gpt-5.6-sol"]
+        assert qodex_dashboard["totals"]["all"]["total_tokens"] == 100
+        assert 0 < qodex_dashboard["totals"]["all"]["reasoning_output_tokens"] <= 10
+        assert qodex_dashboard["audit"]["inferred_reasoning_events"] == 1
+        assert qodex_dashboard["audit"]["inferred_reasoning_tokens"] > 0
+        assert qodex_dashboard["pricing"]["scopes"]["all"]["priced_tokens"] == 0
+        assert qodex_dashboard["pricing"]["scopes"]["all"]["unpriced_tokens"] == 100
+
+        qodex_cache_path = incremental_cache_path(qodex_source)
+        try:
+            save_incremental_cache(qodex_source, qodex_report)
+            next_qodex_id = "00000000-0000-4000-8000-000000000005"
+            next_qodex_path = qodex_session_dir / f"rollout-{next_qodex_id}.jsonl"
+            next_qodex_path.write_text(
+                "\n".join(
+                    [
+                        meta(next_qodex_id, provider="qwen_local"),
+                        context(
+                            "turn-qodex-next",
+                            "gpt-5.6-sol",
+                            "2026-01-03T01:00:01Z",
+                        ),
+                        usage_event(100, first_last, "2026-01-03T01:00:02Z"),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            incremental_qodex = incrementally_refresh_usage(qodex_source)
+            assert incremental_qodex is not None
+            assert incremental_qodex.totals["total_tokens"] == 200
+            assert incremental_qodex.totals["calls"] == 2
+            assert incremental_qodex.conversation_sessions == 2
+            assert len(incremental_qodex.sessions) == 2
+        finally:
+            qodex_cache_path.unlink(missing_ok=True)
+
+        relocated_codex = usage_source_from_home(
+            Path(temp_dir) / "archive" / ".codex"
+        )
+        assert relocated_codex.label == "Codex"
+        assert not relocated_codex.read_billing_context
+        assert not relocated_codex.read_service_tier
+        assert not relocated_codex.enable_official_pricing
+        assert normalize_data_home(qodex_home / "sessions") == qodex_home.resolve()
+        nested_home = Path(temp_dir) / "sessions"
+        (nested_home / "sessions").mkdir(parents=True)
+        assert normalize_data_home(nested_home) == nested_home.resolve()
+    print(
+        "Self-test passed: user-fork/internal-thread semantics, model filtering, "
+        "reasoning inference, route attribution, pricing isolation, and total invariants."
+    )
+
+
+def collect_source_usage(source: UsageSource) -> UsageReport:
+    fallback_service_tier = (
+        read_configured_service_tier(source.config_file)
+        if source.read_service_tier
+        else DEFAULT_SERVICE_TIER
+    )
+    billing_context = (
+        read_billing_context(source.auth_file)
+        if source.read_billing_context
+        else {}
+    )
+    return collect_usage(
+        source.sessions_root,
+        thread_info=read_thread_info(source.state_db, source.session_index),
+        fallback_service_tier=fallback_service_tier,
+        source_key=source.key,
+        source_label=source.label,
+        model_aliases_file=source.model_aliases_file,
+        billing_context=billing_context,
+        # Official-price comparisons are scoped to the standard Codex source;
+        # compatible local sources remain token-accounting sources.
+        pricing_catalog={} if not source.enable_official_pricing else None,
+    )
 
 
 def main() -> None:
@@ -3393,19 +4819,38 @@ def main() -> None:
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="run synthetic regression tests without reading local Codex sessions",
+        help="run synthetic regression tests without reading local sessions",
+    )
+    parser.add_argument(
+        "--data-home",
+        type=Path,
+        default=CODEX_HOME,
+        help="Codex-compatible data home containing sessions/ (SQLite metadata is optional)",
     )
     args = parser.parse_args()
     if args.self_test:
         run_self_test()
         return
-    if not SESSIONS_ROOT.exists():
-        raise SystemExit(f"Codex sessions directory not found: {SESSIONS_ROOT}")
+    data_home = normalize_data_home(args.data_home)
+    source = usage_source_from_home(data_home)
+    if not source.sessions_root.is_dir():
+        raise SystemExit(
+            f"Compatible sessions directory not found: {source.sessions_root}"
+        )
 
-    report = collect_usage()
-    summary = write_outputs(report)
+    input_manifest = source_input_manifest(source)
+    summary = cached_summary(source, input_manifest)
+    if summary is None:
+        report = incrementally_refresh_usage(source)
+        if report is None:
+            report = collect_source_usage(source)
+        summary = write_outputs(report, input_manifest)
+        save_incremental_cache(source, report)
+    else:
+        print("Usage inputs unchanged; reused the existing report.")
     totals = summary["totals"]
 
+    print(f"Data source: {source.label} ({source.home})")
     print(f"HTML: {OUTPUT_HTML}")
     print(f"Daily CSV: {OUTPUT_DAILY_CSV}")
     print(f"Hourly CSV: {OUTPUT_HOURLY_CSV}")

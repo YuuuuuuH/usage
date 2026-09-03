@@ -8,10 +8,39 @@ private let appearanceModeDefaultsKey = "appearanceModeV1"
 private let appGlassFrostDefaultsKey = "appGlassFrostAmountV1"
 private let liveGlassFrostDefaultsKey = "glassFrostAmountV1"
 private let historicalTotalDefaultsKey = "historicalTotalTokensV1"
+private let historicalTotalsByDataHomeDefaultsKey = "historicalTotalTokensByDataHomeV1"
 private let liveRefreshDefaultsKey = "liveTokenRefreshSecondsV2"
+private let dataHomeDefaultsKey = "tokenAtlasDataHomePathV1"
 private let dashboardRenderScale: CGFloat = 0.9
 private let defaultAppGlassFrostAmount = 1.0
 private let defaultLiveGlassFrostAmount = 0.58
+
+private func normalizedDataHomeURL(_ candidate: URL) -> URL {
+    let normalized = candidate.standardizedFileURL.resolvingSymlinksInPath()
+    let nestedSessions = normalized.appendingPathComponent("sessions", isDirectory: true)
+    var nestedIsDirectory: ObjCBool = false
+    let hasNestedSessions = FileManager.default.fileExists(
+        atPath: nestedSessions.path,
+        isDirectory: &nestedIsDirectory
+    ) && nestedIsDirectory.boolValue
+    if normalized.lastPathComponent == "sessions", !hasNestedSessions {
+        return normalized.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+    }
+    return normalized
+}
+
+private func defaultDataHomeURL() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex", isDirectory: true)
+        .standardizedFileURL
+}
+
+private func preferredDataHomePath() -> String {
+    guard let stored = UserDefaults.standard.string(forKey: dataHomeDefaultsKey), !stored.isEmpty else {
+        return defaultDataHomeURL().path
+    }
+    return normalizedDataHomeURL(URL(fileURLWithPath: stored, isDirectory: true)).path
+}
 
 private enum AppearanceMode: Int, CaseIterable {
     case system, light, dark
@@ -372,6 +401,16 @@ private struct SessionData: Decodable {
     let costs_by_day: [String: Cost]
     let costs_by_day_model: [String: [String: Cost]]
     let inherited_events: Int
+    let rollout_files: Int?
+    let internal_thread_count: Int?
+
+    var rolloutFileCount: Int { max(1, rollout_files ?? 1) }
+    var internalThreadCount: Int { max(0, internal_thread_count ?? 0) }
+
+    var lineageLabel: String {
+        let kind = parent_id.isEmpty ? "conversation" : "user fork +\(lineage_depth)"
+        return "\(kind)\n\(rolloutFileCount) files · \(internalThreadCount) internal"
+    }
 }
 
 private struct AuditData: Decodable {
@@ -390,9 +429,24 @@ private struct AuditData: Decodable {
     let repaired_total_events: Int
     let missing_timestamp_events: Int
     let pricing_config_errors: Int
+    let inferred_reasoning_events: Int?
+    let inferred_reasoning_tokens: Int?
+    let heuristic_reasoning_events: Int?
+    let conversation_sessions: Int?
+    let internal_threads: Int?
+    let orphan_internal_threads: Int?
+
+    var conversationSessionCount: Int { max(0, conversation_sessions ?? session_files) }
+    var internalThreadCount: Int { max(0, internal_threads ?? 0) }
+    var orphanInternalThreadCount: Int { max(0, orphan_internal_threads ?? 0) }
+    var inferredReasoningEventCount: Int { max(0, inferred_reasoning_events ?? 0) }
+    var inferredReasoningTokenCount: Int64 { Int64(max(0, inferred_reasoning_tokens ?? 0)) }
+    var heuristicReasoningEventCount: Int { max(0, heuristic_reasoning_events ?? 0) }
 }
 
 private struct DashboardData: Decodable {
+    let source_id: String?
+    let source_label: String?
     let generated_at_label: String
     let timezone: String
     let range: DateRange
@@ -407,6 +461,9 @@ private struct DashboardData: Decodable {
 }
 
 private struct ReportEnvelope: Decodable {
+    let source_id: String?
+    let source_label: String?
+    let sessions_root: String?
     let dashboard: DashboardData
 }
 
@@ -448,6 +505,7 @@ private struct MetricOption {
         MetricOption(key: "unclassified_tokens", title: "Unclassified"),
         MetricOption(key: "calls", title: "Unique calls")
     ]
+
 }
 
 private extension Usage {
@@ -659,8 +717,8 @@ private final class HourHeatmapView: NSView {
         for row in 0..<7 where usage[row].count == 24 && costs[row].count == 24 {
             for hour in 0..<24 {
                 let item = usage[row][hour]
-                let cost = pricingMode.value(costs[row][hour])
-                let text = "\(weekdays[row]) \(String(format: "%02d", hour)):00 · \(modelLabel)\n\(formatInt(item.value(for: metricKey))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(cost))"
+                let cost = costs[row][hour]
+                let text = "\(weekdays[row]) \(String(format: "%02d", hour)):00 · \(modelLabel)\n\(formatInt(item.value(for: metricKey))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(cost, pricingMode: pricingMode))"
                 let token = TooltipToken(text)
                 tooltipTokens.append(token)
                 addToolTip(cellRect(row: row, hour: hour), owner: self, userData: Unmanaged.passUnretained(token).toOpaque())
@@ -747,8 +805,8 @@ private final class CalendarHeatmapView: NSView {
         for (key, rect) in cells where key >= start && key <= end {
             let item = usage[key] ?? Usage()
             let value = item.value(for: metricKey)
-            let amount = pricingMode.value(costs[key] ?? Cost())
-            let token = TooltipToken("\(key) · \(modelLabel)\n\(formatInt(value)) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(amount))")
+            let cost = costs[key] ?? Cost()
+            let token = TooltipToken("\(key) · \(modelLabel)\n\(formatInt(value)) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(cost, pricingMode: pricingMode))")
             tooltipTokens.append(token)
             addToolTip(rect, owner: self, userData: Unmanaged.passUnretained(token).toOpaque())
         }
@@ -799,6 +857,10 @@ private func formatStatusTokenRate(_ value: Double) -> String {
 
 private func formatUSD(_ value: Double) -> String {
     NumberFormatter.currency.string(from: NSNumber(value: value)) ?? "$0.00"
+}
+
+private func formatCostValue(_ cost: Cost, pricingMode: PricingMode) -> String {
+    cost.priced_tokens > 0 ? formatUSD(pricingMode.value(cost)) : "未定价"
 }
 
 private func makeLabel(
@@ -983,6 +1045,8 @@ private final class LiveMonitorPresentation: ObservableObject {
     @Published var refreshSeconds = 2
     @Published var panelPinned = false
     @Published var historicalTotalTokens: Int64 = 0
+    @Published var sourceLabel = "Codex"
+    @Published var sourcePath = "~/.codex"
 }
 
 private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
@@ -1110,8 +1174,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private weak var liveGlassFrostValueLabel: NSTextField?
     @Published fileprivate var generatorRunning = false
     @Published fileprivate var loadingTitleText = "正在刷新 Token 历史"
-    @Published fileprivate var loadingDetailText = "读取本地 Codex 会话并汇总用量…"
+    @Published fileprivate var loadingDetailText = "读取当前数据目录的本地会话并汇总用量…"
     @Published fileprivate var dashboard: DashboardData?
+    @Published fileprivate var dataHomePath = preferredDataHomePath()
     @Published fileprivate var selectedModel = "all"
     @Published fileprivate var selectedMetric = "total_tokens"
     @Published fileprivate var pricingMode = PricingMode.simple
@@ -1127,9 +1192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var statusItem: NSStatusItem?
     private var lastStatusRateText: String?
     private var livePanel: LiveMonitorPanel!
-    private var liveMonitor: LiveTokenMonitor!
+    private var liveMonitor: LiveTokenMonitor?
+    private var liveMonitorGeneration: UInt64 = 0
     private var latestLiveSnapshot = LiveTokenSnapshot.zero
-    private var historicalTotalTokens = (UserDefaults.standard.object(forKey: historicalTotalDefaultsKey) as? NSNumber)?.int64Value ?? 0
+    private var historicalTotalTokens: Int64 = 0
+    private var historicalTotalsByDataHome: [String: Int64] = [:]
     private var historicalDisplayTimer: Timer?
     private var appGlassFrostSaveWorkItem: DispatchWorkItem?
     private var windowBackdropUpdateWorkItem: DispatchWorkItem?
@@ -1151,7 +1218,165 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         (.session, homeURL.appendingPathComponent("codex_token_usage_by_session.csv"))
     ]
 
+    private var dataHomeURL: URL {
+        normalizedDataHomeURL(URL(fileURLWithPath: dataHomePath, isDirectory: true))
+    }
+
+    private var dataHomeHistoryKey: String { dataHomeURL.path }
+
+    private func loadHistoricalTotals() {
+        var totals: [String: Int64] = [:]
+        if let stored = UserDefaults.standard.dictionary(forKey: historicalTotalsByDataHomeDefaultsKey) {
+            for (path, value) in stored {
+                guard let number = value as? NSNumber else { continue }
+                let key = normalizedDataHomeURL(URL(fileURLWithPath: path, isDirectory: true)).path
+                totals[key] = max(totals[key] ?? 0, number.int64Value)
+            }
+        }
+
+        let codexKey = codexDataHomeURL.path
+        if totals[codexKey] == nil,
+           let legacy = UserDefaults.standard.object(forKey: historicalTotalDefaultsKey) as? NSNumber {
+            totals[codexKey] = max(0, legacy.int64Value)
+        }
+        historicalTotalsByDataHome = totals
+        historicalTotalTokens = totals[dataHomeHistoryKey] ?? 0
+        persistHistoricalTotals()
+    }
+
+    private func persistHistoricalTotals() {
+        let stored = historicalTotalsByDataHome.mapValues { NSNumber(value: $0) }
+        UserDefaults.standard.set(stored, forKey: historicalTotalsByDataHomeDefaultsKey)
+    }
+
+    private var codexDataHomeURL: URL {
+        normalizedDataHomeURL(homeURL.appendingPathComponent(".codex", isDirectory: true))
+    }
+
+    private var qodexDataHomeURL: URL {
+        normalizedDataHomeURL(homeURL.appendingPathComponent(".qodex", isDirectory: true))
+    }
+
+    fileprivate var dataHomeDisplayPath: String {
+        let path = dataHomeURL.path
+        let userHome = homeURL.standardizedFileURL.path
+        if path == userHome { return "~" }
+        if path.hasPrefix(userHome + "/") {
+            return "~" + String(path.dropFirst(userHome.count))
+        }
+        return path
+    }
+
+    fileprivate var currentDataSourceID: String {
+        if dataHomeURL.path == codexDataHomeURL.path { return "codex" }
+        if dataHomeURL.path == qodexDataHomeURL.path { return "qodex" }
+        if let sourceID = dashboard?.source_id?.trimmingCharacters(in: .whitespacesAndNewlines), !sourceID.isEmpty {
+            return sourceID
+        }
+        return "custom"
+    }
+
+    fileprivate var currentDataSourceLabel: String {
+        if dataHomeURL.path == codexDataHomeURL.path { return "Codex" }
+        if dataHomeURL.path == qodexDataHomeURL.path { return "Qodex" }
+        if let sourceLabel = dashboard?.source_label?.trimmingCharacters(in: .whitespacesAndNewlines), !sourceLabel.isEmpty {
+            return sourceLabel
+        }
+        let name = dataHomeURL.lastPathComponent
+        return name.isEmpty ? "自定义数据源" : name
+    }
+
+    fileprivate var codexDataHomeAvailable: Bool { isCompatibleDataHome(codexDataHomeURL) }
+    fileprivate var qodexDataHomeAvailable: Bool { isCompatibleDataHome(qodexDataHomeURL) }
+    fileprivate var isUsingCodexDataHome: Bool { dataHomeURL.path == codexDataHomeURL.path }
+    fileprivate var isUsingQodexDataHome: Bool { dataHomeURL.path == qodexDataHomeURL.path }
+
+    private var dataHomeLoadingDetail: String {
+        "检查增量缓存并读取 \(currentDataSourceLabel)（\(dataHomeDisplayPath)）的新日志…"
+    }
+
+    private func isCompatibleDataHome(_ candidate: URL) -> Bool {
+        let sessions = normalizedDataHomeURL(candidate).appendingPathComponent("sessions", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        return fileManager.fileExists(atPath: sessions.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private func normalizeInitialDataHomeSelection() {
+        let selected = dataHomeURL
+        if isCompatibleDataHome(selected) {
+            dataHomePath = selected.path
+            UserDefaults.standard.set(selected.path, forKey: dataHomeDefaultsKey)
+            return
+        }
+        if let fallback = [codexDataHomeURL, qodexDataHomeURL]
+            .first(where: { isCompatibleDataHome($0) }) {
+            dataHomePath = fallback.path
+            UserDefaults.standard.set(fallback.path, forKey: dataHomeDefaultsKey)
+        }
+    }
+
+    fileprivate func activateCodexDataHome() {
+        activateDataHome(codexDataHomeURL)
+    }
+
+    fileprivate func activateQodexDataHome() {
+        activateDataHome(qodexDataHomeURL)
+    }
+
+    fileprivate func chooseDataHome() {
+        guard !generatorRunning else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择会话数据目录"
+        panel.message = "请选择包含 sessions 子目录的数据目录；也可以直接选择 sessions 目录。"
+        panel.prompt = "使用此目录"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = fileManager.fileExists(atPath: dataHomeURL.path) ? dataHomeURL : homeURL
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let selected = panel.url else { return }
+            self?.activateDataHome(selected)
+        }
+    }
+
+    @objc private func chooseDataHomeFromMenu(_ sender: Any?) {
+        chooseDataHome()
+    }
+
+    private func activateDataHome(_ candidate: URL) {
+        guard !generatorRunning else { return }
+        let selected = normalizedDataHomeURL(candidate)
+        guard isCompatibleDataHome(selected) else {
+            presentError("所选目录不兼容：需要存在 \(selected.path)/sessions。")
+            return
+        }
+
+        let changed = selected.path != dataHomeURL.path
+        if changed, livePanel != nil {
+            publishHistoricalTotal()
+        }
+        dataHomePath = selected.path
+        UserDefaults.standard.set(selected.path, forKey: dataHomeDefaultsKey)
+        refreshToolbarItem?.toolTip = "重新扫描当前数据目录 \(dataHomeDisplayPath)（⌘R）"
+        if changed {
+            dashboard = nil
+            selectedModel = "all"
+            datePreset = .all
+            selectedStartDate = nil
+            selectedEndDate = nil
+            historicalTotalTokens = historicalTotalsByDataHome[dataHomeHistoryKey] ?? 0
+            updateLivePresentationSource()
+            if livePanel != nil {
+                rebuildLiveMonitorForCurrentDataHome()
+            }
+        }
+        refreshReport(nil)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        normalizeInitialDataHomeSelection()
+        loadHistoricalTotals()
         NSApp.appearance = appearanceMode.appKitAppearance
         pricingMode = PricingMode(rawValue: UserDefaults.standard.integer(forKey: "pricingMode")) ?? .simple
         let storedRefresh = UserDefaults.standard.integer(forKey: liveRefreshDefaultsKey)
@@ -1191,6 +1416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         UserDefaults.standard.set(appGlassFrostAmount, forKey: appGlassFrostDefaultsKey)
         UserDefaults.standard.set(liveGlassFrostAmount, forKey: liveGlassFrostDefaultsKey)
         historicalDisplayTimer?.invalidate()
+        liveMonitorGeneration &+= 1
         liveMonitor?.stop()
     }
 
@@ -1214,6 +1440,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let fileMenu = NSMenu(title: "文件")
         let refresh = fileMenu.addItem(withTitle: "刷新统计", action: #selector(refreshReport(_:)), keyEquivalent: "r")
         refresh.target = self
+        let chooseDataHome = fileMenu.addItem(withTitle: "选择会话数据目录…", action: #selector(chooseDataHomeFromMenu(_:)), keyEquivalent: "")
+        chooseDataHome.target = self
         let export = fileMenu.addItem(withTitle: "导出…", action: #selector(exportReport(_:)), keyEquivalent: "e")
         export.keyEquivalentModifierMask = [.command, .shift]
         export.target = self
@@ -1414,7 +1642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func configureLiveMonitor() {
-        livePresentation.historicalTotalTokens = historicalTotalTokens
+        updateLivePresentationSource()
         livePanel = LiveMonitorPanel(contentSize: NSSize(width: 300, height: 254))
         let liveController = NSHostingController(
             rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
@@ -1427,16 +1655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             self?.livePresentation.panelPinned = pinned
         }
 
-        let sessionRoot = homeURL.appendingPathComponent(".codex/sessions", isDirectory: true)
-        liveMonitor = LiveTokenMonitor(sessionRoot: sessionRoot) { [weak self] snapshot in
-            guard let self else { return }
-            self.latestLiveSnapshot = snapshot
-            if self.livePanel.isVisible {
-                self.livePresentation.snapshot = snapshot
-            }
-            self.historicalTotalTokens += snapshot.intervalUsage.totalTokens
-            self.updateStatusItem(rate: snapshot.totalRate)
-        }
+        rebuildLiveMonitorForCurrentDataHome(startIfEnabled: false)
         setLiveMonitorEnabled(liveMonitorEnabled, persist: false, ensureReachability: false)
         let historyTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             self?.publishHistoricalTotal()
@@ -1444,6 +1663,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         historyTimer.tolerance = 5
         RunLoop.main.add(historyTimer, forMode: .common)
         historicalDisplayTimer = historyTimer
+    }
+
+    private func updateLivePresentationSource() {
+        livePresentation.sourceLabel = currentDataSourceLabel
+        livePresentation.sourcePath = dataHomeDisplayPath
+        livePresentation.historicalTotalTokens = historicalTotalTokens
+        statusItem?.button?.toolTip = "\(currentDataSourceLabel) · 60 秒平均 Token 速率"
+    }
+
+    private func rebuildLiveMonitorForCurrentDataHome(startIfEnabled: Bool = true) {
+        liveMonitorGeneration &+= 1
+        let generation = liveMonitorGeneration
+        let selectedHome = dataHomeURL
+        let selectedPath = selectedHome.path
+        liveMonitor?.stop()
+        liveMonitor = nil
+        latestLiveSnapshot = .zero
+        livePresentation.snapshot = .zero
+        lastStatusRateText = nil
+        updateLivePresentationSource()
+        if statusItem != nil {
+            updateStatusItem(rate: 0)
+        }
+
+        let monitor = LiveTokenMonitor(
+            sessionRoot: selectedHome.appendingPathComponent("sessions", isDirectory: true)
+        ) { [weak self] snapshot in
+            guard let self,
+                  generation == self.liveMonitorGeneration,
+                  selectedPath == self.dataHomeURL.path
+            else { return }
+            self.latestLiveSnapshot = snapshot
+            if self.livePanel.isVisible {
+                self.livePresentation.snapshot = snapshot
+            }
+            if snapshot.intervalUsage.totalTokens > 0 {
+                self.historicalTotalTokens += snapshot.intervalUsage.totalTokens
+                self.historicalTotalsByDataHome[selectedPath] = self.historicalTotalTokens
+                self.livePresentation.historicalTotalTokens = self.historicalTotalTokens
+            }
+            self.updateStatusItem(rate: snapshot.totalRate)
+        }
+        liveMonitor = monitor
+        if startIfEnabled, liveMonitorEnabled {
+            monitor.start(interval: TimeInterval(livePresentation.refreshSeconds))
+        }
     }
 
     private func installStatusItem() {
@@ -1457,7 +1722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         button.target = self
         button.action = #selector(toggleLivePopover(_:))
         button.sendAction(on: [.leftMouseUp])
-        button.toolTip = "60 秒平均 Token 速率"
+        button.toolTip = "\(currentDataSourceLabel) · 60 秒平均 Token 速率"
         updateStatusItem(rate: latestLiveSnapshot.totalRate)
     }
 
@@ -1466,6 +1731,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let value = formatStatusTokenRate(rate)
         guard value != lastStatusRateText else { return }
         lastStatusRateText = value
+        let sourceTitle = String(currentDataSourceLabel.prefix(7))
 
         let size = NSSize(width: 30, height: NSStatusBar.system.thickness)
         let image = NSImage(size: size, flipped: true) { _ in
@@ -1482,7 +1748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 .foregroundColor: NSColor.black,
                 .paragraphStyle: paragraph
             ]
-            ("Tokens" as NSString).draw(
+            (sourceTitle as NSString).draw(
                 in: NSRect(x: 0, y: 1, width: size.width, height: 8),
                 withAttributes: titleAttributes
             )
@@ -1494,7 +1760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
         image.isTemplate = true
         button.image = image
-        button.setAccessibilityLabel("Token rate \(formatTokenRate(rate)) tokens per second")
+        button.setAccessibilityLabel("\(currentDataSourceLabel) Token rate \(formatTokenRate(rate)) tokens per second")
     }
 
     private func liveToolbarImage(enabled: Bool) -> NSImage? {
@@ -1523,10 +1789,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         liveMenuItem?.state = enabled ? .on : .off
         if enabled {
             installStatusItem()
-            liveMonitor.start(interval: TimeInterval(livePresentation.refreshSeconds))
+            if liveMonitor == nil {
+                rebuildLiveMonitorForCurrentDataHome(startIfEnabled: false)
+            }
+            liveMonitor?.start(interval: TimeInterval(livePresentation.refreshSeconds))
         } else {
             livePanel.dismissAndUnpin()
-            liveMonitor.stop()
+            liveMonitorGeneration &+= 1
+            liveMonitor?.stop()
+            liveMonitor = nil
             latestLiveSnapshot = .zero
             livePresentation.snapshot = .zero
             if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
@@ -1670,12 +1941,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         for (candidate, item) in refreshMenuItems {
             item.state = candidate == seconds ? .on : .off
         }
-        liveMonitor.setInterval(TimeInterval(seconds))
+        liveMonitor?.setInterval(TimeInterval(seconds))
     }
 
     private func publishHistoricalTotal() {
+        historicalTotalsByDataHome[dataHomeHistoryKey] = historicalTotalTokens
         livePresentation.historicalTotalTokens = historicalTotalTokens
-        UserDefaults.standard.set(NSNumber(value: historicalTotalTokens), forKey: historicalTotalDefaultsKey)
+        persistHistoricalTotals()
     }
 
     fileprivate func closeLivePanel() {
@@ -1705,7 +1977,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = ""
             item.paletteLabel = "刷新"
-            item.toolTip = "重新扫描本地 Codex 会话 (⌘R)"
+            item.toolTip = "重新扫描当前数据目录 \(dataHomeDisplayPath)（⌘R）"
             item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新统计")
             item.target = self
             item.action = #selector(refreshReport(_:))
@@ -1762,6 +2034,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     @objc private func refreshReport(_ sender: Any?) {
         guard !generatorRunning else { return }
+        let selectedDataHome = dataHomeURL
+        guard isCompatibleDataHome(selectedDataHome) else {
+            presentError("当前数据目录不兼容：需要存在 \(selectedDataHome.path)/sessions。")
+            return
+        }
         guard let generatorURL = Bundle.main.resourceURL?.appendingPathComponent("codex_token_heatmap.py") else {
             presentError("应用内的统计生成器缺失。")
             return
@@ -1772,14 +2049,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
 
         generatorRunning = true
-        setLoading(true, title: "正在刷新 Token 历史", detail: "读取本地 Codex 会话并汇总用量…")
-        appendLog("\n[\(timestampLabel())] Native app refresh\nPython: \(pythonURL.path)\n")
+        setLoading(true, title: "正在刷新 Token 历史", detail: dataHomeLoadingDetail)
+        appendLog("\n[\(timestampLabel())] Native app refresh\nData home: \(selectedDataHome.path)\nPython: \(pythonURL.path)\n")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let process = Process()
             process.executableURL = pythonURL
-            process.arguments = [generatorURL.path]
+            process.arguments = [generatorURL.path, "--data-home", selectedDataHome.path]
             process.environment = ProcessInfo.processInfo.environment.merging(["HOME": self.homeURL.path]) { _, new in new }
             let logHandle = self.openLogHandle()
             process.standardOutput = logHandle
@@ -1811,14 +2088,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private func loadGeneratedReport() {
         do {
             let data = try Data(contentsOf: summaryURL)
-            let loadedDashboard = try JSONDecoder().decode(ReportEnvelope.self, from: data).dashboard
+            let envelope = try JSONDecoder().decode(ReportEnvelope.self, from: data)
+            guard let sessionsRoot = envelope.sessions_root, !sessionsRoot.isEmpty else {
+                throw NSError(
+                    domain: "CodexTokenAtlasReport",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "报表缺少会话数据目录信息"]
+                )
+            }
+            let reportedDataHome = normalizedDataHomeURL(
+                URL(fileURLWithPath: sessionsRoot, isDirectory: true)
+            )
+            guard reportedDataHome.path == dataHomeURL.path else {
+                throw NSError(
+                    domain: "CodexTokenAtlasReport",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "报表来自其他数据目录，请重新刷新"]
+                )
+            }
+            let loadedDashboard = envelope.dashboard
+            if let sourceID = envelope.source_id,
+               let dashboardSourceID = loadedDashboard.source_id,
+               sourceID != dashboardSourceID {
+                throw NSError(
+                    domain: "CodexTokenAtlasReport",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "报表来源标识不一致"]
+                )
+            }
             dashboard = loadedDashboard
+            if selectedModel != "all", !loadedDashboard.models.contains(selectedModel) {
+                selectedModel = "all"
+            }
             historicalTotalTokens = max(historicalTotalTokens, loadedDashboard.totals["all"]?.total_tokens ?? 0)
             publishHistoricalTotal()
+            updateLivePresentationSource()
+            lastStatusRateText = nil
+            if statusItem != nil {
+                updateStatusItem(rate: latestLiveSnapshot.totalRate)
+            }
             synchronizeDateSelection(with: loadedDashboard)
             generatorRunning = false
             setLoading(false, title: "", detail: "")
-            toolbarStatus.stringValue = "已更新 \(DateFormatter.shortTime.string(from: Date()))"
+            toolbarStatus.stringValue = "\(currentDataSourceLabel) · 已更新 \(DateFormatter.shortTime.string(from: Date()))"
             if ProcessInfo.processInfo.environment["TOKEN_ATLAS_SMOKE_TEST"] == "1" {
                 do {
                     try runSmokeChecks(loadedDashboard)
@@ -1870,6 +2182,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         try require(fullUsage.total_tokens == expected.total_tokens, "full-range daily total differs from report total")
         try require(fullUsage.calls == expected.calls, "full-range daily calls differ from report calls")
 
+        if let model = data.models.first, let modelExpected = data.totals[model] {
+            selectedModel = model
+            let modelUsage = filteredUsage(scope: model, data: data)
+            try require(modelUsage.total_tokens == modelExpected.total_tokens, "model filter total differs from report scope")
+            try require(modelUsage.calls == modelExpected.calls, "model filter calls differ from report scope")
+            selectedModel = "all"
+        }
+
         let hourly = filteredHourly(data).0.flatMap { $0 }.reduce(Usage()) { $0.adding($1) }
         try require(hourly.total_tokens == fullUsage.total_tokens, "filtered hourly total differs from daily total")
         try require(hourly.calls == fullUsage.calls, "filtered hourly calls differ from daily calls")
@@ -1880,6 +2200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         try require(sessionUsage.total_tokens == fullUsage.total_tokens, "session total differs from overall total")
 
         let fullCost = filteredCost(scope: "all", data: data)
+        if currentDataSourceID == "qodex" {
+            try require(fullCost.priced_tokens == 0, "Qodex local usage was assigned an official price")
+            try require(fullCost.unpriced_tokens == fullUsage.total_tokens, "Qodex unpriced total differs from usage")
+        }
         let sessionCost = data.sessions.map { filteredSessionCost($0, data: data) }.reduce(Cost()) { $0.adding($1) }
         try require(abs(sessionCost.standard_equivalent_cost_usd - fullCost.standard_equivalent_cost_usd) < 0.000001, "session Standard value differs from overall value")
         try require(abs(sessionCost.estimated_cost_usd - fullCost.estimated_cost_usd) < 0.000001, "session tiered value differs from overall value")
@@ -1911,9 +2235,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
         let sessionExport = try String(contentsOf: exportDirectory.appendingPathComponent(ExportFormat.session.fileName), encoding: .utf8)
         try require(sessionExport.contains("standard_value_usd") && sessionExport.contains("tiered_value_usd"), "session export lacks official values")
+        try require(sessionExport.contains("source_id") && sessionExport.contains("rollout_files") && sessionExport.contains("internal_threads"), "session export lacks source or logical-session fields")
         let jsonData = try Data(contentsOf: exportDirectory.appendingPathComponent(ExportFormat.json.fileName))
         let json = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
         try require(json?["date_range"] != nil, "selection JSON lacks date range")
+        try require(json?["source_id"] as? String == currentDataSourceID, "selection JSON has the wrong data source")
         try? fileManager.removeItem(at: exportDirectory)
 
         let liveLine = Data(#"{"timestamp":"2026-07-30T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":500,"output_tokens":100,"total_tokens":1000},"last_token_usage":{"input_tokens":90,"cached_input_tokens":50,"output_tokens":10,"total_tokens":100},"model_context_window":258400}}}"#.utf8)
@@ -2047,7 +2373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func makeHeader(_ data: DashboardData) -> NSView {
         let header = SurfaceView(fill: AtlasColor.surface, border: AtlasColor.teal.withAlphaComponent(0.28), radius: 6)
-        let eyebrow = makeLabel("LOCAL CODEX TELEMETRY / ASIA SHANGHAI", size: 10, weight: .bold, color: AtlasColor.teal, monospaced: true)
+        let eyebrow = makeLabel("LOCAL \(currentDataSourceLabel.uppercased()) TELEMETRY / ASIA SHANGHAI", size: 10, weight: .bold, color: AtlasColor.teal, monospaced: true)
         let title = makeLabel("Token Atlas", size: 48, weight: .bold)
         let range = activeRange(data)
         let metricTitle = MetricOption.all.first(where: { $0.key == selectedMetric })?.title ?? "Total tokens"
@@ -2205,11 +2531,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             let models = session.by_model.keys.sorted().joined(separator: " · ")
             let providers = session.by_provider.keys.sorted().joined(separator: " · ")
             let tiers = session.by_service_tier.keys.sorted().map { $0 == "priority" ? "priority / fast" : $0 }.joined(separator: " · ")
-            let branch = session.parent_id.isEmpty ? "root" : "fork +\(session.lineage_depth)\n\(session.inherited_events) inherited skipped"
-            return ["\(session.title)\n\(session.id)", models, "\(providers)\n\(tiers)", formatInt(usage.value(for: selectedMetric)), formatInt(usage.calls), branch]
+            return ["\(session.title)\n\(session.id)", models, "\(providers)\n\(tiers)", formatInt(usage.value(for: selectedMetric)), formatInt(usage.calls), session.lineageLabel]
         }
-        let table = makeTable(headers: ["SESSION", "MODELS", "ROUTING", "METRIC", "CALLS", "BRANCH"], rows: rows, widths: [430, 190, 190, 150, 100, 150])
-        return makePanel(title: "会话用量", subtitle: "fork 会话仅显示分叉后新增的独占用量。", content: table, trailing: "TOP 30")
+        let table = makeTable(headers: ["SESSION", "MODELS", "ROUTING", "METRIC", "CALLS", "LINEAGE"], rows: rows, widths: [410, 190, 190, 150, 100, 190])
+        return makePanel(title: "会话用量", subtitle: "每行是一段用户可见会话；内部线程的独占用量已归并，显式用户 fork 单独列出。", content: table, trailing: "TOP 30")
     }
 
     private func makePricingPanel(_ data: DashboardData) -> NSView {
@@ -2295,11 +2620,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let audit = data.audit
         let cost = data.pricing.scopes["all"] ?? Cost()
         let entries: [(String, Int64)] = [
-            ("Session files", Int64(audit.session_files)), ("Fork sessions", Int64(audit.fork_sessions)), ("Raw events", Int64(audit.raw_token_events)),
-            ("Unique calls", Int64(audit.unique_model_calls)), ("Fork history skipped", Int64(audit.inherited_events)), ("Local duplicates", Int64(audit.local_duplicate_events)),
+            ("Rollout files", Int64(audit.session_files)), ("Conversations", Int64(audit.conversationSessionCount)), ("User forks", Int64(audit.fork_sessions)),
+            ("Internal threads", Int64(audit.internalThreadCount)), ("Orphan internal", Int64(audit.orphanInternalThreadCount)), ("Raw events", Int64(audit.raw_token_events)),
+            ("Unique calls", Int64(audit.unique_model_calls)), ("Replay skipped", Int64(audit.inherited_events)), ("Local duplicates", Int64(audit.local_duplicate_events)),
             ("Null usage", Int64(audit.null_usage_events)), ("Delta fallbacks", Int64(audit.fallback_delta_events)), ("Model fallbacks", Int64(audit.fallback_model_events)),
             ("Provider fallbacks", Int64(audit.fallback_provider_events)), ("Tier fallbacks", Int64(audit.fallback_service_tier_events)), ("Priority calls", cost.priority_tier_calls),
-            ("Tier price fallbacks", cost.tier_rate_fallback_calls), ("Total repairs", Int64(audit.repaired_total_events)), ("Missing timestamps", Int64(audit.missing_timestamp_events)),
+            ("Tier price fallbacks", cost.tier_rate_fallback_calls), ("Reasoning inferred", Int64(audit.inferredReasoningEventCount)), ("Inferred reasoning", audit.inferredReasoningTokenCount),
+            ("Heuristic reasoning", Int64(audit.heuristicReasoningEventCount)), ("Total repairs", Int64(audit.repaired_total_events)), ("Missing timestamps", Int64(audit.missing_timestamp_events)),
             ("Pricing config errors", Int64(audit.pricing_config_errors)), ("Cache writes", data.totals["all"]?.cache_write_input_tokens ?? 0), ("Unclassified", data.totals["all"]?.unclassified_tokens ?? 0)
         ]
         var rows: [[NSView]] = []
@@ -2311,7 +2638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         grid.rowSpacing = 8
         grid.xPlacement = .fill
         for column in 0..<6 { grid.column(at: column).width = 170 }
-        return makePanel(title: "统计审计", subtitle: "异常、fallback 与去重结果保留在此处。", content: grid)
+        return makePanel(title: "统计审计", subtitle: "用户会话、内部线程、异常、fallback 与去重结果保留在此处。", content: grid)
     }
 
     private func makeFooter(_ data: DashboardData) -> NSView {
@@ -2495,6 +2822,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             ]
         }
         return [
+            "source_id": currentDataSourceID,
+            "source_label": currentDataSourceLabel,
+            "data_home": dataHomeURL.path,
             "generated_at": data.generated_at_label,
             "timezone": data.timezone,
             "date_range": ["start": range.start, "end": range.end],
@@ -2560,53 +2890,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         ["tiered_value_usd", "standard_value_usd", "tier_premium_usd", "selected_value_usd", "priced_tokens", "unpriced_tokens"]
     }
 
+    private var sourceHeaders: [String] { ["source_id", "source_label"] }
+    private var sourceCells: [String] { [currentDataSourceID, currentDataSourceLabel] }
+
     private func dailyCSV(_ data: DashboardData) -> String {
-        var rows = [["date", "model", "pricing_mode"] + usageHeaders + costHeaders]
+        var rows = [sourceHeaders + ["date", "model", "pricing_mode"] + usageHeaders + costHeaders]
         let usageDays = data.daily[selectedModel] ?? [:]
         let costDays = data.pricing.daily[selectedModel] ?? [:]
         for day in usageDays.keys.sorted() where isIncluded(day, in: data) {
-            rows.append([day, selectedModel, pricingMode == .simple ? "simple" : "tiered"] + usageCells(usageDays[day] ?? Usage()) + costCells(costDays[day] ?? Cost()))
+            rows.append(sourceCells + [day, selectedModel, pricingMode == .simple ? "simple" : "tiered"] + usageCells(usageDays[day] ?? Usage()) + costCells(costDays[day] ?? Cost()))
         }
         return csv(rows)
     }
 
     private func hourlyCSV(_ data: DashboardData) -> String {
-        var rows = [["local_hour", "model", "pricing_mode"] + usageHeaders + costHeaders]
+        var rows = [sourceHeaders + ["local_hour", "model", "pricing_mode"] + usageHeaders + costHeaders]
         let timeline = data.timeline_hourly[selectedModel] ?? [:]
         let costTimeline = data.pricing.timeline_hourly[selectedModel] ?? [:]
         for hour in timeline.keys.sorted() where isIncluded(String(hour.prefix(10)), in: data) {
-            rows.append([hour, selectedModel, pricingMode == .simple ? "simple" : "tiered"] + usageCells(timeline[hour] ?? Usage()) + costCells(costTimeline[hour] ?? Cost()))
+            rows.append(sourceCells + [hour, selectedModel, pricingMode == .simple ? "simple" : "tiered"] + usageCells(timeline[hour] ?? Usage()) + costCells(costTimeline[hour] ?? Cost()))
         }
         return csv(rows)
     }
 
     private func modelCSV(_ data: DashboardData) -> String {
-        var rows = [["model", "pricing_mode"] + usageHeaders + costHeaders]
+        var rows = [sourceHeaders + ["model", "pricing_mode"] + usageHeaders + costHeaders]
         for model in data.models {
             let usage = filteredUsage(scope: model, data: data)
             guard usage.calls > 0 else { continue }
-            rows.append([model, pricingMode == .simple ? "simple" : "tiered"] + usageCells(usage) + costCells(filteredCost(scope: model, data: data)))
+            rows.append(sourceCells + [model, pricingMode == .simple ? "simple" : "tiered"] + usageCells(usage) + costCells(filteredCost(scope: model, data: data)))
         }
         return csv(rows)
     }
 
     private func routeCSV(_ data: DashboardData) -> String {
-        var rows = [["route_provider", "model", "service_tier", "pricing_provider", "pricing_model", "pricing_mode"] + usageHeaders + costHeaders]
+        var rows = [sourceHeaders + ["route_provider", "model", "service_tier", "pricing_provider", "pricing_model", "pricing_mode"] + usageHeaders + costHeaders]
         for route in data.pricing.routes where selectedModel == "all" || route.model == selectedModel {
             let filtered = filteredRoute(route, data: data)
             guard filtered.0.calls > 0 else { continue }
-            rows.append([route.route_provider, route.model, route.service_tier, route.pricing_provider ?? "", route.pricing_model ?? "", pricingMode == .simple ? "simple" : "tiered"] + usageCells(filtered.0) + costCells(filtered.1))
+            rows.append(sourceCells + [route.route_provider, route.model, route.service_tier, route.pricing_provider ?? "", route.pricing_model ?? "", pricingMode == .simple ? "simple" : "tiered"] + usageCells(filtered.0) + costCells(filtered.1))
         }
         return csv(rows)
     }
 
     private func sessionCSV(_ data: DashboardData) -> String {
-        var rows = [["session_id", "title", "branch", "models", "providers", "service_tiers", "pricing_mode"] + usageHeaders + costHeaders]
+        var rows = [sourceHeaders + ["session_id", "title", "lineage", "rollout_files", "internal_threads", "models", "providers", "service_tiers", "pricing_mode"] + usageHeaders + costHeaders]
         for session in data.sessions {
             let usage = filteredSessionUsage(session, data: data)
             guard usage.calls > 0 else { continue }
             let cost = filteredSessionCost(session, data: data)
-            rows.append([session.id, session.title, session.parent_id.isEmpty ? "root" : "fork +\(session.lineage_depth)", session.by_model.keys.sorted().joined(separator: ";"), session.by_provider.keys.sorted().joined(separator: ";"), session.by_service_tier.keys.sorted().joined(separator: ";"), pricingMode == .simple ? "simple" : "tiered"] + usageCells(usage) + costCells(cost))
+            rows.append(sourceCells + [session.id, session.title, session.parent_id.isEmpty ? "conversation" : "user fork +\(session.lineage_depth)", String(session.rolloutFileCount), String(session.internalThreadCount), session.by_model.keys.sorted().joined(separator: ";"), session.by_provider.keys.sorted().joined(separator: ";"), session.by_service_tier.keys.sorted().joined(separator: ";"), pricingMode == .simple ? "simple" : "tiered"] + usageCells(usage) + costCells(cost))
         }
         return csv(rows)
     }
@@ -2783,9 +3116,10 @@ private struct LiveTokenPopover: View {
 
     private var historySummary: some View {
         HStack(alignment: .lastTextBaseline, spacing: 8) {
-            Text("累计 Tokens")
+            Text("\(presentation.sourceLabel) · 累计 Tokens")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
+                .help(presentation.sourcePath)
             Spacer()
             Text(shortNumber(presentation.historicalTotalTokens))
                 .font(.system(size: 18, weight: .bold, design: .monospaced))
@@ -2962,7 +3296,7 @@ private struct AtlasDashboardView: View {
                             pricingPanel(data)
                             auditPanel(data)
                             HStack {
-                                Text("Generated \(data.generated_at_label) · \(data.timezone)")
+                                Text("\(controller.currentDataSourceLabel) · \(controller.dataHomeDisplayPath) · Generated \(data.generated_at_label) · \(data.timezone)")
                                 Spacer()
                             }
                             .font(.system(size: 10, design: .monospaced))
@@ -2981,10 +3315,16 @@ private struct AtlasDashboardView: View {
                         }
                     }
                 }
-                .id(data.generated_at_label)
+                .id("\(controller.currentDataSourceID)|\(controller.dataHomePath)|\(data.generated_at_label)")
+            } else if !controller.generatorRunning {
+                emptyDataState
             }
             if controller.generatorRunning {
-                loadingOverlay
+                if controller.dashboard == nil {
+                    loadingOverlay
+                } else {
+                    refreshBadge
+                }
             }
         }
         .environment(\.atlasGlassFrostAmount, controller.appGlassFrostAmount)
@@ -3006,6 +3346,60 @@ private struct AtlasDashboardView: View {
         .ignoresSafeArea()
     }
 
+    private var refreshBadge: some View {
+        VStack {
+            HStack {
+                Spacer()
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在增量刷新")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(Color(nsColor: AtlasColor.surface))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color(nsColor: AtlasColor.line), lineWidth: 1)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            Spacer()
+        }
+        .padding(18)
+        .allowsHitTesting(false)
+    }
+
+    private var emptyDataState: some View {
+        VStack(spacing: 12) {
+            Text("选择会话数据目录")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Color(nsColor: AtlasColor.ink))
+            Text(controller.dataHomeDisplayPath)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                .textSelection(.enabled)
+            HStack(spacing: 10) {
+                if controller.codexDataHomeAvailable {
+                    Button("使用 Codex") { controller.activateCodexDataHome() }
+                }
+                if controller.qodexDataHomeAvailable {
+                    Button("使用 Qodex") { controller.activateQodexDataHome() }
+                }
+                Button("选择其他兼容目录…") {
+                    controller.chooseDataHome()
+                }
+            }
+        }
+        .padding(28)
+        .atlasGlass(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
+            clear: true
+        )
+    }
+
     private func hero(_ data: DashboardData) -> some View {
         let range = controller.activeRange(data)
         let metric = MetricOption.all.first(where: { $0.key == controller.selectedMetric })?.title ?? "Total tokens"
@@ -3014,11 +3408,16 @@ private struct AtlasDashboardView: View {
                 Text("Token Atlas")
                     .font(.custom("Avenir Next", size: 40).weight(.bold))
                     .foregroundStyle(Color(nsColor: AtlasColor.ink))
-                Text("\(range.start) → \(range.end) · \(controller.selectedModel == "all" ? "全部模型" : controller.selectedModel) · \(metric)")
+                Text("\(controller.currentDataSourceLabel) · \(controller.dataHomeDisplayPath) · \(range.start) → \(range.end) · \(controller.selectedModel == "all" ? "全部模型" : controller.selectedModel) · \(metric)")
                     .font(.system(size: 15))
                     .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
+                    .lineLimit(2)
+                    .help(controller.dataHomePath)
             }
             HStack(spacing: 10) {
+                AtlasControl(label: "数据源") {
+                    dataSourceMenu
+                }
                 AtlasControl(label: "模型") {
                     AtlasPopup(
                         options: [("all", "全部模型")] + data.models.map { ($0, $0) },
@@ -3048,6 +3447,48 @@ private struct AtlasDashboardView: View {
         .padding(.horizontal, 12)
     }
 
+    private var dataSourceMenu: some View {
+        Menu {
+            Button {
+                controller.activateCodexDataHome()
+            } label: {
+                Label("Codex · ~/.codex", systemImage: controller.isUsingCodexDataHome ? "checkmark" : "folder")
+            }
+            .disabled(!controller.codexDataHomeAvailable)
+
+            if controller.qodexDataHomeAvailable {
+                Button {
+                    controller.activateQodexDataHome()
+                } label: {
+                    Label("Qodex · ~/.qodex", systemImage: controller.isUsingQodexDataHome ? "checkmark" : "folder")
+                }
+            }
+
+            Divider()
+            Button("选择其他兼容目录…") {
+                controller.chooseDataHome()
+            }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "externaldrive")
+                    .foregroundStyle(Color(nsColor: AtlasColor.teal))
+                Text(controller.currentDataSourceLabel)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color(nsColor: AtlasColor.ink))
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color(nsColor: AtlasColor.muted))
+            }
+            .padding(.horizontal, 8)
+            .frame(width: 165, height: 28)
+        }
+        .menuStyle(BorderlessButtonMenuStyle())
+        .disabled(controller.generatorRunning)
+        .help("当前数据目录：\(controller.dataHomePath)")
+    }
+
     private func hourlyScaleNote(_ data: DashboardData) -> String {
         let values = controller.filteredHourly(data).0.flatMap { $0 }.map { Double($0.value(for: controller.selectedMetric)) }
         return "CONTINUOUS POWER SCALE · P98 CAP \(shortNumber(Int64(percentile(values, fraction: 0.98))))"
@@ -3068,11 +3509,21 @@ private struct AtlasDashboardView: View {
             AtlasMetricDivider()
             MetricCard(title: "INPUT", value: shortNumber(usage.input_tokens), detail: formatInt(usage.input_tokens), accent: AtlasColor.teal)
             AtlasMetricDivider()
-            MetricCard(title: "UNCACHED INPUT", value: shortNumber(usage.uncached_input_tokens), detail: "\(shortNumber(usage.cached_input_tokens)) read · \(shortNumber(usage.cache_write_input_tokens)) write", accent: AtlasColor.coral)
+            MetricCard(
+                title: "UNCACHED INPUT",
+                value: shortNumber(usage.uncached_input_tokens),
+                detail: "\(shortNumber(usage.cached_input_tokens)) read · \(shortNumber(usage.cache_write_input_tokens)) write",
+                accent: AtlasColor.coral
+            )
             AtlasMetricDivider()
             MetricCard(title: "OUTPUT", value: shortNumber(usage.output_tokens), detail: "\(shortNumber(usage.reasoning_output_tokens)) reasoning", accent: AtlasColor.amber)
             AtlasMetricDivider()
-            MetricCard(title: "CACHE RATIO", value: String(format: "%.1f%%", cacheRate), detail: "\(shortNumber(usage.cached_input_tokens)) cached", accent: AtlasColor.teal)
+            MetricCard(
+                title: "CACHE RATIO",
+                value: String(format: "%.1f%%", cacheRate),
+                detail: "\(shortNumber(usage.cached_input_tokens)) cached",
+                accent: AtlasColor.teal
+            )
             AtlasMetricDivider()
             MetricCard(title: "UNIQUE CALLS", value: shortNumber(usage.calls), detail: "\(shortNumber(usage.unclassified_tokens)) unclassified", accent: AtlasColor.coral)
         }
@@ -3124,10 +3575,10 @@ private struct AtlasDashboardView: View {
         .sorted { $0.1.value(for: controller.selectedMetric) > $1.1.value(for: controller.selectedMetric) }
         .prefix(30)
         .map { session, usage, cost in
-            [session.title, session.by_model.keys.sorted().joined(separator: " · "), session.by_provider.keys.sorted().joined(separator: " · "), formatInt(usage.value(for: controller.selectedMetric)), formatInt(usage.calls), formatUSD(controller.pricingMode.value(cost)), session.parent_id.isEmpty ? "root" : "fork +\(session.lineage_depth)"]
+            [session.title, session.by_model.keys.sorted().joined(separator: " · "), session.by_provider.keys.sorted().joined(separator: " · "), formatInt(usage.value(for: controller.selectedMetric)), formatInt(usage.calls), cost.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(cost)) : "—", session.lineageLabel]
         }
-        return AtlasPanel(title: "会话用量", subtitle: "fork 会话仅显示分叉后新增的独占用量；金额使用当前周期与计价模式。", trailing: "TOP 30") {
-            AtlasTable(headers: ["SESSION", "MODELS", "ROUTING", "METRIC", "CALLS", "VALUE", "BRANCH"], rows: Array(rows), widths: [360, 165, 78, 115, 68, 100, 58])
+        return AtlasPanel(title: "会话用量", subtitle: "每行是一段用户可见会话；内部线程的独占用量已归并，显式用户 fork 单独列出。金额使用当前周期与计价模式。", trailing: "TOP 30") {
+            AtlasTable(headers: ["SESSION", "MODELS", "ROUTING", "METRIC", "CALLS", "VALUE", "LINEAGE"], rows: Array(rows), widths: [340, 165, 78, 115, 68, 100, 150])
         }
     }
 
@@ -3135,23 +3586,32 @@ private struct AtlasDashboardView: View {
         let cost = controller.filteredCost(scope: controller.selectedModel, data: data)
         let coverageBase = cost.priced_tokens + cost.unpriced_tokens
         let coverage = coverageBase > 0 ? Double(cost.priced_tokens) / Double(coverageBase) * 100 : 0
+        let hasTrustedPricing = cost.priced_tokens > 0
+        let selectedValue = hasTrustedPricing ? formatUSD(controller.pricingMode.value(cost)) : "未定价"
+        let standardValue = hasTrustedPricing ? formatUSD(cost.standard_equivalent_cost_usd) : "未定价"
+        let secondaryValue = hasTrustedPricing ? formatUSD(controller.pricingMode == .tiered ? cost.service_tier_premium_usd : 0) : "—"
+        let cacheValue = hasTrustedPricing ? formatUSD(cost.cache_savings_usd) : "—"
         let routes = data.pricing.routes.compactMap { route -> [String]? in
             guard controller.selectedModel == "all" || route.model == controller.selectedModel else { return nil }
             let filtered = controller.filteredRoute(route, data: data)
             guard filtered.0.calls > 0 else { return nil }
-            return [route.route_provider, route.model, route.service_tier == "priority" ? "priority / fast" : route.service_tier, route.pricing_model.map { "\(route.pricing_provider ?? "") / \($0)" } ?? "Not priced", formatUSD(controller.pricingMode.value(filtered.1)), route.rates?.input.map(formatUSD) ?? "—", route.rates?.cached_input.map(formatUSD) ?? "—", route.rates?.output.map(formatUSD) ?? "—", formatInt(filtered.0.calls), shortNumber(filtered.1.unpriced_tokens)]
+            return [route.route_provider, route.model, route.service_tier == "priority" ? "priority / fast" : route.service_tier, route.pricing_model.map { "\(route.pricing_provider ?? "") / \($0)" } ?? "Not priced", filtered.1.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(filtered.1)) : "—", route.rates?.input.map(formatUSD) ?? "—", route.rates?.cached_input.map(formatUSD) ?? "—", route.rates?.output.map(formatUSD) ?? "—", formatInt(filtered.0.calls), shortNumber(filtered.1.unpriced_tokens)]
         }
-        return AtlasPanel(title: "官方 API 等价价值", subtitle: "计价和周期在这里选择；全页统计同步更新。", trailing: "OFFICIAL RATES · \(data.pricing.as_of)") {
+        return AtlasPanel(
+            title: "官方 API 等价价值",
+            subtitle: hasTrustedPricing ? "计价和周期在这里选择；全页统计同步更新。" : "当前数据目录没有可信官方价格；模型、调用和 Token 仍完整统计。",
+            trailing: hasTrustedPricing ? "OFFICIAL RATES · \(data.pricing.as_of)" : "UNPRICED SOURCE"
+        ) {
             VStack(alignment: .leading, spacing: 15) {
                 pricingControls(data)
                 HStack(spacing: 0) {
-                    MetricCard(title: controller.pricingMode == .simple ? "SIMPLE OFFICIAL VALUE" : "TIERED OFFICIAL VALUE", value: formatUSD(controller.pricingMode.value(cost)), detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal)
+                    MetricCard(title: controller.pricingMode == .simple ? "SIMPLE OFFICIAL VALUE" : "TIERED OFFICIAL VALUE", value: selectedValue, detail: String(format: "%.1f%% categorized tokens priced", coverage), accent: AtlasColor.teal)
                     AtlasMetricDivider()
-                    MetricCard(title: "STANDARD BASELINE", value: formatUSD(cost.standard_equivalent_cost_usd), detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal)
+                    MetricCard(title: "STANDARD BASELINE", value: standardValue, detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal)
                     AtlasMetricDivider()
-                    MetricCard(title: "TIER PREMIUM", value: formatUSD(controller.pricingMode == .tiered ? cost.service_tier_premium_usd : 0), detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral)
+                    MetricCard(title: "TIER PREMIUM", value: secondaryValue, detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral)
                     AtlasMetricDivider()
-                    MetricCard(title: "CACHE SAVINGS", value: formatUSD(cost.cache_savings_usd), detail: "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write", accent: AtlasColor.amber)
+                    MetricCard(title: "CACHE SAVINGS", value: cacheValue, detail: hasTrustedPricing ? "\(formatUSD(cost.cached_input_cost_usd)) read · \(formatUSD(cost.cache_write_input_cost_usd)) write" : "无可信价格时不估算", accent: AtlasColor.amber)
                 }
                 .padding(.horizontal, 6)
                 .padding(.vertical, 5)
@@ -3161,9 +3621,11 @@ private struct AtlasDashboardView: View {
                     clear: true
                 )
                 AtlasTable(headers: ["PROVIDER", "MODEL", "TIER", "PRICED AS", "VALUE", "INPUT", "CACHE", "OUTPUT", "CALLS", "UNPRICED"], rows: routes, widths: [110, 145, 140, 200, 110, 75, 75, 75, 75, 95])
-                Text(controller.pricingMode == .simple
-                    ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
-                    : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前 Codex 配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
+                Text(!hasTrustedPricing
+                    ? "当前来源仅提供用量统计。为避免本地模型与官方模型同名造成误计价，本页不会推断任何 API 费用。"
+                    : controller.pricingMode == .simple
+                        ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
+                        : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
                     .font(.system(size: 11))
                     .foregroundStyle(Color(nsColor: AtlasColor.muted))
                     .textSelection(.enabled)
@@ -3217,14 +3679,16 @@ private struct AtlasDashboardView: View {
         let audit = data.audit
         let cost = controller.filteredCost(scope: "all", data: data)
         let entries: [(String, Int64)] = [
-            ("SESSION FILES", Int64(audit.session_files)), ("FORK SESSIONS", Int64(audit.fork_sessions)), ("RAW EVENTS", Int64(audit.raw_token_events)),
-            ("UNIQUE CALLS", Int64(audit.unique_model_calls)), ("FORK SKIPPED", Int64(audit.inherited_events)), ("LOCAL DUPLICATES", Int64(audit.local_duplicate_events)),
+            ("ROLLOUT FILES", Int64(audit.session_files)), ("CONVERSATIONS", Int64(audit.conversationSessionCount)), ("USER FORKS", Int64(audit.fork_sessions)),
+            ("INTERNAL THREADS", Int64(audit.internalThreadCount)), ("ORPHAN INTERNAL", Int64(audit.orphanInternalThreadCount)), ("RAW EVENTS", Int64(audit.raw_token_events)),
+            ("UNIQUE CALLS", Int64(audit.unique_model_calls)), ("REPLAY SKIPPED", Int64(audit.inherited_events)), ("LOCAL DUPLICATES", Int64(audit.local_duplicate_events)),
             ("NULL USAGE", Int64(audit.null_usage_events)), ("DELTA FALLBACKS", Int64(audit.fallback_delta_events)), ("MODEL FALLBACKS", Int64(audit.fallback_model_events)),
             ("PROVIDER FALLBACKS", Int64(audit.fallback_provider_events)), ("TIER FALLBACKS", Int64(audit.fallback_service_tier_events)), ("PRIORITY CALLS", cost.priority_tier_calls),
-            ("PRICE FALLBACKS", cost.tier_rate_fallback_calls), ("TOTAL REPAIRS", Int64(audit.repaired_total_events)), ("MISSING TIME", Int64(audit.missing_timestamp_events)),
+            ("PRICE FALLBACKS", cost.tier_rate_fallback_calls), ("REASONING INFERRED", Int64(audit.inferredReasoningEventCount)), ("INFERRED REASONING", audit.inferredReasoningTokenCount),
+            ("HEURISTIC REASONING", Int64(audit.heuristicReasoningEventCount)), ("TOTAL REPAIRS", Int64(audit.repaired_total_events)), ("MISSING TIME", Int64(audit.missing_timestamp_events)),
             ("CONFIG ERRORS", Int64(audit.pricing_config_errors)), ("CACHE WRITES", controller.filteredUsage(scope: "all", data: data).cache_write_input_tokens), ("UNCLASSIFIED", controller.filteredUsage(scope: "all", data: data).unclassified_tokens)
         ]
-        return AtlasPanel(title: "统计审计", subtitle: "异常、fallback 与去重结果。") {
+        return AtlasPanel(title: "统计审计", subtitle: "用户会话、内部线程、异常、fallback 与去重结果。") {
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 6), spacing: 8) {
                 ForEach(Array(entries.enumerated()), id: \.offset) { _, item in
                     MetricCard(title: item.0, value: shortNumber(item.1), detail: formatInt(item.1), accent: AtlasColor.line)
@@ -3626,7 +4090,7 @@ private struct HourlyHeatmap: View {
                         AtlasHeatCell(
                             color: heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap),
                             size: 36,
-                            tooltip: "\(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day]) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[day][hour])))"
+                            tooltip: "\(["周一", "周二", "周三", "周四", "周五", "周六", "周日"][day]) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[day][hour], pricingMode: controller.pricingMode))"
                         )
                     }
                 }
@@ -3763,7 +4227,7 @@ private struct DailyHourlyStrip: View {
                 .frame(width: 76, alignment: .leading)
             ForEach(0..<24, id: \.self) { hour in
                 let item = usage[hour]
-                let tooltip = "\(day) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[hour])))"
+                let tooltip = "\(day) \(String(format: "%02d", hour)):00\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[hour], pricingMode: controller.pricingMode))"
                 AtlasHeatCell(
                     color: heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap),
                     size: 18,
@@ -3819,7 +4283,7 @@ private struct DailyHeatmap: View {
                     LazyHGrid(rows: Array(repeating: GridItem(.fixed(22), spacing: 5), count: 7), spacing: 5) {
                         ForEach(Array(cells.enumerated()), id: \.element.id) { index, cell in
                             let item = usage[cell.day] ?? Usage()
-                            let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatUSD(controller.pricingMode.value(costs[cell.day] ?? Cost())))" : "不在所选周期内"
+                            let tooltip = cell.inside ? "\(cell.day)\n\(formatInt(item.value(for: controller.selectedMetric))) · \(formatInt(item.calls)) calls\n官方 API 等价价值 \(formatCostValue(costs[cell.day] ?? Cost(), pricingMode: controller.pricingMode))" : "不在所选周期内"
                             AtlasHeatCell(
                                 color: cell.inside ? heatColor(value: Double(item.value(for: controller.selectedMetric)), cap: cap) : NSColor.gray.withAlphaComponent(0.08),
                                 size: 22,

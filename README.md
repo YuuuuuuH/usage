@@ -1,6 +1,6 @@
 # Codex Token Atlas
 
-Codex Token Atlas scans local Codex session logs and builds a route-aware token dashboard for macOS. It uses a native SwiftUI/AppKit interface with no embedded browser or WebKit dependency. The app includes a 7 x 24 hourly heatmap, daily history, session and model breakdowns, fork deduplication, filtered exports, and an official direct-API equivalent value estimate.
+Codex Token Atlas scans a selected Codex-compatible data home and builds a route-aware token dashboard for macOS. It supports the standard `~/.codex` home, local Qodex at `~/.qodex`, and other compatible directories without mixing their usage. The app uses a native SwiftUI/AppKit interface with no embedded browser or WebKit dependency.
 
 All session parsing and report generation happen locally. The repository does not contain session logs, prompts, generated reports, or personal usage data.
 
@@ -8,10 +8,11 @@ All session parsing and report generation happen locally. The repository does no
 
 - Keeps `total_tokens` as the primary usage metric, including cached input and any unclassified total reported by Codex.
 - Attributes every call to the nearest preceding model, provider, service tier, and reasoning-effort settings instead of assigning one final setting to the whole session.
-- Deduplicates inherited fork history using lineage root, turn ID, cumulative usage, per-call usage, and context window.
+- Separates user forks from internal worker threads using recorded lineage metadata. Worker usage is deduplicated and rolled into its user-visible conversation, while reasoning effort remains an independent route dimension.
+- Deduplicates inherited history using physical lineage root, turn ID, route, cumulative usage, per-call usage, and context window.
 - Aggregates usage into continuous-color 7 x 24 and daily heatmaps.
 - Shows tokens, calls, and the selected official direct-API equivalent value for every hourly and daily heatmap cell on hover.
-- Filters the whole dashboard by all history, the latest 7 or 30 days, or an exact custom date range.
+- Selects `~/.codex`, `~/.qodex`, or another compatible data home from the dashboard, then filters that source by model, metric, all history, the latest 7 or 30 days, or an exact custom date range.
 - Switches between a simple Standard-rate estimate and a service-tier estimate that distinguishes Default from Fast/Priority calls.
 - Separates Standard/default and Priority/Fast API rates where the provider publishes both.
 - Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. Unknown models remain visible and are marked unpriced.
@@ -27,9 +28,13 @@ All session parsing and report generation happen locally. The repository does no
 
 ## Accounting
 
-The dashboard sums unique `last_token_usage` events. When that field is missing, it falls back to a non-negative delta of cumulative usage. `reasoning_output_tokens` is treated as part of output and is not added to the total a second time.
+The dashboard sums unique `last_token_usage` events. When that field is missing, it falls back to a non-negative delta of cumulative usage. Reported `reasoning_output_tokens` is treated as part of output and is not added to the total a second time. If a compatible provider leaves that field at zero but stores plaintext reasoning response items, Token Atlas derives the reasoning subset with a matching local Hugging Face `tokenizer.json` when available and records the inference in the audit panel; a conservative text estimate is used as a fallback. An exact model-to-tokenizer path can be supplied in `<data-home>/token_atlas_tokenizers.json`.
 
-The menu-bar monitor is off by default and can be enabled from the main toolbar or application menu. Its compact readout remains the 60-second live rate; the expanded panel adds the all-time total, published once per minute. It baselines files that already exist when it starts and waits until newly discovered files stop growing before reading appended events. This prevents inherited fork history from appearing as fresh throughput. The selected refresh interval controls how quickly appended log events are detected, not the averaging window. Codex writes usage after model calls rather than as a token stream, so an in-flight call becomes visible only after its `token_count` event reaches disk. Dragging the live panel away from the menu bar pins it as a normal persistent window without forcing it above other apps. Closing the dashboard leaves an enabled monitor running, and clicking its compact menu-bar readout opens the live panel. Hiding the Dock icon automatically keeps that status item available; disabling it restores the Dock icon so the app cannot become unreachable.
+The menu-bar monitor is off by default and can be enabled from the main toolbar or application menu. It follows the currently selected data home, keeps historical totals separate by directory, and resets its live window when the directory changes. Its compact readout remains the 60-second live rate; the expanded panel adds the selected source's all-time total. It baselines files that already exist when it starts and waits until newly discovered files stop growing before reading appended events. This prevents inherited history from appearing as fresh throughput. The selected refresh interval controls how quickly appended log events are detected, not the averaging window. Usage appears after a model call writes its `token_count` event to disk.
+
+The session table represents user-visible conversations. Internal `subagent`/worker rollouts remain part of token, model, date, and cost totals, but are recursively folded into their owning conversation. Explicit user forks remain separate rows. The audit panel reports rollout files, conversations, user forks, internal threads, and orphan internal threads independently.
+
+Refreshes keep an append-only parser cache under `~/Library/Caches/CodexTokenAtlas`. After the first full rebuild, unchanged files are reused and growing rollout files are read only from their previous byte offset while retaining fork-deduplication state. A rewritten, truncated, removed, or structurally changed rollout invalidates the cache and triggers a safe full rebuild. The dashboard remains visible behind a compact progress badge during a background refresh.
 
 Codex `/status` may show a much smaller number because its displayed token usage generally resembles uncached input plus output. Token Atlas intentionally preserves the complete `total_tokens` field from local logs.
 
@@ -38,7 +43,7 @@ The value panel is deliberately not labelled as an actual bill. Its controls off
 - **Simple pricing:** every recognized call uses the model's official Standard API rate.
 - **Default / Fast pricing:** logged Default calls use Standard rates and logged Fast/Priority calls use official Priority rates when available, with an explicit Standard fallback when no Priority rate exists.
 
-Older logs may not contain a service tier. Those calls use the current top-level `service_tier` from `~/.codex/config.toml` as an inferred fallback, and the audit panel reports exactly how many calls were inferred. This improves historical estimates without claiming that the current setting proves the original route.
+Older logs may not contain a service tier. For the standard `~/.codex` home, those calls use the current top-level `service_tier` from `~/.codex/config.toml` as an inferred fallback, and the audit panel reports exactly how many calls were inferred. Alternate data homes use Default without reading their auth or provider configuration.
 
 Channel interpretation remains separate from those controls:
 
@@ -46,6 +51,8 @@ Channel interpretation remains separate from those controls:
 - **OpenAI API key:** `default` uses Standard rates and logged `priority`/`fast` routes use published Priority rates when available.
 - **Other provider or relay:** the logged provider and model are retained. A recognized DeepSeek, Gemini, Claude, Grok, or GPT model is valued at that vendor's official direct rate even when it was reached through an OpenAI-compatible relay.
 - **Unknown or internal model:** usage remains in every total and export, but value is unpriced until it can be mapped to a built-in official model.
+
+Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, while official-price comparisons are enabled for the standard Codex home.
 
 Unclassified tokens are excluded from value. Cache writes use a published write rate when one exists; otherwise they use the uncached input rate. Pricing sources are listed in the generated report.
 
@@ -73,7 +80,7 @@ The current authentication mode is shown only as context. Codex logs do not pres
 - macOS 12 or later
 - Xcode Command Line Tools or Xcode
 - Python 3.9 or later
-- Local Codex sessions under `~/.codex/sessions`
+- A local Codex-compatible data home containing `sessions/`
 
 ## Build
 
@@ -108,13 +115,19 @@ Run the report generator without the app:
 python3 src/codex_token_heatmap.py
 ```
 
+Choose another compatible data home, for example local Qodex:
+
+```bash
+python3 src/codex_token_heatmap.py --data-home ~/.qodex
+```
+
 Run synthetic regression tests:
 
 ```bash
 python3 src/codex_token_heatmap.py --self-test
 ```
 
-Generated files are written to the home directory:
+Generated files for the currently selected data home are written to the home directory:
 
 - `~/codex_token_heatmap.html`
 - `~/codex_token_usage_by_day.csv`
