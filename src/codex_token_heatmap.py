@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 try:
@@ -61,11 +62,38 @@ OUTPUT_ARTIFACTS = (
 )
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
-REPORT_SCHEMA_VERSION = 3
-INCREMENTAL_CACHE_VERSION = 2
-INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, INCREMENTAL_CACHE_VERSION}
+REPORT_SCHEMA_VERSION = 11
+INCREMENTAL_CACHE_VERSION = 3
+INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, 2, INCREMENTAL_CACHE_VERSION}
 CACHE_ROOT = HOME / "Library" / "Caches" / "CodexTokenAtlas"
 ALL_MODELS_KEY = "all"
+ACHIEVEMENT_LEVEL_NAMES = ("铜", "银", "金", "钻石")
+STREAK_ACHIEVEMENT_TARGETS = (3, 7, 14)
+ACTIVE_DAY_ACHIEVEMENT_TARGETS = (7, 30, 90, 365)
+CONVERSATION_ACHIEVEMENT_TARGETS = (10, 30, 100, 500)
+RECORD_ACHIEVEMENT_TARGETS = {
+    "streak": STREAK_ACHIEVEMENT_TARGETS,
+    "days": ACTIVE_DAY_ACHIEVEMENT_TARGETS,
+    "sessions": CONVERSATION_ACHIEVEMENT_TARGETS,
+    "models": (2, 4, 6),
+    "session_models": (2, 3, 4),
+    "daily_sessions": (2, 4, 8),
+    "collaborative_sessions": (3, 10, 30),
+    "collaborative_days": (3, 10, 30, 100),
+    "total_tokens": (100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000),
+    "output_tokens": (1_000_000, 5_000_000, 20_000_000, 100_000_000),
+    "reasoning_tokens": (500_000, 2_000_000, 10_000_000),
+    "cached_tokens": (100_000_000, 1_000_000_000, 5_000_000_000),
+}
+RECORD_VOLUME_FIELDS = {
+    "total_tokens": "total_tokens",
+    "output_tokens": "output_tokens",
+    "reasoning_tokens": "reasoning_output_tokens",
+    "cached_tokens": "cached_input_tokens",
+}
+PEAK_VOLUME_WINDOW_SECONDS = 3600
+PEAK_RATE_WINDOW_SECONDS = 60
+ACTIVITY_GAP_SECONDS = 1800
 UNKNOWN_MODEL = "(unknown)"
 UNKNOWN_PROVIDER = "(unknown provider)"
 DEFAULT_SERVICE_TIER = "default"
@@ -97,7 +125,7 @@ RELEVANT_USAGE_LINE_MARKERS = tuple(
     for marker in (f'"type":"{event_type}"', f'"type": "{event_type}"')
 ) + (b"<think",)
 
-PRICING_AS_OF = "2026-07-29"
+PRICING_AS_OF = "2026-09-07"
 LONG_CONTEXT_THRESHOLD = 272_000
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 
@@ -156,17 +184,33 @@ def cached_summary(
         return None
     if payload.get("schema_version") != REPORT_SCHEMA_VERSION:
         return None
+    # A quiet data directory still needs its current streak to age on refresh.
+    dashboard = payload.get("dashboard")
+    records = dashboard.get("records") if isinstance(dashboard, dict) else None
+    if not isinstance(records, dict) or records.get("as_of") != datetime.now(LOCAL_TZ).date().isoformat():
+        return None
     if payload.get("source_id") != source.key:
         return None
     if payload.get("sessions_root") != str(source.sessions_root):
+        return None
+    pricing = payload.get("pricing")
+    if not isinstance(pricing, dict) or pricing.get("as_of") != PRICING_AS_OF:
+        return None
+    if pricing.get("revision") != pricing_configuration_revision(source):
         return None
     if payload.get("input_manifest") != manifest:
         return None
     return payload
 
 
-def auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
-    paths = [source.model_aliases_file, source.home / TOKENIZER_MAP_FILE]
+def _auxiliary_input_manifest(
+    source: UsageSource,
+    *,
+    include_pricing: bool,
+) -> list[list[str | int]]:
+    paths = [source.home / TOKENIZER_MAP_FILE]
+    if include_pricing:
+        paths.insert(0, source.model_aliases_file)
     if source.read_service_tier:
         paths.append(source.config_file)
     if source.read_billing_context:
@@ -193,6 +237,36 @@ def auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
                 continue
             result.append([str(path), int(stat.st_size), int(stat.st_mtime_ns)])
     return result
+
+
+def auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
+    return _auxiliary_input_manifest(source, include_pricing=False)
+
+
+def legacy_auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
+    return _auxiliary_input_manifest(source, include_pricing=True)
+
+
+def pricing_configuration_revision(source: UsageSource) -> str:
+    digest = hashlib.sha256()
+    digest.update(PRICING_AS_OF.encode("utf-8"))
+    digest.update(b"\0cost-schema=2")
+    digest.update(b"\0official=" + str(source.enable_official_pricing).encode("ascii"))
+    if source.enable_official_pricing:
+        digest.update(
+            b"\0catalog="
+            + json.dumps(
+                PRICING_USD_PER_MTOK,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    try:
+        digest.update(b"\0config=" + source.model_aliases_file.read_bytes())
+    except OSError:
+        digest.update(b"\0config=(missing)")
+    return digest.hexdigest()
 
 
 def incremental_cache_path(source: UsageSource) -> Path:
@@ -224,7 +298,12 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
         return None
     if envelope.source_home != str(source.home):
         return None
-    if envelope.auxiliary_manifest != auxiliary_input_manifest(source):
+    expected_auxiliary_manifest = (
+        legacy_auxiliary_input_manifest(source)
+        if envelope.version < INCREMENTAL_CACHE_VERSION
+        else auxiliary_input_manifest(source)
+    )
+    if envelope.auxiliary_manifest != expected_auxiliary_manifest:
         return None
     if not isinstance(envelope.report, UsageReport):
         return None
@@ -238,6 +317,24 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
             return None
     if not hasattr(envelope.report, "custom_pricing_models"):
         envelope.report.custom_pricing_models = set()
+    if not hasattr(envelope.report, "billable_events"):
+        envelope.report.billable_events = []
+    if not hasattr(envelope.report, "pricing_revision"):
+        envelope.report.pricing_revision = ""
+    desired_pricing_revision = pricing_configuration_revision(source)
+    if envelope.report.pricing_revision != desired_pricing_revision:
+        catalog, aliases, custom_models, errors = current_pricing_configuration(source)
+        # Older cache schemas did not retain the per-call timestamp/context needed
+        # for exact repricing. Rebuild them once rather than silently revaluing only
+        # calls appended after the upgrade.
+        if envelope.report.totals["calls"] and not envelope.report.billable_events:
+            return None
+        envelope.report.pricing_catalog = catalog
+        envelope.report.pricing_aliases = aliases
+        envelope.report.custom_pricing_models = custom_models
+        envelope.report.pricing_config_errors = errors
+        reprice_usage_report(envelope.report)
+        envelope.report.pricing_revision = desired_pricing_revision
     return envelope.report
 
 
@@ -276,6 +373,8 @@ def pricing_rate(
     long_context: bool = False,
     long_context_threshold: int | None = None,
     long_context_rates: tuple[float, float | None, float | None, float] | None = None,
+    off_peak_rates: tuple[float, float | None, float | None, float] | None = None,
+    peak_utc_weekday_windows: tuple[tuple[int, int], ...] | None = None,
     source: str = OFFICIAL_PRICING_URL,
 ) -> dict[str, Any]:
     return {
@@ -289,35 +388,63 @@ def pricing_rate(
         "long_context": long_context,
         "long_context_threshold": long_context_threshold,
         "long_context_rates": long_context_rates,
+        "off_peak_rates": off_peak_rates,
+        "peak_utc_weekday_windows": peak_utc_weekday_windows,
         "source": source,
     }
 
 
 PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
     # Current GPT families and historical standard API models.
+    "gpt-6-astra": pricing_rate(
+        10.0, 1.0, 50.0,
+        cache_write_input_rate=12.5,
+        priority_rates=(20.0, 2.0, 25.0, 100.0),
+        long_context_threshold=LONG_CONTEXT_THRESHOLD,
+        long_context_rates=(20.0, 2.0, 25.0, 75.0),
+        source="https://developers.openai.com/api/docs/models/gpt-6-astra",
+    ),
     "gpt-5.6-sol": pricing_rate(
-        5.0, 0.5, 30.0,
+        4.0, 0.4, 20.0,
         cache_write_input_rate=5.0,
-        priority_rates=(10.0, 1.0, 10.0, 60.0),
+        priority_rates=(8.0, 0.8, 10.0, 40.0),
         long_context=True,
     ),
     "gpt-5.6-terra": pricing_rate(
-        2.5, 0.25, 15.0,
+        2.0, 0.2, 12.0,
         cache_write_input_rate=2.5,
-        priority_rates=(5.0, 0.5, 5.0, 30.0),
+        priority_rates=(4.0, 0.4, 5.0, 24.0),
         long_context=True,
     ),
     "gpt-5.6-luna": pricing_rate(
-        1.0, 0.1, 6.0,
-        cache_write_input_rate=1.0,
-        priority_rates=(2.0, 0.2, 2.0, 12.0),
+        0.2, 0.02, 1.2,
+        cache_write_input_rate=0.25,
+        priority_rates=(0.4, 0.04, 0.5, 2.4),
         long_context=True,
     ),
     "gpt-5.6": pricing_rate(
-        5.0, 0.5, 30.0,
+        4.0, 0.4, 20.0,
         cache_write_input_rate=5.0,
-        priority_rates=(10.0, 1.0, 10.0, 60.0),
+        priority_rates=(8.0, 0.8, 10.0, 40.0),
         long_context=True,
+    ),
+    "gpt-5.6-cyber": pricing_rate(
+        12.5, 1.25, 75.0,
+        cache_write_input_rate=15.625,
+    ),
+    "gpt-daybreak-blue-latest": pricing_rate(
+        4.0, 0.4, 20.0,
+        cache_write_input_rate=5.0,
+        priority_rates=(8.0, 0.8, 10.0, 40.0),
+        long_context=True,
+    ),
+    "gpt-daybreak-red-latest": pricing_rate(
+        12.5, 1.25, 75.0,
+        cache_write_input_rate=15.625,
+    ),
+    "chat-latest": pricing_rate(
+        5.0, 0.5, 30.0,
+        source="https://developers.openai.com/api/docs/models/chat-latest",
     ),
     "gpt-5.5-pro": pricing_rate(
         30.0, None, 180.0,
@@ -346,6 +473,7 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         1.75,
         0.175,
         14.0,
+        priority_rates=(3.5, 0.35, None, 28.0),
         source="https://developers.openai.com/api/docs/models/gpt-5.3-codex",
     ),
     "gpt-5.3-chat-latest": pricing_rate(
@@ -452,18 +580,32 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
     "o1": pricing_rate(15.0, 7.5, 60.0),
     # Other providers commonly routed through OpenAI-compatible Codex endpoints.
     "deepseek-v4-pro": pricing_rate(
-        0.435,
-        0.003625,
-        0.87,
-        cache_write_input_rate=0.435,
+        1.32,
+        0.044,
+        3.96,
+        cache_write_input_rate=1.32,
+        off_peak_rates=(0.66, 0.022, 0.66, 1.98),
+        peak_utc_weekday_windows=((1, 4), (6, 10)),
         provider="DeepSeek",
         source="https://api-docs.deepseek.com/quick_start/pricing",
     ),
     "deepseek-v4-flash": pricing_rate(
-        0.14,
-        0.0028,
-        0.28,
-        cache_write_input_rate=0.14,
+        0.44,
+        0.014,
+        1.32,
+        cache_write_input_rate=0.44,
+        off_peak_rates=(0.22, 0.007, 0.22, 0.66),
+        peak_utc_weekday_windows=((1, 4), (6, 10)),
+        provider="DeepSeek",
+        source="https://api-docs.deepseek.com/quick_start/pricing",
+    ),
+    "deepseek-v4-flash-vision-exp": pricing_rate(
+        0.44,
+        0.014,
+        1.32,
+        cache_write_input_rate=0.44,
+        off_peak_rates=(0.22, 0.007, 0.22, 0.66),
+        peak_utc_weekday_windows=((1, 4), (6, 10)),
         provider="DeepSeek",
         source="https://api-docs.deepseek.com/quick_start/pricing",
     ),
@@ -483,9 +625,21 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         provider="DeepSeek",
         source="https://api-docs.deepseek.com/quick_start/pricing-details-usd",
     ),
+    "gemini-3.8-flash": pricing_rate(
+        0.75, 0.075, 3.75,
+        priority_rates=(1.35, 0.135, None, 6.75),
+        provider="Google",
+        source="https://ai.google.dev/gemini-api/docs/pricing",
+    ),
+    "gemini-3.7-flash": pricing_rate(
+        0.75, 0.075, 3.75,
+        priority_rates=(1.35, 0.135, None, 6.75),
+        provider="Google",
+        source="https://ai.google.dev/gemini-api/docs/pricing",
+    ),
     "gemini-3.6-flash": pricing_rate(
-        1.5, 0.15, 7.5,
-        priority_rates=(2.7, 0.27, None, 13.5),
+        0.75, 0.075, 3.75,
+        priority_rates=(1.35, 0.135, None, 6.75),
         provider="Google",
         source="https://ai.google.dev/gemini-api/docs/pricing",
     ),
@@ -558,6 +712,42 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         provider="Google",
         source="https://ai.google.dev/gemini-api/docs/pricing",
     ),
+    "claude-fable-5-1": pricing_rate(
+        10.0, 0.25, 50.0,
+        cache_write_input_rate=12.5,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-mythos-5-1": pricing_rate(
+        10.0, 0.25, 50.0,
+        cache_write_input_rate=12.5,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-fable-5": pricing_rate(
+        10.0, 1.0, 50.0,
+        cache_write_input_rate=12.5,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-mythos-5": pricing_rate(
+        10.0, 1.0, 50.0,
+        cache_write_input_rate=12.5,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-opus-5": pricing_rate(
+        5.0, 0.5, 25.0,
+        cache_write_input_rate=6.25,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-sonnet-5": pricing_rate(
+        2.0, 0.2, 10.0,
+        cache_write_input_rate=2.5,
+        provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
     "claude-opus-4-8": pricing_rate(
         5.0, 0.5, 25.0,
         cache_write_input_rate=6.25,
@@ -593,6 +783,13 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         cache_write_input_rate=1.25,
         provider="Anthropic",
         source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "grok-4.6": pricing_rate(
+        2.0, 0.5, 6.0,
+        provider="xAI",
+        long_context_threshold=200_000,
+        long_context_rates=(4.0, 1.0, None, 12.0),
+        source="https://docs.x.ai/developers/pricing",
     ),
     "grok-4.5": pricing_rate(
         2.0, 0.3, 6.0,
@@ -646,6 +843,9 @@ COST_FIELDS = (
     "standard_equivalent_cost_usd",
     "service_tier_premium_usd",
     "cache_savings_usd",
+    "standard_cache_savings_usd",
+    "standard_cached_input_cost_usd",
+    "standard_cache_write_input_cost_usd",
     "priced_tokens",
     "unpriced_tokens",
     "priced_calls",
@@ -829,6 +1029,16 @@ class FileParserState:
 
 
 @dataclass
+class BillableUsageEvent:
+    session_id: str
+    route_provider: str
+    model: str
+    service_tier: str
+    timestamp: datetime
+    usage: Counter
+
+
+@dataclass
 class UsageReport:
     sessions: list[SessionStats]
     source_key: str = "codex"
@@ -841,6 +1051,8 @@ class UsageReport:
     custom_pricing_models: set[str] = field(default_factory=set)
     pricing_aliases: dict[str, str] = field(default_factory=dict)
     pricing_config_errors: list[str] = field(default_factory=list)
+    pricing_revision: str = ""
+    billable_events: list[BillableUsageEvent] = field(default_factory=list)
     totals: Counter = field(default_factory=Counter)
     totals_by_model: dict[str, Counter] = field(default_factory=counter_map)
     totals_by_provider: dict[str, Counter] = field(default_factory=counter_map)
@@ -1029,17 +1241,20 @@ def read_thread_info(
     state_db: Path = STATE_DB,
     session_index: Path = SESSION_INDEX,
 ) -> dict[str, ThreadInfo]:
-    if not state_db.exists():
-        return {}
-
     indexed_names = read_session_index_names(session_index)
+    result = {
+        f"id:{thread_id}": ThreadInfo(thread_id=thread_id, title=title, title_source="session_index.thread_name")
+        for thread_id, title in indexed_names.items()
+    }
+    if not state_db.exists():
+        return result
     try:
-        with sqlite3.connect(state_db) as conn:
+        with sqlite3.connect(state_db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
             conn.row_factory = sqlite3.Row
             columns = {row[1] for row in conn.execute("pragma table_info(threads)")}
             required = {"id", "rollout_path"}
             if not required.issubset(columns):
-                return {}
+                return result
 
             optional = [
                 name
@@ -1054,7 +1269,6 @@ def read_thread_info(
             ]
             select_fields = ["id", "rollout_path", *optional]
             query = f"select {', '.join(select_fields)} from threads"
-            result: dict[str, ThreadInfo] = {}
             for row in conn.execute(query):
                 rollout_path = row["rollout_path"]
                 if not rollout_path:
@@ -1089,7 +1303,7 @@ def read_thread_info(
                 )
             return result
     except sqlite3.Error:
-        return {}
+        return result
 
 
 def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
@@ -1242,7 +1456,7 @@ def discover_sessions(
                 conversation_id=str(first.get("conversation_id") or ""),
                 is_internal=bool(first.get("is_internal")),
                 context_window=safe_int(first.get("context_window")),
-                thread=thread_info.get(normalized_path(path), ThreadInfo()),
+                thread=thread_info.get(normalized_path(path), thread_info.get(f"id:{session_id}", ThreadInfo())),
             )
         )
 
@@ -1686,6 +1900,18 @@ def read_model_aliases(
     return aliases, errors
 
 
+def current_pricing_configuration(
+    source: UsageSource,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str], set[str], list[str]]:
+    catalog = dict(PRICING_USD_PER_MTOK) if source.enable_official_pricing else {}
+    aliases, custom_models, errors = read_pricing_config(
+        source.model_aliases_file,
+        catalog,
+    )
+    catalog.update(custom_models)
+    return catalog, aliases, set(custom_models), errors
+
+
 def normalized_model_id(model: str) -> str:
     normalized = model.strip().lower()
     if normalized.startswith("anthropic."):
@@ -1725,6 +1951,7 @@ def pricing_for_model(
 def standard_rates_for_usage(
     pricing: dict[str, Any],
     usage: Counter,
+    timestamp: datetime | None = None,
 ) -> tuple[dict[str, float | None], bool]:
     input_rate = float(pricing["input"])
     cache_write_rate = optional_rate(pricing.get("cache_write_input"))
@@ -1737,6 +1964,30 @@ def standard_rates_for_usage(
         ),
         "output": float(pricing["output"]),
     }
+    off_peak_rates = pricing.get("off_peak_rates")
+    peak_windows = pricing.get("peak_utc_weekday_windows")
+    if timestamp is not None and off_peak_rates and peak_windows:
+        aware_timestamp = (
+            timestamp.replace(tzinfo=timezone.utc)
+            if timestamp.tzinfo is None
+            else timestamp
+        )
+        utc_timestamp = aware_timestamp.astimezone(timezone.utc)
+        is_peak = utc_timestamp.weekday() < 5 and any(
+            int(start) <= utc_timestamp.hour < int(end)
+            for start, end in peak_windows
+        )
+        if not is_peak:
+            rates = {
+                "input": off_peak_rates[0],
+                "cached_input": off_peak_rates[1],
+                "cache_write_input": (
+                    off_peak_rates[2]
+                    if off_peak_rates[2] is not None
+                    else off_peak_rates[0]
+                ),
+                "output": off_peak_rates[3],
+            }
     threshold = pricing.get("long_context_threshold")
     if threshold is None and pricing.get("long_context"):
         threshold = LONG_CONTEXT_THRESHOLD
@@ -1849,6 +2100,7 @@ def estimate_usage_cost(
     usage: Counter,
     catalog: dict[str, dict[str, Any]] | None = None,
     aliases: dict[str, str] | None = None,
+    timestamp: datetime | None = None,
 ) -> Counter:
     pricing_match = pricing_for_model(
         model,
@@ -1868,7 +2120,7 @@ def estimate_usage_cost(
         )
 
     _, pricing = pricing_match
-    standard_rates, long_context = standard_rates_for_usage(pricing, usage)
+    standard_rates, long_context = standard_rates_for_usage(pricing, usage, timestamp)
     selected_rates, tier_fallback = rates_for_service_tier(
         pricing,
         standard_rates,
@@ -1882,21 +2134,23 @@ def estimate_usage_cost(
         result["estimated_cost_usd"] - standard_cost["estimated_cost_usd"],
     )
 
-    input_rate = selected_rates.get("input")
-    cache_savings = 0.0
-    if input_rate is not None:
-        for token_field, rate_field in (
-            ("cached_input_tokens", "cached_input"),
-            ("cache_write_input_tokens", "cache_write_input"),
-        ):
-            category_rate = selected_rates.get(rate_field)
-            if category_rate is not None:
-                cache_savings += (
-                    usage[token_field]
-                    / 1_000_000
-                    * max(0.0, float(input_rate) - float(category_rate))
+    for rates, field in (
+        (selected_rates, "cache_savings_usd"),
+        (standard_rates, "standard_cache_savings_usd"),
+    ):
+        input_rate = rates.get("input")
+        if input_rate is not None:
+            result[field] = sum(
+                usage[token_field] / 1_000_000
+                * max(0.0, float(input_rate) - float(rates[rate_field]))
+                for token_field, rate_field in (
+                    ("cached_input_tokens", "cached_input"),
+                    ("cache_write_input_tokens", "cache_write_input"),
                 )
-    result["cache_savings_usd"] = cache_savings
+                if rates.get(rate_field) is not None
+            )
+    result["standard_cached_input_cost_usd"] = standard_cost["cached_input_cost_usd"]
+    result["standard_cache_write_input_cost_usd"] = standard_cost["cache_write_input_cost_usd"]
     result["priced_calls"] = 1 if result["priced_tokens"] else 0
     result["unpriced_calls"] = 1 if result["unpriced_tokens"] and not result["priced_tokens"] else 0
     result["long_context_calls"] = 1 if long_context else 0
@@ -1905,6 +2159,65 @@ def estimate_usage_cost(
     result["other_tier_calls"] = 1 if service_tier not in {"default", "priority"} else 0
     result["tier_rate_fallback_calls"] = 1 if tier_fallback else 0
     return result
+
+
+def reprice_usage_report(report: UsageReport) -> None:
+    for attribute in (
+        "costs_by_model",
+        "costs_by_route",
+        "costs_by_day",
+        "costs_by_day_model",
+        "costs_by_day_route",
+        "costs_by_hour",
+        "costs_by_hour_model",
+        "costs_weekday_hour",
+        "costs_weekday_hour_model",
+    ):
+        getattr(report, attribute).clear()
+    for stats in report.sessions:
+        stats.costs_by_day.clear()
+        stats.costs_by_day_model.clear()
+
+    sessions_by_id = {
+        stats.descriptor.session_id: stats for stats in report.sessions
+    }
+    logical_owner_by_id = {
+        state.descriptor.session_id: state.logical_owner_id
+        for state in report.file_states.values()
+        if state.logical_owner_id
+    }
+
+    for event in report.billable_events:
+        timestamp = event.timestamp
+        day = timestamp.date()
+        hour = timestamp.replace(minute=0, second=0, microsecond=0)
+        weekday_hour = (timestamp.weekday(), timestamp.hour)
+        route = (event.route_provider, event.model, event.service_tier)
+        cost = estimate_usage_cost(
+            event.route_provider,
+            event.model,
+            event.service_tier,
+            event.usage,
+            report.pricing_catalog,
+            report.pricing_aliases,
+            timestamp,
+        )
+
+        report.costs_by_model[event.model].update(cost)
+        report.costs_by_route[route].update(cost)
+        report.costs_by_day[day].update(cost)
+        report.costs_by_day_model[day][event.model].update(cost)
+        report.costs_by_day_route[day][route].update(cost)
+        report.costs_by_hour[hour].update(cost)
+        report.costs_by_hour_model[hour][event.model].update(cost)
+        report.costs_weekday_hour[weekday_hour].update(cost)
+        report.costs_weekday_hour_model[weekday_hour][event.model].update(cost)
+
+        owner_id = logical_owner_by_id.get(event.session_id, event.session_id)
+        stats = sessions_by_id.get(owner_id)
+        if stats is not None:
+            stats.costs_by_day[day].update(cost)
+            stats.costs_by_day_model[day][event.model].update(cost)
 
 
 def event_fingerprint(
@@ -1941,6 +2254,14 @@ def add_usage(
     timestamp: datetime,
     usage: Counter,
 ) -> None:
+    report.billable_events.append(BillableUsageEvent(
+        session_id=stats.descriptor.session_id,
+        route_provider=route_provider,
+        model=model,
+        service_tier=service_tier,
+        timestamp=timestamp,
+        usage=Counter(usage),
+    ))
     day = timestamp.date()
     hour = timestamp.replace(minute=0, second=0, microsecond=0)
     weekday_hour = (timestamp.weekday(), timestamp.hour)
@@ -1974,6 +2295,7 @@ def add_usage(
         usage,
         report.pricing_catalog,
         report.pricing_aliases,
+        timestamp,
     )
     stats.costs_by_day[day].update(cost)
     stats.costs_by_day_model[day][model].update(cost)
@@ -2056,6 +2378,9 @@ def logical_owner_ids(
     visible_ids = {
         descriptor.session_id for descriptor in descriptors if not descriptor.is_internal
     }
+    # Memoize physical ancestry independently of conversation_id overrides: an
+    # ancestor's override does not change a descendant's physical parent chain.
+    physical_owners = {sid: sid for sid in visible_ids}
     result: dict[str, str] = {}
     for descriptor in descriptors:
         if not descriptor.is_internal:
@@ -2065,15 +2390,16 @@ def logical_owner_ids(
         if candidate and candidate != descriptor.session_id and candidate in visible_ids:
             result[descriptor.session_id] = candidate
             continue
-        current = descriptor.physical_parent_id
+        current = descriptor.session_id
         visited: set[str] = set()
-        while current and current not in visited:
+        while current and current not in visited and current not in physical_owners:
             visited.add(current)
-            if current in visible_ids:
-                break
             parent = by_id.get(current)
             current = parent.physical_parent_id if parent is not None else ""
-        result[descriptor.session_id] = current if current in visible_ids else descriptor.session_id
+        owner = physical_owners.get(current, "")
+        for sid in visited:
+            physical_owners[sid] = owner
+        result[descriptor.session_id] = owner or descriptor.session_id
     return result
 
 
@@ -2887,7 +3213,15 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
                 ),
                 "output": float(pricing["output"]),
             },
-            "long_context": bool(pricing.get("long_context")),
+            "long_context": bool(
+                pricing.get("long_context") or pricing.get("long_context_threshold")
+            ),
+            "rate_note": (
+                "Peak rate shown; historical value uses the official UTC "
+                "weekday peak/off-peak schedule."
+                if pricing.get("off_peak_rates")
+                else None
+            ),
             "source": source,
             "costs": cost_dict(costs),
         }
@@ -2916,6 +3250,8 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
             "pricing_model": None,
             "pricing_kind": None,
             "rates": None,
+            "rate_note": None,
+            "standard_rates": None,
             "source": None,
             "daily": {
                 day.isoformat(): {
@@ -2941,6 +3277,13 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
                     "pricing_model": pricing_model,
                     "pricing_kind": pricing.get("pricing_kind", "official"),
                     "rates": selected_rates,
+                    "standard_rates": standard_rates,
+                    "rate_note": (
+                        "Peak rate shown; historical value uses the official UTC "
+                        "weekday peak/off-peak schedule."
+                        if pricing.get("off_peak_rates")
+                        else None
+                    ),
                     "source": source,
                     "tier_rate_fallback": tier_fallback,
                 }
@@ -2951,6 +3294,7 @@ def build_pricing_data(report: UsageReport, models: list[str]) -> dict[str, Any]
     return {
         "currency": "USD",
         "as_of": PRICING_AS_OF,
+        "revision": report.pricing_revision,
         "custom_models": sorted(report.custom_pricing_models),
         "long_context_threshold": LONG_CONTEXT_THRESHOLD,
         "scopes": scopes,
@@ -2979,6 +3323,326 @@ def iter_dates(start: date, end: date) -> Iterable[date]:
         yield start + timedelta(days=offset)
 
 
+def record_event_provenance(report: UsageReport, owners: dict[str, str]) -> list[tuple[str, str]] | None:
+    """Recover physical rollout and turn IDs from the existing parser cache.
+
+    Both parsers insert one fingerprint immediately before appending one billable
+    event. Validate the entire ordered pairing before using it for timing records.
+    """
+    if len(report.seen_fingerprints) != len(report.billable_events):
+        return None
+    provenance = []
+    for event, (fingerprint, physical_id) in zip(report.billable_events, report.seen_fingerprints.items()):
+        if len(fingerprint) != 9 or (
+            event.route_provider, event.model, event.service_tier
+        ) != fingerprint[2:5] or event.session_id not in (physical_id, owners.get(physical_id)):
+            return None
+        provenance.append((physical_id, fingerprint[1]))
+    return provenance
+
+
+def peak_usage_windows(events: list[BillableUsageEvent], seconds: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Find independent total/output peaks over sorted events in (end - seconds, end]."""
+    peak_total = peak_output = None
+    left = total = output = 0
+    for right, event in enumerate(events):
+        stamp = event.timestamp.timestamp()
+        while left < right and events[left].timestamp.timestamp() <= stamp - seconds:
+            total -= events[left].usage["total_tokens"]
+            output -= events[left].usage["output_tokens"]
+            left += 1
+        total += event.usage["total_tokens"]
+        output += event.usage["output_tokens"]
+        new_total = peak_total is None or total > peak_total["total_tokens"]
+        new_output = peak_output is None or output > peak_output["output_tokens"]
+        if new_total or new_output:
+            window = {
+                "start": (event.timestamp.astimezone(LOCAL_TZ) - timedelta(seconds=seconds)).isoformat(),
+                "end": event.timestamp.astimezone(LOCAL_TZ).isoformat(),
+                "window_seconds": seconds, "total_tokens": total, "output_tokens": output,
+            }
+            if new_total:
+                peak_total = window
+            if new_output:
+                peak_output = window
+    return peak_total, peak_output
+
+
+def build_usage_records(report: UsageReport, today: date | None = None) -> dict[str, Any]:
+    """Lifetime records from deduplicated events; no rollout rereads or rate sampling."""
+    today = today or datetime.now(LOCAL_TZ).date()
+    # Full parses retain physical IDs; incremental appends use logical owners.
+    descriptors = {state.descriptor.session_id: state.descriptor for state in report.file_states.values()}
+    owners = logical_owner_ids(descriptors.values())
+    sessions = {s.descriptor.session_id: s for s in report.sessions}
+    visible = [s for s in report.sessions if not s.descriptor.is_internal and s.total["total_tokens"] > 0]
+    visible_ids = {s.descriptor.session_id for s in visible}
+    # Identity follows the reported model, independent of service tiers and
+    # pricing aliases. Keep all identities in footprints for accounting.
+    model_usage: dict[str, Counter] = defaultdict(Counter)
+    for model, usage in report.totals_by_model.items():
+        model_usage[normalized_model_id(model)].update(usage)
+
+    def known_model(model: str) -> bool:
+        return model not in ("", "(unknown)", "unknown", "codex-auto-review")
+
+    known_models = {model for model, usage in model_usage.items() if known_model(model) and usage["total_tokens"] > 0}
+    models_by_session = {
+        s.descriptor.session_id: {
+            normalized_model_id(model) for model, usage in s.by_model.items()
+            if usage["total_tokens"] > 0 and known_model(normalized_model_id(model))
+        }
+        for s in visible
+    }
+    excluded = {sid for sid, stats in sessions.items() if stats.missing_timestamp_events}
+    fork_created = {}
+    worker_created = {}
+    for state in report.file_states.values():
+        descriptor = state.descriptor
+        try:
+            created = datetime.fromisoformat(descriptor.created_at.replace("Z", "+00:00"))
+            if created.tzinfo is not None:
+                if descriptor.physical_parent_id or descriptor.parent_id:
+                    fork_created[descriptor.session_id] = created.timestamp()
+                if descriptor.is_internal:
+                    worker_created[descriptor.session_id] = created.timestamp()
+        except ValueError:
+            continue
+    provenance = record_event_provenance(report, owners)
+    turn_times: dict[str, float | None] = {}
+
+    def turn_timestamp(turn_id: str) -> float | None:
+        if turn_id not in turn_times:
+            try:
+                turn = UUID(turn_id)
+                turn_times[turn_id] = (turn.int >> 80) / 1000 if turn.version == 7 else None
+            except (ValueError, AttributeError):
+                turn_times[turn_id] = None
+        return turn_times[turn_id]
+
+    excluded_replay_events = excluded_provenance_events = 0
+    eligible_events: list[tuple[BillableUsageEvent, str | None]] = []
+    workers: set[str] = set()
+    workers_by_session: dict[str, set[str]] = defaultdict(set)
+    for index, event in enumerate(report.billable_events):
+        if event.usage["total_tokens"] <= 0:
+            continue
+        owner = owners.get(event.session_id, event.session_id)
+        worker_id = None
+        if provenance is not None:
+            physical_id, turn_id = provenance[index]
+            descriptor = descriptors.get(physical_id)
+            if descriptor is not None and descriptor.is_internal:
+                created = worker_created.get(physical_id)
+                turn_time = turn_timestamp(turn_id)
+                # A physical rollout can contain copied parent calls, including
+                # calls with preserved original timestamps. Participation needs
+                # an own post-creation turn and occurrence; missing evidence is
+                # insufficient. Repeated calls still count a physical ID once.
+                if (created is not None and turn_time is not None and turn_time + 1 >= created
+                    and event.timestamp.tzinfo is not None and event.timestamp.timestamp() >= created):
+                    worker_id = physical_id
+                    workers.add(worker_id)
+                    if owner in visible_ids:
+                        workers_by_session[owner].add(worker_id)
+        # Participation snapshots include every positive confirmed own call;
+        # dates and daily patterns require the additional chronology checks.
+        if (owner in excluded or event.timestamp.tzinfo is None
+            or event.timestamp.astimezone(LOCAL_TZ).date() > today):
+            continue
+        if provenance is None and report.file_states:
+            excluded_provenance_events += 1
+            continue
+        if provenance is not None:
+            physical_id, turn_id = provenance[index]
+            created = fork_created.get(physical_id)
+            if created is not None:
+                turn_time = turn_timestamp(turn_id)
+                if turn_time is None and event.timestamp.timestamp() >= created:
+                    # Old copied histories can omit turn IDs entirely. Their
+                    # rewritten time cannot be distinguished from new activity.
+                    excluded_provenance_events += 1
+                    continue
+                # A pre-existing turn rewritten at/after the fork's creation is
+                # inherited history with an unsuitable occurrence timestamp.
+                # Preserve original pre-fork timestamps; tolerate 1 s rounding.
+                if turn_time is not None and turn_time + 1 < created <= event.timestamp.timestamp():
+                    excluded_replay_events += 1
+                    continue
+        eligible_events.append((event, worker_id))
+    eligible_events.sort(key=lambda item: item[0].timestamp.timestamp())
+    events = [event for event, _ in eligible_events]
+    active_days = sorted({event.timestamp.astimezone(LOCAL_TZ).date() for event in events})
+    longest_streak = streak = 0
+    longest_start = longest_end = streak_start = previous = None
+    streak_unlocks: dict[int, str] = {}
+    for day in active_days:
+        streak = streak + 1 if previous and day == previous + timedelta(days=1) else 1
+        if streak == 1:
+            streak_start = day
+        if streak > longest_streak:
+            longest_streak, longest_start, longest_end = streak, streak_start, day
+        for goal in STREAK_ACHIEVEMENT_TARGETS:
+            if streak >= goal and goal not in streak_unlocks:
+                streak_unlocks[goal] = day.isoformat()
+        previous = day
+    current_streak = streak if previous in (today, today - timedelta(days=1)) else 0
+
+    peak_total, peak_output = peak_usage_windows(events, PEAK_VOLUME_WINDOW_SECONDS)
+    peak_rate, peak_output_rate = peak_usage_windows(events, PEAK_RATE_WINDOW_SECONDS)
+    activity: dict[str, dict[str, Any]] = {}
+    longest_activity = None
+    for event in events:
+        stamp = event.timestamp.timestamp()
+        owner = owners.get(event.session_id, event.session_id)
+        stats = sessions.get(owner)
+        if stats is None or stats.descriptor.is_internal:
+            continue
+        segment = activity.get(owner)
+        if segment is None or stamp - segment["last"] > ACTIVITY_GAP_SECONDS:
+            segment = {"first": stamp, "last": stamp, "start": event.timestamp.isoformat(), "total_tokens": 0}
+            activity[owner] = segment
+        segment["last"] = stamp
+        segment["total_tokens"] += event.usage["total_tokens"]
+        duration = int(stamp - segment["first"])
+        if duration > 0 and (longest_activity is None or duration > longest_activity["seconds"]):
+            longest_activity = {
+                "session_id": owner, "title": clean_text(stats.descriptor.thread.title or "(untitled)", limit=500),
+                "start": segment["start"], "end": event.timestamp.isoformat(),
+                "seconds": duration, "total_tokens": segment["total_tokens"],
+            }
+
+    # One chronological pass establishes the earliest confirmable attainment
+    # dates, independently of cumulative counters whose timestamps may be absent.
+    unlocks: dict[str, dict[int, str]] = defaultdict(dict)
+    day_usage: dict[str, Counter] = defaultdict(Counter)
+    day_sessions: dict[str, set[str]] = defaultdict(set)
+    day_models: dict[str, set[str]] = defaultdict(set)
+    model_dates: dict[str, dict[str, str]] = {}
+    observed_models: set[str] = set()
+    observed_sessions: set[str] = set()
+    observed_session_models: dict[str, set[str]] = defaultdict(set)
+    observed_workers: dict[str, set[str]] = defaultdict(set)
+    collaborative_days: set[str] = set()
+    observed_volumes: Counter = Counter()
+
+    def confirm(key: str, value: int, day: str) -> None:
+        for target in RECORD_ACHIEVEMENT_TARGETS[key]:
+            if value >= target and target not in unlocks[key]:
+                unlocks[key][target] = day
+
+    for event, worker_id in eligible_events:
+        day = event.timestamp.astimezone(LOCAL_TZ).date().isoformat()
+        model = normalized_model_id(event.model)
+        owner = owners.get(event.session_id, event.session_id)
+        day_usage[day].update(event.usage)
+        model_dates.setdefault(model, {"first_used": day})["last_used"] = day
+        if known_model(model):
+            day_models[day].add(model)
+            observed_models.add(model)
+            confirm("models", len(observed_models), day)
+        if owner in visible_ids:
+            day_sessions[day].add(owner)
+            observed_sessions.add(owner)
+            confirm("sessions", len(observed_sessions), day)
+            confirm("daily_sessions", len(day_sessions[day]), day)
+            if known_model(model):
+                observed_session_models[owner].add(model)
+                confirm("session_models", len(observed_session_models[owner]), day)
+            if worker_id is not None:
+                observed_workers[owner].add(worker_id)
+                collaborative_days.add(day)
+                confirm("collaborative_sessions", len(observed_workers), day)
+                confirm("collaborative_days", len(collaborative_days), day)
+        for key, field_name in RECORD_VOLUME_FIELDS.items():
+            observed_volumes[key] += event.usage[field_name]
+            confirm(key, observed_volumes[key], day)
+
+    days = [
+        {"date": day, "total_tokens": usage["total_tokens"], "output_tokens": usage["output_tokens"],
+         "calls": usage["calls"], "sessions": len(day_sessions[day]), "models": len(day_models[day])}
+        for day, usage in sorted(day_usage.items())
+    ]
+    # Ascending days plus max's first-wins behavior makes every tie independent
+    # and deterministic, including days with different total/output peaks.
+    peak_day = max(days, key=lambda item: item["total_tokens"], default=None)
+    peak_output_day = max(days, key=lambda item: item["output_tokens"], default=None)
+    busiest_day = max(days, key=lambda item: item["sessions"], default=None)
+    most_models_id = min(
+        (sid for sid, models in models_by_session.items() if models),
+        key=lambda sid: (-len(models_by_session[sid]), sid), default=None,
+    )
+    most_models_session = None if most_models_id is None else {
+        "session_id": most_models_id,
+        "title": clean_text(sessions[most_models_id].descriptor.thread.title or "(untitled)", limit=500),
+        "model_count": len(models_by_session[most_models_id]), "models": sorted(models_by_session[most_models_id]),
+    }
+    largest_team_id = min(workers_by_session, key=lambda sid: (-len(workers_by_session[sid]), sid), default=None)
+    largest_team_session = None if largest_team_id is None else {
+        "session_id": largest_team_id,
+        "title": clean_text(sessions[largest_team_id].descriptor.thread.title or "(untitled)", limit=500),
+        "worker_count": len(workers_by_session[largest_team_id]),
+    }
+    insights = {
+        "first_active_day": active_days[0].isoformat() if active_days else None,
+        "model_count": len(known_models), "collaborative_sessions": len(workers_by_session),
+        "worker_count": len(workers), "peak_day": peak_day, "peak_output_day": peak_output_day,
+        "busiest_day": busiest_day, "most_models_session": most_models_session,
+        "collaborative_days": len(collaborative_days), "largest_team_session": largest_team_session,
+        "models": [
+            {"id": model, "calls": usage["calls"], "total_tokens": usage["total_tokens"],
+             "output_tokens": usage["output_tokens"], "first_used": model_dates.get(model, {}).get("first_used"),
+             "last_used": model_dates.get(model, {}).get("last_used")}
+            for model, usage in sorted(model_usage.items(), key=lambda item: (-item[1]["calls"], item[0]))
+        ],
+    }
+    largest = max(visible, key=lambda s: s.total["total_tokens"], default=None)
+    largest_session = None if largest is None else {
+        "session_id": largest.descriptor.session_id,
+        "title": clean_text(largest.descriptor.thread.title or "(untitled)", limit=500),
+        "total_tokens": largest.total["total_tokens"],
+    }
+    achievements = []
+    for key, title, symbol, category, detail, rule, value, unit in (
+        ("streak", "持之以恒", "flame", "habit", "最长连续使用", "按可确认时间的本地日期，记录连续有用量的最长天数。", longest_streak, "天"),
+        ("days", "日积月累", "calendar", "habit", "累计活跃", "按可确认时间的本地日期，累计有用量的不同日期。", len(active_days), "天"),
+        ("sessions", "对话旅程", "bubble.left.and.bubble.right", "habit", "有用量的逻辑会话", "累计有用量的用户对话，内部工作线程用量归入所属对话。", len(visible), "条"),
+        ("models", "模型探索", "sparkles", "exploration", "累计使用的模型", "按报告中的已知模型标识累计，同一标识的服务档位合并计数。", len(known_models), "种"),
+        ("session_models", "融会贯通", "square.stack.3d.up", "exploration", "单条对话中的最多模型", "记录单条用户对话使用过的最多已知模型，包含所属内部工作线程。", max(map(len, models_by_session.values()), default=0), "种"),
+        ("daily_sessions", "多线展开", "bubble.left.and.text.bubble.right", "exploration", "单日有用量的最多对话", "按可确认时间的本地日期，记录一天内有用量的最多不同用户对话。", busiest_day["sessions"] if busiest_day else 0, "条"),
+        ("collaborative_sessions", "携手同行", "person.2", "collaboration", "有内部工作线程参与的对话", "累计有时间与来源可确认的内部线程调用的用户对话；参与按线程创建后的自身调用确认。", len(workers_by_session), "条"),
+        ("collaborative_days", "协作日常", "person.3", "collaboration", "累计协作活跃", "按可确认时间的本地日期，累计有内部工作线程自身调用的日期；同一天的不同线程和对话合并计为一天。", len(collaborative_days), "天"),
+        ("total_tokens", "用量里程碑", "chart.bar", "volume", "累计 Token", "累计报告总用量；日期以可确认时间的事件累计首次达到门槛为准。", report.totals["total_tokens"], "Token"),
+        ("output_tokens", "输出积累", "text.alignleft", "volume", "累计输出 Token", "累计报告输出用量；日期以可确认时间的事件累计首次达到门槛为准。", report.totals["output_tokens"], "Token"),
+        ("reasoning_tokens", "推理足迹", "brain", "volume", "累计推理 Token", "累计报告推理用量，包含报告已计入的估算值；日期以可确认时间的事件累计为准。", report.totals["reasoning_output_tokens"], "Token"),
+        ("cached_tokens", "缓存接力", "arrow.triangle.2.circlepath", "volume", "累计缓存输入 Token", "累计报告缓存输入用量；日期以可确认时间的事件累计首次达到门槛为准。", report.totals["cached_input_tokens"], "Token"),
+    ):
+        levels = []
+        for name, goal in zip(ACHIEVEMENT_LEVEL_NAMES, RECORD_ACHIEVEMENT_TARGETS[key]):
+            unlocked_on = unlocks[key].get(goal) if value >= goal else None
+            if key == "streak":
+                unlocked_on = streak_unlocks.get(goal)
+            elif key == "days" and len(active_days) >= goal:
+                unlocked_on = active_days[goal - 1].isoformat()
+            levels.append({"name": name, "target": goal, "unlocked_on": unlocked_on, "hidden": name == "钻石"})
+        achievements.append({"id": key, "title": title, "symbol": symbol, "detail": detail,
+                             "category": category, "rule": rule,
+                             "value": value, "current_value": current_streak if key == "streak" else value,
+                             "unit": unit, "levels": levels})
+    return {
+        "as_of": today.isoformat(), "active_days": len(active_days),
+        "current_streak": current_streak, "longest_streak": longest_streak,
+        "longest_streak_start": longest_start.isoformat() if longest_start else None,
+        "longest_streak_end": longest_end.isoformat() if longest_end else None,
+        "peak_hour": peak_total, "peak_output_hour": peak_output,
+        "peak_throughput": peak_rate, "peak_output_throughput": peak_output_rate,
+        "longest_activity": longest_activity, "largest_session": largest_session,
+        "achievements": achievements, "insights": insights, "excluded_timestamp_sessions": len(excluded),
+        "excluded_replay_events": excluded_replay_events,
+        "excluded_provenance_events": excluded_provenance_events,
+    }
+
+
 def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
     models = sorted(
         report.totals_by_model,
@@ -2987,7 +3651,7 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
     )
     active_days = sorted(report.by_day)
     if not active_days:
-        raise SystemExit("No token usage found.")
+        active_days = [datetime.now(LOCAL_TZ).date()]
 
     totals_by_scope = {ALL_MODELS_KEY: counter_dict(report.totals)}
     for model in models:
@@ -3179,6 +3843,7 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
         "timeline_hourly": timeline_hourly,
         "daily": daily,
         "sessions": sessions,
+        "records": build_usage_records(report),
         "audit": {
             "session_files": report.rollout_files,
             "sessions_with_usage": sum(
@@ -3638,6 +4303,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .tooltip {
+  white-space: pre-line;
   position: fixed;
   z-index: 99;
   max-width: 310px;
@@ -3847,7 +4513,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     const selected = `${metrics[state.metric].label}: ${fmt(metricValue(usage))}`;
     const unpriced = cost.unpriced_tokens ? ` · ${short(cost.unpriced_tokens)} unpriced` : "";
     const value = cost.priced_tokens ? usd(cost.estimated_cost_usd) : "Unpriced";
-    return `${title}<br>${selected}<br>Total: ${fmt(usage.total_tokens)} · Calls: ${fmt(usage.calls)}<br>Official API value: ${value}${unpriced}`;
+    return `${title}\n${selected}\nTotal: ${fmt(usage.total_tokens)} · Calls: ${fmt(usage.calls)}\nAPI value: ${value}${unpriced}`;
   }
   function heatButton(className, value, cap, tooltip, aria) {
     return `<button type="button" class="heat-cell ${className}" style="background:${colorFor(value, cap)}" data-tooltip="${escapeHtml(tooltip)}" aria-label="${escapeHtml(aria)}"></button>`;
@@ -3983,6 +4649,9 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     const hasCustomPricing = pricing.routes.some(route =>
       (state.model === "all" || route.model === state.model) && route.pricing_kind === "custom"
     );
+    const hasTimeVariablePricing = pricing.routes.some(route =>
+      (state.model === "all" || route.model === state.model) && route.rate_note
+    );
     document.getElementById("estimatedCost").textContent = hasTrustedPricing ? usd(cost.estimated_cost_usd) : "未定价";
     document.getElementById("estimatedCostDetail").textContent = `${(coverage * 100).toFixed(1)}% categorized tokens priced`;
     document.getElementById("standardCost").textContent = hasTrustedPricing ? usd(cost.standard_equivalent_cost_usd) : "未定价";
@@ -3994,7 +4663,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("costCaption").textContent = hasTrustedPricing
       ? hasCustomPricing
         ? `${modelLabel(state.model)} · 使用当前数据目录保存的逐模型单价估算文本 token 价值。`
-        : `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。`
+        : `${modelLabel(state.model)} · 按日志路由计算官方直连文本 token 等价价值；不是中转站或订阅实际账单。${hasTimeVariablePricing ? " DeepSeek V4 表中显示峰时价，历史金额按调用时间套用 UTC 工作日峰/谷价。" : ""}`
       : `${modelLabel(state.model)} · 当前数据目录尚未配置可用价格；模型、调用和 token 仍完整统计。`;
     document.getElementById("pricingAsOf").textContent = hasTrustedPricing
       ? hasCustomPricing ? "CUSTOM MODEL RATES" : `OFFICIAL DIRECT RATES · ${pricing.as_of}`
@@ -4081,7 +4750,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   function showTooltip(target, event) {
     const content = target?.dataset?.tooltip;
     if (!content) return;
-    tooltip.innerHTML = content;
+    tooltip.textContent = content;
     tooltip.classList.add("visible");
     positionTooltip(event);
   }
@@ -4111,8 +4780,8 @@ def render_html(report: UsageReport) -> str:
     encoded = encoded.replace("<", "\\u003c").replace("&", "\\u0026")
     return (
         HTML_TEMPLATE
-        .replace("__DATA_JSON__", encoded)
         .replace("__SOURCE_LABEL__", html.escape(report.source_label))
+        .replace("__DATA_JSON__", encoded)
     )
 
 
@@ -4428,8 +5097,407 @@ def synthetic_event(
     )
 
 
+def run_records_self_test() -> None:
+    def session(sid: str) -> SessionStats:
+        return SessionStats(SessionDescriptor(Path("synthetic") / sid, sid, "", sid, sid, 0, "", thread=ThreadInfo(title=sid)))
+
+    first, second = session("first"), session("second")
+    report = UsageReport(sessions=[first, second])
+    start = datetime(2026, 1, 1, 12, tzinfo=LOCAL_TZ)
+    for minute, tokens in ((0, 100), (10, 200), (29, 300), (30, 400), (61, 500)):
+        add_usage(report, first, "test", "test", "default", "", start + timedelta(minutes=minute), Counter(total_tokens=tokens, output_tokens=10, calls=1))
+    add_usage(report, second, "test", "test", "default", "", start + timedelta(minutes=29), Counter(total_tokens=100, output_tokens=90, calls=1))
+    report.billable_events.reverse()
+    records = build_usage_records(report, date(2026, 1, 1))
+    assert records["peak_hour"]["total_tokens"] == 1500
+    assert records["peak_output_hour"]["output_tokens"] == 130
+    assert records["peak_throughput"]["total_tokens"] == 500
+    assert records["peak_output_throughput"]["output_tokens"] == 100
+    for key, seconds in (("peak_hour", 3600), ("peak_output_hour", 3600), ("peak_throughput", 60), ("peak_output_throughput", 60)):
+        peak = records[key]
+        assert peak["window_seconds"] == seconds
+        assert (datetime.fromisoformat(peak["end"]) - datetime.fromisoformat(peak["start"])).total_seconds() == seconds
+    for window_seconds in (60, 3600):
+        boundary_events = [BillableUsageEvent("boundary", "test", "test", "default", start + timedelta(seconds=second * window_seconds / 60), Counter(total_tokens=tokens, output_tokens=10))
+                           for second, tokens in ((0, 100), (30, 200), (59, 300), (60, 400), (121, 500))]
+        peak, _ = peak_usage_windows(boundary_events, window_seconds)
+        assert peak["total_tokens"] == 900  # exact lower boundary is excluded
+    assert records["longest_activity"]["seconds"] == 1800  # >30 min idle splits activity
+    assert records["longest_activity"]["session_id"] == "first"
+    assert records["largest_session"]["total_tokens"] == 1500
+    assert records["current_streak"] == records["longest_streak"] == 1
+    assert build_usage_records(report, date(2026, 1, 2))["current_streak"] == 1
+    assert build_usage_records(report, date(2026, 1, 3))["current_streak"] == 0
+    for day in range(2, 8):
+        # UTC 16:01 belongs to the following local calendar day.
+        timestamp = datetime(2026, 1, day - 1, 16, 1, tzinfo=timezone.utc)
+        add_usage(report, first, "test", "test", "default", "", timestamp, Counter(total_tokens=1, calls=1))
+    records = build_usage_records(report, date(2026, 1, 7))
+    assert records["active_days"] == records["current_streak"] == records["longest_streak"] == 7
+    streak_badge = next(a for a in records["achievements"] if a["id"] == "streak")
+    assert streak_badge["levels"][0]["unlocked_on"] == "2026-01-03"
+    assert streak_badge["levels"][1]["unlocked_on"] == "2026-01-07"
+    assert [level["target"] for level in streak_badge["levels"]] == [3, 7, 14]
+    assert [level["name"] for level in streak_badge["levels"]] == ["铜", "银", "金"]
+    interrupted = build_usage_records(report, date(2026, 1, 10))
+    assert interrupted["current_streak"] == 0 and interrupted["longest_streak"] == 7
+    interrupted_badge = next(a for a in interrupted["achievements"] if a["id"] == "streak")
+    assert interrupted_badge["value"] == 7 and interrupted_badge["current_value"] == 0
+    assert interrupted_badge["levels"][1]["unlocked_on"] == "2026-01-07"
+    unknown_time = session("missing-time")
+    unknown_time.missing_timestamp_events = 1
+    report.sessions.append(unknown_time)
+    add_usage(report, unknown_time, "test", "test", "default", "", start, Counter(total_tokens=100000, calls=1))
+    records = build_usage_records(report, date(2026, 1, 7))
+    assert records["peak_hour"]["total_tokens"] == 1500
+    assert records["excluded_timestamp_sessions"] == 1
+    assert records["largest_session"]["total_tokens"] == 100000
+    milestone_session = session("milestones")
+    milestones = UsageReport(sessions=[milestone_session])
+    for offset in range(365):
+        add_usage(milestones, milestone_session, "test", "test", "default", "", start + timedelta(days=offset), Counter(total_tokens=1, calls=1))
+    for days, streak_levels, active_levels in ((2, 0, 0), (3, 1, 0), (6, 1, 0), (7, 2, 1), (13, 2, 1), (14, 3, 1), (29, 3, 1), (30, 3, 2), (89, 3, 2), (90, 3, 3), (364, 3, 3), (365, 3, 4)):
+        milestone_records = build_usage_records(milestones, start.date() + timedelta(days=days - 1))
+        for badge, expected_levels in zip(milestone_records["achievements"][:2], (streak_levels, active_levels)):
+            assert sum(badge["value"] >= level["target"] for level in badge["levels"]) == expected_levels
+            assert sum(level["unlocked_on"] is not None for level in badge["levels"]) == expected_levels
+    for event in milestones.billable_events:
+        event.timestamp = start + (event.timestamp - start) * 2
+    spaced_records = build_usage_records(milestones, start.date() + timedelta(days=728))
+    assert spaced_records["active_days"] == 365 and spaced_records["longest_streak"] == 1
+    assert all(level["unlocked_on"] is None for level in spaced_records["achievements"][0]["levels"])
+    assert all(level["unlocked_on"] is not None for level in spaced_records["achievements"][1]["levels"])
+    parent, worker = session("parent"), session("worker")
+    worker.descriptor.is_internal = True
+    worker.descriptor.physical_parent_id = parent.descriptor.session_id
+    worker.descriptor.conversation_id = parent.descriptor.session_id
+    fork_time = start + timedelta(days=1)
+    worker.descriptor.created_at = fork_time.isoformat()
+    replay_report = UsageReport(sessions=[parent])
+    replay_report.file_states = {
+        "parent": FileParserState(parent.descriptor), "worker": FileParserState(worker.descriptor),
+    }
+    def turn_uuid(when: datetime) -> str:
+        return str(UUID(int=(int(when.timestamp() * 1000) << 80) | (7 << 76) | (2 << 62)))
+    old_turn, own_turn = turn_uuid(start), turn_uuid(fork_time + timedelta(seconds=10))
+    for physical, turn, when, tokens in (
+        ("parent", old_turn, start, 10),
+        ("worker", old_turn, fork_time + timedelta(milliseconds=250), 100000),
+        ("worker", old_turn, start + timedelta(seconds=60), 20),
+        ("worker", own_turn, fork_time + timedelta(seconds=60), 30),
+        ("worker", "(no-turn)", fork_time + timedelta(seconds=1), 40),
+    ):
+        usage = Counter(total_tokens=tokens, output_tokens=tokens, calls=1)
+        fingerprint = event_fingerprint("parent", turn, "test", "test", "default", "", usage, usage, 0)
+        replay_report.seen_fingerprints[fingerprint] = physical
+        add_usage(replay_report, parent, "test", "test", "default", "", when, usage)
+    replay_records = build_usage_records(replay_report, fork_time.date())
+    assert replay_records["excluded_replay_events"] == 1
+    assert replay_records["excluded_provenance_events"] == 1
+    assert replay_records["peak_hour"]["total_tokens"] == 30
+    assert replay_records["peak_throughput"]["total_tokens"] == 30
+    assert replay_report.totals["total_tokens"] == 100100  # timing views do not change accounting
+    replay_report.seen_fingerprints.pop(next(iter(replay_report.seen_fingerprints)))
+    invalid_provenance = build_usage_records(replay_report, fork_time.date())
+    assert invalid_provenance["excluded_provenance_events"] == 5
+    assert invalid_provenance["peak_hour"] is None
+    assert invalid_provenance["insights"]["worker_count"] == 0
+    assert invalid_provenance["insights"]["first_active_day"] is None
+    assert all(level["unlocked_on"] is None for badge in invalid_provenance["achievements"] for level in badge["levels"])
+
+    # Reported identity is stable across case, whitespace, provider prefix and
+    # service tiers. A pricing alias remains its own reported model identity.
+    explorer = session("explorer")
+    exploration = UsageReport(sessions=[explorer], pricing_aliases={"alias-x": "gpt-x"})
+    for offset, model, tier in (
+        (0, " GPT-X ", "default"), (0, "gpt-x", "priority"),
+        (1, " ANTHROPIC.Claude-Y ", "flex"), (2, "claude-y", "default"),
+        (3, "alias-x", "default"), (4, "gpt-x-fast", "default"),
+        (0, "", "default"), (0, "(unknown)", "default"),
+        (0, "UNKNOWN", "default"), (0, "codex-auto-review", "default"),
+    ):
+        add_usage(exploration, explorer, "test", model, tier, "", start + timedelta(days=offset), Counter(total_tokens=10, output_tokens=2, calls=1))
+    add_usage(exploration, explorer, "test", "unused-model", "default", "", start, Counter(calls=1))
+    exploration_records = build_usage_records(exploration, start.date() + timedelta(days=4))
+    badges = {a["id"]: a for a in exploration_records["achievements"]}
+    assert badges["models"]["value"] == badges["session_models"]["value"] == 4
+    assert badges["models"]["levels"][0]["unlocked_on"] == "2026-01-02"
+    assert [level["unlocked_on"] for level in badges["session_models"]["levels"]] == ["2026-01-02", "2026-01-04", "2026-01-05"]
+    footprints = exploration_records["insights"]["models"]
+    assert [item["id"] for item in footprints[:2]] == ["claude-y", "gpt-x"]
+    footprint_by_id = {item["id"]: item for item in footprints}
+    assert footprint_by_id["gpt-x"]["calls"] == 2 and footprint_by_id["gpt-x"]["total_tokens"] == 20
+    assert footprint_by_id["claude-y"]["first_used"] == "2026-01-02"
+    assert footprint_by_id["claude-y"]["last_used"] == "2026-01-03"
+    assert footprint_by_id["unused-model"]["first_used"] is None
+    assert sum(item["total_tokens"] for item in footprints) == exploration.totals["total_tokens"]
+    assert exploration_records["insights"]["most_models_session"]["models"] == ["alias-x", "claude-y", "gpt-x", "gpt-x-fast"]
+
+    # Total, output and distinct-conversation day records have separate peaks;
+    # ties choose the earliest local day even when events arrive out of order.
+    daily_sessions = [session(f"daily-{index}") for index in range(3)]
+    missing_daily = session("daily-missing")
+    missing_daily.missing_timestamp_events = 1
+    daily_report = UsageReport(sessions=[*daily_sessions, missing_daily])
+    for offset, index, total, output in (
+        (0, 0, 1000, 2), (1, 1, 1000, 1),
+        (2, 0, 50, 45), (2, 1, 50, 45), (3, 0, 50, 45), (3, 1, 50, 45),
+        (4, 0, 1, 0), (4, 1, 1, 0), (4, 2, 1, 0),
+        (5, 0, 1, 0), (5, 1, 1, 0), (5, 2, 1, 0), (6, 0, 100000, 100000),
+    ):
+        stamp = start + timedelta(days=offset)
+        if offset == 4:
+            stamp = datetime(2026, 1, 4, 16, 1, tzinfo=timezone.utc)
+        add_usage(daily_report, daily_sessions[index], "test", f"model-{index}", "default", "", stamp, Counter(total_tokens=total, output_tokens=output, calls=1))
+    add_usage(daily_report, missing_daily, "test", "model-unknown-time", "default", "", start, Counter(total_tokens=1000000, output_tokens=1000000, calls=1))
+    daily_report.billable_events.reverse()
+    daily_records = build_usage_records(daily_report, date(2026, 1, 6))
+    daily_insights = daily_records["insights"]
+    assert daily_insights["first_active_day"] == "2026-01-01"
+    assert daily_insights["peak_day"]["date"] == "2026-01-01"
+    assert daily_insights["peak_day"]["total_tokens"] == 1000
+    assert daily_insights["peak_output_day"]["date"] == "2026-01-03"
+    assert daily_insights["peak_output_day"]["output_tokens"] == 90
+    assert daily_insights["busiest_day"] == {"date": "2026-01-05", "total_tokens": 3, "output_tokens": 0, "calls": 3, "sessions": 3, "models": 3}
+    badges = {a["id"]: a for a in daily_records["achievements"]}
+    assert badges["daily_sessions"]["value"] == 3
+    assert badges["daily_sessions"]["levels"][0]["unlocked_on"] == "2026-01-03"
+    assert badges["sessions"]["value"] == 4 and all(level["unlocked_on"] is None for level in badges["sessions"]["levels"])
+
+    # Count physical participating workers once, preserve logical owners across
+    # full/incremental event representations, and keep orphan usage in totals.
+    team_parent, unknown_parent = session("team-parent"), session("unknown-parent")
+    unknown_parent.missing_timestamp_events = 1
+    team_workers = [session(f"team-worker-{index}") for index in range(5)]
+    orphan = session("orphan-worker")
+    for index, stats in enumerate([*team_workers, orphan]):
+        stats.descriptor.is_internal = True
+        stats.descriptor.created_at = fork_time.isoformat()
+        if stats is not orphan:
+            stats.descriptor.physical_parent_id = unknown_parent.descriptor.session_id if index == 3 else team_parent.descriptor.session_id
+            stats.descriptor.conversation_id = stats.descriptor.physical_parent_id
+    orphan.descriptor.orphan_internal = True
+    orphan.descriptor.physical_parent_id = "unavailable-parent"
+    team_report = UsageReport(sessions=[team_parent, unknown_parent, orphan])
+    team_report.file_states = {
+        stats.descriptor.session_id: FileParserState(stats.descriptor)
+        for stats in [team_parent, unknown_parent, *team_workers, orphan]
+    }
+    for index, (physical, target, offset, tokens, inherited) in enumerate((
+        (team_workers[0], team_parent, 2, 10, False),
+        (team_workers[1], team_parent, 3, 10, False),
+        (team_workers[0], team_parent, 4, 10, False),
+        (team_workers[2], team_parent, 2, 1000000, True),
+        (team_workers[3], unknown_parent, 2, 10, False),
+        (team_workers[4], team_parent, 2, 0, False),
+        (orphan, orphan, 2, 10, False),
+        (team_parent, team_parent, 2, 10, False),
+    )):
+        stamp = start + timedelta(days=offset)
+        usage = Counter(total_tokens=tokens, output_tokens=tokens, calls=1)
+        turn = old_turn if inherited else turn_uuid(stamp)
+        fingerprint = event_fingerprint(target.descriptor.session_id, turn, "test", f"team-model-{index}", "default", "", usage, usage, index)
+        team_report.seen_fingerprints[fingerprint] = physical.descriptor.session_id
+        add_usage(team_report, target, "test", f"team-model-{index}", "default", "", stamp, usage)
+    team_records = build_usage_records(team_report, date(2026, 1, 5))
+    team_badges = {a["id"]: a for a in team_records["achievements"]}
+    assert team_records["insights"]["worker_count"] == 4
+    assert team_records["insights"]["collaborative_sessions"] == team_badges["collaborative_sessions"]["value"] == 2
+    assert team_badges["collaborative_sessions"]["levels"][0]["unlocked_on"] is None
+    assert team_badges["collaborative_days"]["value"] == 3
+    assert team_badges["collaborative_days"]["levels"][0]["unlocked_on"] == "2026-01-05"
+    assert team_records["insights"]["collaborative_days"] == 3
+    assert team_records["insights"]["largest_team_session"] == {"session_id": "team-parent", "title": "team-parent", "worker_count": 2}
+    assert team_badges["sessions"]["value"] == 2
+    assert team_records["insights"]["busiest_day"]["sessions"] == 1
+    assert team_records["insights"]["most_models_session"]["model_count"] == 5
+    assert team_records["excluded_replay_events"] == 1
+    for event, physical in zip(team_report.billable_events, team_report.seen_fingerprints.values()):
+        event.session_id = physical
+    assert build_usage_records(team_report, date(2026, 1, 5)) == team_records
+    # Even a same-length provenance mismatch invalidates every proposed date.
+    first_fingerprint = next(iter(team_report.seen_fingerprints))
+    mismatched_fingerprint = (*first_fingerprint[:3], "different-model", *first_fingerprint[4:])
+    team_report.seen_fingerprints = {
+        mismatched_fingerprint if fingerprint == first_fingerprint else fingerprint: physical
+        for fingerprint, physical in team_report.seen_fingerprints.items()
+    }
+    unpaired_records = build_usage_records(team_report, date(2026, 1, 5))
+    unpaired_badges = {a["id"]: a for a in unpaired_records["achievements"]}
+    assert unpaired_badges["session_models"]["value"] == 5
+    assert unpaired_badges["output_tokens"]["value"] >= 1_000_000
+    assert all(level["unlocked_on"] is None for a in unpaired_records["achievements"] for level in a["levels"])
+    assert all(model["first_used"] is None and model["last_used"] is None for model in unpaired_records["insights"]["models"])
+
+    copied_parent, copied_worker = session("copied-parent"), session("copied-worker")
+    copied_worker.descriptor.is_internal = True
+    copied_worker.descriptor.physical_parent_id = copied_parent.descriptor.session_id
+    copied_worker.descriptor.created_at = fork_time.isoformat()
+    copied_report = UsageReport(sessions=[copied_parent], file_states={
+        "copied-parent": FileParserState(copied_parent.descriptor),
+        "copied-worker": FileParserState(copied_worker.descriptor),
+    })
+    for index, stamp in enumerate((start, fork_time + timedelta(seconds=5))):
+        usage = Counter(total_tokens=10, calls=1)
+        fingerprint = event_fingerprint("copied-parent", old_turn, "test", "test", "default", "", usage, usage, index)
+        copied_report.seen_fingerprints[fingerprint] = "copied-worker"
+        add_usage(copied_report, copied_parent, "test", "test", "default", "", stamp, usage)
+    copied_records = build_usage_records(copied_report, fork_time.date())
+    assert copied_records["insights"]["worker_count"] == copied_records["insights"]["collaborative_sessions"] == 0
+    assert copied_records["insights"]["first_active_day"] == "2026-01-01"
+    assert copied_records["peak_hour"]["total_tokens"] == 10
+    assert next(a for a in copied_records["achievements"] if a["id"] == "collaborative_days")["value"] == 0
+    own_usage = Counter(total_tokens=20, calls=1)
+    copied_report.seen_fingerprints[event_fingerprint("copied-parent", own_turn, "test", "test", "default", "", own_usage, own_usage, 2)] = "copied-worker"
+    add_usage(copied_report, copied_parent, "test", "test", "default", "", fork_time + timedelta(seconds=60), own_usage)
+    own_records = build_usage_records(copied_report, fork_time.date())
+    assert own_records["insights"]["worker_count"] == own_records["insights"]["collaborative_sessions"] == 1
+    assert next(a for a in own_records["achievements"] if a["id"] == "collaborative_sessions")["levels"][0]["unlocked_on"] is None
+    assert own_records["insights"]["collaborative_days"] == 1
+    copied_worker.descriptor.created_at = ""
+    assert build_usage_records(copied_report, fork_time.date())["insights"]["worker_count"] == 0
+    copied_worker.descriptor.created_at = fork_time.isoformat()
+    copied_report.seen_fingerprints = {
+        (fingerprint[0], "(no-turn)", *fingerprint[2:]): physical
+        for fingerprint, physical in copied_report.seen_fingerprints.items()
+    }
+    assert build_usage_records(copied_report, fork_time.date())["insights"]["worker_count"] == 0
+
+    # Many automatic workers in one conversation/day do not advance either
+    # collaboration track more than once. Reuse the same worker across dates.
+    habit_parent = session("habit-parent")
+    habit_report = UsageReport(sessions=[habit_parent])
+    habit_report.file_states[habit_parent.descriptor.session_id] = FileParserState(habit_parent.descriptor)
+    habit_workers = [session(f"habit-worker-{index}") for index in range(100)]
+    for index, worker in enumerate(habit_workers):
+        worker.descriptor.is_internal = True
+        worker.descriptor.physical_parent_id = habit_parent.descriptor.session_id
+        worker.descriptor.created_at = start.isoformat()
+        habit_report.file_states[worker.descriptor.session_id] = FileParserState(worker.descriptor)
+        stamp = start + timedelta(seconds=index + 1)
+        usage = Counter(total_tokens=1, calls=1)
+        habit_report.seen_fingerprints[event_fingerprint("habit-parent", turn_uuid(stamp), "test", "test", "default", "", usage, usage, index)] = worker.descriptor.session_id
+        add_usage(habit_report, habit_parent, "test", "test", "default", "", stamp, usage)
+    burst_records = build_usage_records(habit_report, start.date())
+    burst_badges = {a["id"]: a for a in burst_records["achievements"]}
+    assert burst_records["insights"]["largest_team_session"]["worker_count"] == 100
+    assert burst_badges["collaborative_sessions"]["value"] == burst_badges["collaborative_days"]["value"] == 1
+    assert all(level["unlocked_on"] is None for key in ("collaborative_sessions", "collaborative_days") for level in burst_badges[key]["levels"])
+    for offset in range(1, 100):
+        stamp = start + timedelta(days=offset)
+        usage = Counter(total_tokens=1, calls=1)
+        habit_report.seen_fingerprints[event_fingerprint("habit-parent", turn_uuid(stamp), "test", "test", "default", "", usage, usage, offset + 100)] = habit_workers[0].descriptor.session_id
+        add_usage(habit_report, habit_parent, "test", "test", "default", "", stamp, usage)
+    for target in RECORD_ACHIEVEMENT_TARGETS["collaborative_days"]:
+        for count in (target - 1, target):
+            checked = build_usage_records(habit_report, start.date() + timedelta(days=count - 1))
+            badge = next(a for a in checked["achievements"] if a["id"] == "collaborative_days")
+            assert badge["value"] == count
+            assert sum(level["unlocked_on"] is not None for level in badge["levels"]) == sum(count >= goal for goal in RECORD_ACHIEVEMENT_TARGETS["collaborative_days"])
+        assert next(level for level in badge["levels"] if level["target"] == target)["unlocked_on"] == (start.date() + timedelta(days=target - 1)).isoformat()
+    assert habit_report.totals["total_tokens"] == 199
+
+    # Conversation thresholds count logical conversations, not calls, while
+    # their dates stop at the last eligible threshold crossing.
+    journey = UsageReport(sessions=[])
+    for count in range(1, 502):
+        traveler = session(f"journey-{count}")
+        journey.sessions.append(traveler)
+        stamp = start + timedelta(days=count - 1)
+        add_usage(journey, traveler, "test", "test", "default", "", stamp, Counter(total_tokens=1, calls=1000))
+        if any(abs(count - target) <= 1 for target in CONVERSATION_ACHIEVEMENT_TARGETS):
+            badge = next(a for a in build_usage_records(journey, stamp.date())["achievements"] if a["id"] == "sessions")
+            assert badge["value"] == count
+            for level in badge["levels"]:
+                expected_date = (start.date() + timedelta(days=level["target"] - 1)).isoformat() if count >= level["target"] else None
+                assert level["unlocked_on"] == expected_date
+
+    # Memoized ancestry retains physical-chain semantics even when an ancestor
+    # has its own explicit conversation override, and terminates on cycles.
+    ancestry_root, override_root = session("ancestry-root"), session("override-root")
+    ancestry = [ancestry_root.descriptor, override_root.descriptor]
+    for index in range(1000):
+        descendant = session(f"descendant-{index}").descriptor
+        descendant.is_internal = True
+        descendant.physical_parent_id = ancestry_root.descriptor.session_id if index == 0 else f"descendant-{index - 1}"
+        if index == 0:
+            descendant.conversation_id = override_root.descriptor.session_id
+        ancestry.append(descendant)
+    ancestry_owners = logical_owner_ids(reversed(ancestry))
+    assert ancestry_owners["descendant-0"] == "override-root"
+    assert ancestry_owners["descendant-999"] == "ancestry-root"
+    ancestry[2].physical_parent_id = "descendant-999"
+    cycle_owners = logical_owner_ids(ancestry)
+    assert cycle_owners["descendant-0"] == "override-root"
+    assert cycle_owners["descendant-999"] == "descendant-999"
+
+    # Large cumulative totals with incomplete chronology unlock badges while
+    # dates stay null until eligible events alone cross the exact thresholds.
+    dated_volume, undated_volume = session("dated-volume"), session("undated-volume")
+    undated_volume.missing_timestamp_events = 1
+    volume_report = UsageReport(sessions=[dated_volume, undated_volume])
+    highest_usage = Counter({field_name: RECORD_ACHIEVEMENT_TARGETS[key][-1] for key, field_name in RECORD_VOLUME_FIELDS.items()})
+    highest_usage["calls"] = 1
+    add_usage(volume_report, undated_volume, "test", "volume-model", "default", "", start, highest_usage)
+    dated_cumulative = Counter()
+    for level_index in range(len(ACHIEVEMENT_LEVEL_NAMES)):
+        tier_fields = {key: field_name for key, field_name in RECORD_VOLUME_FIELDS.items() if level_index < len(RECORD_ACHIEVEMENT_TARGETS[key])}
+        below_target = Counter({field_name: RECORD_ACHIEVEMENT_TARGETS[key][level_index] - 1 for key, field_name in tier_fields.items()})
+        delta = Counter({field_name: below_target[field_name] - dated_cumulative[field_name] for field_name in tier_fields.values()})
+        delta["calls"] = 1
+        stamp = start + timedelta(days=level_index * 2 + 1)
+        add_usage(volume_report, dated_volume, "test", "volume-model", "default", "", stamp, delta)
+        before = {a["id"]: a for a in build_usage_records(volume_report, stamp.date())["achievements"]}
+        assert all(before[key]["levels"][level_index]["unlocked_on"] is None for key in tier_fields)
+        step = Counter({field_name: 1 for field_name in tier_fields.values()})
+        step["calls"] = 1
+        add_usage(volume_report, dated_volume, "test", "volume-model", "default", "", stamp + timedelta(days=1), step)
+        dated_cumulative = below_target + step
+        after = {a["id"]: a for a in build_usage_records(volume_report, stamp.date() + timedelta(days=1))["achievements"]}
+        for key, field_name in tier_fields.items():
+            assert after[key]["value"] == after[key]["current_value"] == volume_report.totals[field_name]
+            assert after[key]["levels"][level_index]["unlocked_on"] == (stamp.date() + timedelta(days=1)).isoformat()
+            assert after[key]["unit"] == "Token"
+
+    empty = build_usage_records(UsageReport(sessions=[]), date(2026, 1, 1))
+    assert empty["peak_hour"] is None and empty["peak_throughput"] is None and empty["longest_activity"] is None
+    assert empty["active_days"] == empty["current_streak"] == empty["longest_streak"] == 0
+    assert all(a["value"] == 0 for a in empty["achievements"])
+    assert empty["insights"] == {
+        "first_active_day": None, "model_count": 0, "collaborative_sessions": 0, "worker_count": 0,
+        "peak_day": None, "peak_output_day": None, "busiest_day": None, "most_models_session": None, "models": [],
+        "collaborative_days": 0, "largest_team_session": None,
+    }
+    assert [a["id"] for a in empty["achievements"]] == [
+        "streak", "days", "sessions", "models", "session_models", "daily_sessions", "collaborative_sessions",
+        "collaborative_days", "total_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
+    ]
+    assert [a["category"] for a in empty["achievements"]] == ["habit"] * 3 + ["exploration"] * 3 + ["collaboration"] * 2 + ["volume"] * 4
+    assert [list(level["target"] for level in a["levels"]) for a in empty["achievements"]] == [
+        [3, 7, 14], [7, 30, 90, 365], [10, 30, 100, 500], [2, 4, 6], [2, 3, 4], [2, 4, 8], [3, 10, 30], [3, 10, 30, 100],
+        [100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000], [1_000_000, 5_000_000, 20_000_000, 100_000_000],
+        [500_000, 2_000_000, 10_000_000], [100_000_000, 1_000_000_000, 5_000_000_000],
+    ]
+    assert all(a["rule"] and [level["name"] for level in a["levels"][:3]] == ["铜", "银", "金"] for a in empty["achievements"])
+    assert {a["id"] for a in empty["achievements"] if len(a["levels"]) == 4} == {"days", "sessions", "collaborative_days", "total_tokens", "output_tokens"}
+    assert all(level["hidden"] == (level["name"] == "钻石") for a in empty["achievements"] for level in a["levels"])
+    assert REPORT_SCHEMA_VERSION == 11 and INCREMENTAL_CACHE_VERSION == 3
+
+
 def run_self_test() -> None:
+    run_records_self_test()
     with tempfile.TemporaryDirectory() as temp_dir:
+        empty_report = UsageReport(sessions=[], sessions_root=Path(temp_dir) / "empty")
+        empty_data = build_dashboard_data(empty_report)
+        assert empty_data["totals"]["all"]["total_tokens"] == 0
+        assert empty_data["models"] == []
+        assert empty_data["range"]["start"] == empty_data["range"]["end"]
+        assert "tooltip.textContent = content" in render_html(empty_report)
+        index_file = Path(temp_dir) / "session_index.jsonl"
+        index_file.write_text(json.dumps({"id": "index-only", "thread_name": "Named session"}) + "\n", encoding="utf-8")
+        indexed_info = read_thread_info(Path(temp_dir) / "absent.sqlite", index_file)
+        assert indexed_info["id:index-only"].title == "Named session"
+        assert not (Path(temp_dir) / "absent.sqlite").exists()
         root = Path(temp_dir) / "sessions"
         parent_dir = root / "2026" / "01" / "01"
         child_dir = root / "2026" / "01" / "02"
@@ -4613,6 +5681,10 @@ def run_self_test() -> None:
         ).descriptor.parent_id == parent_id
         assert clean_text({"unexpected": "object"}) == ""
         assert pricing_for_model("gpt-5.6-luna-2026-07-01")[0] == "gpt-5.6-luna"
+        assert pricing_for_model("gpt-6-astra-2026-08-31")[0] == "gpt-6-astra"
+        assert pricing_for_model("gemini-3.8-flash")[1]["input"] == 0.75
+        assert pricing_for_model("claude-fable-5-1")[1]["cached_input"] == 0.25
+        assert pricing_for_model("grok-4.6")[1]["output"] == 6.0
         assert pricing_for_model("gpt-4o-mini-2024-07-18")[0] == "gpt-4o-mini"
         assert pricing_for_model("gpt-4o-2024-05-13")[0] == "gpt-4o-2024-05-13"
         assert pricing_for_model("gpt-3.5-turbo-0125")[0] == "gpt-3.5-turbo-0125"
@@ -4633,9 +5705,12 @@ def run_self_test() -> None:
         priority_cost = estimate_usage_cost(
             "OpenAI", "gpt-5.6-sol", "priority", priced_usage
         )
-        assert abs(priority_cost["estimated_cost_usd"] - 0.0124) < 1e-12
-        assert abs(priority_cost["standard_equivalent_cost_usd"] - 0.0062) < 1e-12
+        assert abs(priority_cost["estimated_cost_usd"] - 0.00932) < 1e-12
+        assert abs(priority_cost["standard_equivalent_cost_usd"] - 0.00466) < 1e-12
         assert abs(priority_cost["cache_write_input_cost_usd"] - 0.001) < 1e-12
+        assert abs(priority_cost["standard_cache_write_input_cost_usd"] - 0.0005) < 1e-12
+        assert abs(priority_cost["standard_cached_input_cost_usd"] - 0.00016) < 1e-12
+        assert abs(priority_cost["cache_savings_usd"] - 2 * priority_cost["standard_cache_savings_usd"]) < 1e-12
         assert priority_cost["priority_tier_calls"] == 1
         assert normalize_service_tier("fast") == "priority"
         assert normalize_provider("openai") == "OpenAI"
@@ -4664,6 +5739,29 @@ def run_self_test() -> None:
         assert gemini_priority["input"] == 4.5
         assert gemini_priority["output"] == 27.0
         assert rates_for_service_tier(gemini_pricing, gemini_standard, "flex")[1]
+        astra_pricing = pricing_for_model("gpt-6-astra")[1]
+        astra_long, astra_is_long = standard_rates_for_usage(
+            astra_pricing, Counter({"input_tokens": LONG_CONTEXT_THRESHOLD + 1})
+        )
+        astra_fast, astra_fast_fallback = rates_for_service_tier(
+            astra_pricing, astra_long, "priority"
+        )
+        assert astra_is_long
+        assert not astra_fast_fallback
+        assert astra_long["input"] == 20.0
+        assert astra_fast["input"] == 40.0
+        assert astra_fast["output"] == 150.0
+        grok_pricing = pricing_for_model("grok-4.6")[1]
+        grok_long, grok_is_long = standard_rates_for_usage(
+            grok_pricing, Counter({"input_tokens": 200_001})
+        )
+        grok_priority, grok_priority_fallback = rates_for_service_tier(
+            grok_pricing, grok_long, "priority"
+        )
+        assert grok_is_long
+        assert grok_long["input"] == 4.0
+        assert grok_priority["input"] == 4.0
+        assert grok_priority_fallback
         gpt55_standard, _ = standard_rates_for_usage(
             pricing_for_model("gpt-5.5")[1], Counter()
         )
@@ -4672,10 +5770,29 @@ def run_self_test() -> None:
         )
         assert gpt55_priority["cache_write_input"] == 12.5
 
-        deepseek_cost = estimate_usage_cost(
-            "Relay", "deepseek-v4-pro", "default", priced_usage
+        deepseek_peak_cost = estimate_usage_cost(
+            "Relay",
+            "deepseek-v4-pro",
+            "default",
+            priced_usage,
+            timestamp=datetime(2026, 9, 7, 2, tzinfo=timezone.utc),
         )
-        assert abs(deepseek_cost["cache_write_input_cost_usd"] - 0.0000435) < 1e-12
+        deepseek_off_peak_cost = estimate_usage_cost(
+            "Relay",
+            "deepseek-v4-pro",
+            "default",
+            priced_usage,
+            timestamp=datetime(2026, 9, 6, 2, tzinfo=timezone.utc),
+        )
+        assert abs(
+            deepseek_peak_cost["cache_write_input_cost_usd"] - 0.000132
+        ) < 1e-12
+        assert abs(
+            deepseek_peak_cost["estimated_cost_usd"] - 0.0012056
+        ) < 1e-12
+        assert abs(
+            deepseek_off_peak_cost["estimated_cost_usd"] - 0.0006028
+        ) < 1e-12
         alias_file = Path(temp_dir) / "token_atlas_pricing.json"
         alias_file.write_text(
             json.dumps(
@@ -4743,6 +5860,8 @@ def run_self_test() -> None:
             if item["model"] == "gpt-5.6-sol" and item["service_tier"] == "priority"
         )
         assert priority_route["daily"]["2026-01-02"]["usage"]["total_tokens"] == 20
+        assert priority_route["standard_rates"]["input"] == 4.0
+        assert priority_route["rates"]["input"] == 8.0
         assert dashboard["pricing"]["hourly"]["all"][4][11]["priority_tier_calls"] == 1
         assert dashboard["pricing"]["timeline_hourly"]["gpt-5.6-sol"]["2026-01-02T11"]["priority_tier_calls"] == 1
         assert dashboard["pricing"]["daily"]["all"]["2026-01-02"]["unpriced_tokens"] == 30
@@ -4808,6 +5927,7 @@ def run_self_test() -> None:
         assert [counter_dict(stats.total) for stats in report.sessions] == [
             counter_dict(stats.total) for stats in fresh_report.sessions
         ]
+        assert build_usage_records(report) == build_usage_records(fresh_report)
 
         qodex_home = Path(temp_dir) / ".qodex"
         qodex_session_dir = qodex_home / "sessions" / "2026" / "01" / "03"
@@ -4877,20 +5997,21 @@ def run_self_test() -> None:
         CACHE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
         legacy_qodex_report = pickle.loads(pickle.dumps(qodex_report))
         del legacy_qodex_report.custom_pricing_models
+        del legacy_qodex_report.billable_events
+        del legacy_qodex_report.pricing_revision
         with qodex_cache_path.open("wb") as handle:
             pickle.dump(
                 IncrementalCacheEnvelope(
                     version=1,
                     source_home=str(qodex_source.home),
-                    auxiliary_manifest=auxiliary_input_manifest(qodex_source),
+                    auxiliary_manifest=legacy_auxiliary_input_manifest(qodex_source),
                     report=legacy_qodex_report,
                 ),
                 handle,
             )
         qodex_cache_path.chmod(0o600)
         migrated_qodex_report = load_incremental_cache(qodex_source)
-        assert migrated_qodex_report is not None
-        assert migrated_qodex_report.custom_pricing_models == set()
+        assert migrated_qodex_report is None
         qodex_cache_path.unlink()
 
         qodex_source.model_aliases_file.write_text(
@@ -4927,7 +6048,7 @@ def run_self_test() -> None:
                     IncrementalCacheEnvelope(
                         version=1,
                         source_home=str(qodex_source.home),
-                        auxiliary_manifest=auxiliary_input_manifest(qodex_source),
+                        auxiliary_manifest=legacy_auxiliary_input_manifest(qodex_source),
                         report=qodex_report,
                     ),
                     handle,
@@ -4935,6 +6056,31 @@ def run_self_test() -> None:
             qodex_cache_path.chmod(0o600)
             assert load_incremental_cache(qodex_source) is None
             save_incremental_cache(qodex_source, qodex_report)
+            qodex_source.model_aliases_file.write_text(
+                json.dumps(
+                    {
+                        "models": {
+                            "gpt-5.6-sol": {
+                                "provider": "Qodex",
+                                "input": 2.0,
+                                "cached_input": 0.5,
+                                "cache_write_input": 2.0,
+                                "output": 4.0,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repriced_qodex = load_incremental_cache(qodex_source)
+            assert repriced_qodex is not None
+            assert repriced_qodex.totals["total_tokens"] == 100
+            assert abs(
+                repriced_qodex.costs_by_model["gpt-5.6-sol"][
+                    "estimated_cost_usd"
+                ]
+                - 0.00022
+            ) < 1e-12
             next_qodex_id = "00000000-0000-4000-8000-000000000005"
             next_qodex_path = qodex_session_dir / f"rollout-{next_qodex_id}.jsonl"
             next_qodex_path.write_text(
@@ -4989,7 +6135,7 @@ def collect_source_usage(source: UsageSource) -> UsageReport:
         if source.read_billing_context
         else {}
     )
-    return collect_usage(
+    report = collect_usage(
         source.sessions_root,
         thread_info=read_thread_info(source.state_db, source.session_index),
         fallback_service_tier=fallback_service_tier,
@@ -5001,6 +6147,8 @@ def collect_source_usage(source: UsageSource) -> UsageReport:
         # compatible local sources remain token-accounting sources.
         pricing_catalog={} if not source.enable_official_pricing else None,
     )
+    report.pricing_revision = pricing_configuration_revision(source)
+    return report
 
 
 def main() -> None:

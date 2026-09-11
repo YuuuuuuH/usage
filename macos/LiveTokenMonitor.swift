@@ -18,7 +18,8 @@ struct LiveTokenUsage: Equatable {
     }
 
     func nonnegativeDelta(from previous: LiveTokenUsage) -> LiveTokenUsage {
-        LiveTokenUsage(
+        if totalTokens < previous.totalTokens { return self }
+        return LiveTokenUsage(
             inputTokens: max(0, inputTokens - previous.inputTokens),
             cachedInputTokens: max(0, cachedInputTokens - previous.cachedInputTokens),
             outputTokens: max(0, outputTokens - previous.outputTokens),
@@ -52,6 +53,32 @@ struct LiveTokenSnapshot {
     let lastEventAt: Date?
     let monitoredFiles: Int
     let pollDurationMilliseconds: Double
+
+    static func combining(_ snapshots: [LiveTokenSnapshot]) -> LiveTokenSnapshot {
+        guard !snapshots.isEmpty else { return .zero }
+
+        let maxSampleCount = snapshots.map(\.samples.count).max() ?? 0
+        let combinedSamples = (0..<maxSampleCount).map { index -> Double in
+            let distanceFromEnd = maxSampleCount - index
+            return snapshots.reduce(0) { result, snapshot in
+                guard snapshot.samples.count >= distanceFromEnd else { return result }
+                return result + snapshot.samples[snapshot.samples.count - distanceFromEnd]
+            }
+        }
+
+        return LiveTokenSnapshot(
+            totalRate: snapshots.reduce(0) { $0 + $1.totalRate },
+            inputRate: snapshots.reduce(0) { $0 + $1.inputRate },
+            cachedRate: snapshots.reduce(0) { $0 + $1.cachedRate },
+            outputRate: snapshots.reduce(0) { $0 + $1.outputRate },
+            intervalUsage: snapshots.reduce(.zero) { $0.adding($1.intervalUsage) },
+            windowUsage: snapshots.reduce(.zero) { $0.adding($1.windowUsage) },
+            samples: combinedSamples,
+            lastEventAt: snapshots.compactMap(\.lastEventAt).max(),
+            monitoredFiles: snapshots.reduce(0) { $0 + $1.monitoredFiles },
+            pollDurationMilliseconds: snapshots.reduce(0) { $0 + $1.pollDurationMilliseconds }
+        )
+    }
 }
 
 struct ParsedLiveTokenEvent {
@@ -195,10 +222,12 @@ final class LiveTokenMonitor {
 
             do {
                 let handle = try FileHandle(forReadingFrom: file.url)
+                defer { try? handle.close() }
                 try handle.seek(toOffset: cursor.offset)
-                let appended = try handle.readToEnd() ?? Data()
-                try? handle.close()
-                cursor.offset = file.size
+                // Read only this snapshot's byte range. The file can grow during
+                // the read; advancing to the earlier stat size would replay bytes.
+                let appended = try handle.read(upToCount: Int(min(file.size - cursor.offset, 4 * 1024 * 1024))) ?? Data()
+                cursor.offset += UInt64(appended.count)
 
                 var bytes = cursor.remainder
                 bytes.append(appended)

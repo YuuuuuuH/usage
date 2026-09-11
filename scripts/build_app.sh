@@ -26,6 +26,18 @@ xcrun swiftc \
   -o "$TEMP_DIR/LiveTokenMonitorTests"
 "$TEMP_DIR/LiveTokenMonitorTests"
 
+xcrun swiftc -O -parse-as-library \
+  "$ROOT_DIR/macos/AtlasTheme.swift" \
+  "$ROOT_DIR/tests/AtlasThemeTests.swift" \
+  -o "$TEMP_DIR/AtlasThemeTests"
+"$TEMP_DIR/AtlasThemeTests"
+
+xcrun swiftc -O -parse-as-library \
+  "$ROOT_DIR/macos/AtlasHoverTooltip.swift" \
+  "$ROOT_DIR/tests/AtlasHoverTooltipTests.swift" \
+  -o "$TEMP_DIR/AtlasHoverTooltipTests"
+"$TEMP_DIR/AtlasHoverTooltipTests"
+
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 
@@ -35,7 +47,9 @@ xcrun swiftc \
   -target arm64-apple-macos12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  "$ROOT_DIR/macos/AtlasTheme.swift" \
   "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
+  "$ROOT_DIR/macos/AtlasHoverTooltip.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-arm64"
 
@@ -45,7 +59,9 @@ xcrun swiftc \
   -target x86_64-apple-macos12.0 \
   -framework AppKit \
   -framework SwiftUI \
+  "$ROOT_DIR/macos/AtlasTheme.swift" \
   "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
+  "$ROOT_DIR/macos/AtlasHoverTooltip.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-x86_64"
 
@@ -56,7 +72,8 @@ xcrun lipo \
   -output "$CONTENTS_DIR/MacOS/CodexTokenAtlas"
 
 install -m 0644 "$ROOT_DIR/macos/Info.plist" "$CONTENTS_DIR/Info.plist"
-install -m 0644 "$ROOT_DIR/assets/AppIcon.icns" "$CONTENTS_DIR/Resources/AppIcon.icns"
+xcrun swift "$ROOT_DIR/scripts/render_icon.swift" "$TEMP_DIR/AppIcon.iconset"
+iconutil -c icns "$TEMP_DIR/AppIcon.iconset" -o "$CONTENTS_DIR/Resources/AppIcon.icns"
 install -m 0644 "$ROOT_DIR/src/codex_token_heatmap.py" "$CONTENTS_DIR/Resources/codex_token_heatmap.py"
 
 codesign --force --deep --sign - "$APP_DIR"
