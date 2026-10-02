@@ -664,6 +664,7 @@ private struct DashboardData: Decodable {
 }
 
 private struct ReportEnvelope: Decodable {
+    let schema_version: Int?
     let source_id: String?
     let source_label: String?
     let sessions_root: String?
@@ -2301,8 +2302,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         setLoading(true, title: "正在刷新 Token 历史", detail: dataHomeLoadingDetail)
         appendLog("\n[\(timestampLabel())] Native app refresh\nData home: \(selectedDataHome.path)\nPython: \(pythonURL.path)\n")
 
+        let snapshotURL = atlasReportSnapshotURL(home: homeURL, dataHome: selectedDataHome)
+        let existingSummaryURL = summaryURL
+        let shouldLoadSnapshot = dashboard == nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            let refreshStarted = Date()
+            if shouldLoadSnapshot {
+                for url in [snapshotURL, existingSummaryURL] {
+                    guard let data = try? Data(contentsOf: url),
+                          let envelope = try? JSONDecoder().decode(ReportEnvelope.self, from: data),
+                          atlasSnapshotMatchesSource(schema: envelope.schema_version,
+                              sessionsRoot: envelope.sessions_root, sourceID: envelope.source_id,
+                              dashboardSourceID: envelope.dashboard.source_id, dataHome: selectedDataHome)
+                    else { continue }
+                    self.appendLog(String(format: "Cached report decoded in %.3fs\n", Date().timeIntervalSince(refreshStarted)))
+                    DispatchQueue.main.async {
+                        guard self.generatorRunning, self.dashboard == nil,
+                              self.dataHomeURL.path == selectedDataHome.path else { return }
+                        self.loadGeneratedReport(envelope, isPreview: true)
+                    }
+                    break
+                }
+            }
             let process = Process()
             process.executableURL = pythonURL
             process.arguments = [generatorURL.path, "--data-home", selectedDataHome.path]
@@ -2317,6 +2339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 if process.terminationStatus == 0 {
                     let data = try Data(contentsOf: self.summaryURL)
                     let envelope = try JSONDecoder().decode(ReportEnvelope.self, from: data)
+                    self.appendLog(String(format: "Native refresh ready in %.3fs\n", Date().timeIntervalSince(refreshStarted)))
                     DispatchQueue.main.async {
                         self.loadGeneratedReport(envelope)
                     }
@@ -2340,7 +2363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         }
     }
 
-    private func loadGeneratedReport(_ envelope: ReportEnvelope) {
+    private func loadGeneratedReport(_ envelope: ReportEnvelope, isPreview: Bool = false) {
         do {
             guard let sessionsRoot = envelope.sessions_root, !sessionsRoot.isEmpty else {
                 throw NSError(
@@ -2373,13 +2396,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             if selectedModel != "all", !loadedDashboard.models.contains(selectedModel) {
                 selectedModel = "all"
             }
+            synchronizeDateSelection(with: loadedDashboard)
+            if isPreview {
+                toolbarStatus.stringValue = "上次统计 · 正在更新"
+                return
+            }
             reconcileHistoricalTotal(loadedDashboard.totals["all"]?.total_tokens ?? 0)
             updateLivePresentationSource()
             lastStatusRateText = nil
             if statusItem != nil {
                 updateStatusItem(rate: latestLiveSnapshot.totalRate)
             }
-            synchronizeDateSelection(with: loadedDashboard)
             generatorRunning = false
             updateModelPricingMenuItem()
             setLoading(false, title: "", detail: "")
@@ -2396,6 +2423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 }
             }
         } catch {
+            if isPreview { return }
             generatorRunning = false
             updateModelPricingMenuItem()
             setLoading(false, title: "", detail: "")
@@ -3461,7 +3489,7 @@ private struct AtlasDashboardView: View {
                 Spacer()
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("正在刷新统计")
+                    Text("正在更新 · 当前显示上次统计")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
                 }

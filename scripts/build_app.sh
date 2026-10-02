@@ -17,6 +17,7 @@ command -v codesign >/dev/null
 
 /usr/bin/python3 -m py_compile "$ROOT_DIR/src/codex_token_heatmap.py"
 /usr/bin/python3 "$ROOT_DIR/src/codex_token_heatmap.py" --self-test
+/usr/bin/python3 -m unittest discover -s "$ROOT_DIR/tests" -p 'test_*.py'
 
 xcrun swiftc \
   -O \
@@ -38,6 +39,12 @@ xcrun swiftc -O -parse-as-library \
   -o "$TEMP_DIR/AtlasHoverTooltipTests"
 "$TEMP_DIR/AtlasHoverTooltipTests"
 
+xcrun swiftc -O -parse-as-library \
+  "$ROOT_DIR/macos/AtlasReportSnapshot.swift" \
+  "$ROOT_DIR/tests/AtlasReportSnapshotTests.swift" \
+  -o "$TEMP_DIR/AtlasReportSnapshotTests"
+"$TEMP_DIR/AtlasReportSnapshotTests"
+
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 
@@ -50,6 +57,7 @@ xcrun swiftc \
   "$ROOT_DIR/macos/AtlasTheme.swift" \
   "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
   "$ROOT_DIR/macos/AtlasHoverTooltip.swift" \
+  "$ROOT_DIR/macos/AtlasReportSnapshot.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-arm64"
 
@@ -62,6 +70,7 @@ xcrun swiftc \
   "$ROOT_DIR/macos/AtlasTheme.swift" \
   "$ROOT_DIR/macos/LiveTokenMonitor.swift" \
   "$ROOT_DIR/macos/AtlasHoverTooltip.swift" \
+  "$ROOT_DIR/macos/AtlasReportSnapshot.swift" \
   "$ROOT_DIR/macos/CodexTokenAtlasApp.swift" \
   -o "$TEMP_DIR/CodexTokenAtlas-x86_64"
 

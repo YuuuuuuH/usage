@@ -14,6 +14,7 @@ import pickle
 import re
 import sqlite3
 import tempfile
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -63,8 +64,8 @@ OUTPUT_ARTIFACTS = (
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 REPORT_SCHEMA_VERSION = 11
-INCREMENTAL_CACHE_VERSION = 3
-INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, 2, INCREMENTAL_CACHE_VERSION}
+INCREMENTAL_CACHE_VERSION = 4
+INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, 2, 3, INCREMENTAL_CACHE_VERSION}
 CACHE_ROOT = HOME / "Library" / "Caches" / "CodexTokenAtlas"
 ALL_MODELS_KEY = "all"
 ACHIEVEMENT_LEVEL_NAMES = ("铜", "银", "金", "钻石")
@@ -154,11 +155,7 @@ def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
                 int(stat.st_mtime_ns),
             ]
         )
-    metadata_paths = [source.state_db, source.session_index, source.model_aliases_file]
-    if source.read_service_tier:
-        metadata_paths.append(source.config_file)
-    if source.read_billing_context:
-        metadata_paths.append(source.auth_file)
+    metadata_paths = [source.state_db, Path(str(source.state_db) + "-wal"), source.session_index, source.model_aliases_file]
     metadata_paths.append(source.home / TOKENIZER_MAP_FILE)
     for path in metadata_paths:
         try:
@@ -167,17 +164,23 @@ def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
         except OSError:
             size, modified = -1, -1
         entries.append([f"@{path.name}", size, modified])
+    # Credentials and unrelated preferences can change frequently. Only the
+    # values consumed by the report participate in snapshot invalidation.
+    entries.append(["@service_tier", source_service_tier(source)])
+    entries.append(["@billing_context", json.dumps(source_billing_context(source), sort_keys=True)])
+    entries.extend(auxiliary_input_manifest(source))
     return entries
 
 
 def cached_summary(
     source: UsageSource,
     manifest: list[list[str | int]],
+    path: Path | None = None,
 ) -> dict[str, Any] | None:
-    if any(not path.is_file() for path in OUTPUT_ARTIFACTS):
+    if path is None and any(not artifact.is_file() for artifact in OUTPUT_ARTIFACTS):
         return None
     try:
-        payload = decode_json(OUTPUT_JSON.read_bytes())
+        payload = decode_json((path or OUTPUT_JSON).read_bytes())
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -207,13 +210,14 @@ def _auxiliary_input_manifest(
     source: UsageSource,
     *,
     include_pricing: bool,
+    legacy: bool = False,
 ) -> list[list[str | int]]:
     paths = [source.home / TOKENIZER_MAP_FILE]
     if include_pricing:
         paths.insert(0, source.model_aliases_file)
-    if source.read_service_tier:
+    if legacy and source.read_service_tier:
         paths.append(source.config_file)
-    if source.read_billing_context:
+    if legacy and source.read_billing_context:
         paths.append(source.auth_file)
     result: list[list[str | int]] = []
     for path in paths:
@@ -244,7 +248,15 @@ def auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
 
 
 def legacy_auxiliary_input_manifest(source: UsageSource) -> list[list[str | int]]:
-    return _auxiliary_input_manifest(source, include_pricing=True)
+    return _auxiliary_input_manifest(source, include_pricing=True, legacy=True)
+
+
+def source_service_tier(source: UsageSource) -> str:
+    return read_configured_service_tier(source.config_file) if source.read_service_tier else DEFAULT_SERVICE_TIER
+
+
+def source_billing_context(source: UsageSource) -> dict[str, Any]:
+    return read_billing_context(source.auth_file) if source.read_billing_context else {}
 
 
 def pricing_configuration_revision(source: UsageSource) -> str:
@@ -274,8 +286,33 @@ def incremental_cache_path(source: UsageSource) -> Path:
     return CACHE_ROOT / f"usage-{digest}.pickle"
 
 
-def load_incremental_cache(source: UsageSource) -> UsageReport | None:
+def source_summary_path(source: UsageSource) -> Path:
+    return incremental_cache_path(source).with_suffix(".json")
+
+
+def tier_cache_path(source: UsageSource, tier: str) -> Path | None:
+    if tier not in {"default", "priority"}:
+        return None
     path = incremental_cache_path(source)
+    return path.with_name(f"{path.stem}-{tier}{path.suffix}")
+
+
+def atomic_write(path: Path, contents: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=path.name + "-", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(contents)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_incremental_cache(source: UsageSource, *, tier_variant: bool = False) -> UsageReport | None:
+    path = tier_cache_path(source, source_service_tier(source)) if tier_variant else incremental_cache_path(source)
+    if path is None:
+        return None
     try:
         stat = path.lstat()
         if path.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o022:
@@ -300,13 +337,19 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
         return None
     expected_auxiliary_manifest = (
         legacy_auxiliary_input_manifest(source)
-        if envelope.version < INCREMENTAL_CACHE_VERSION
+        if envelope.version < 3
         else auxiliary_input_manifest(source)
     )
-    if envelope.auxiliary_manifest != expected_auxiliary_manifest:
+    # Migrate existing caches without rereading history merely because auth
+    # tokens rotated or a non-accounting config preference changed.
+    runtime_paths = {str(source.auth_file), str(source.config_file)}
+    stored_manifest = [entry for entry in envelope.auxiliary_manifest if entry[0] not in runtime_paths]
+    expected_manifest = [entry for entry in expected_auxiliary_manifest if entry[0] not in runtime_paths]
+    if stored_manifest != expected_manifest:
         return None
     if not isinstance(envelope.report, UsageReport):
         return None
+    envelope.report.billing_context = source_billing_context(source)
     if envelope.version == 1:
         base_catalog = PRICING_USD_PER_MTOK if source.enable_official_pricing else {}
         _, configured_custom_models, _ = read_pricing_config(
@@ -321,8 +364,14 @@ def load_incremental_cache(source: UsageSource) -> UsageReport | None:
         envelope.report.billable_events = []
     if not hasattr(envelope.report, "pricing_revision"):
         envelope.report.pricing_revision = ""
+    if not hasattr(envelope.report, "inferred_tier_fingerprints"):
+        envelope.report.inferred_tier_fingerprints = set()
+    desired_tier = source_service_tier(source)
+    tier_changed = envelope.report.configured_service_tier_fallback != desired_tier
+    if tier_changed and not retier_inferred_usage(envelope.report, desired_tier):
+        return None if tier_variant else load_incremental_cache(source, tier_variant=True)
     desired_pricing_revision = pricing_configuration_revision(source)
-    if envelope.report.pricing_revision != desired_pricing_revision:
+    if tier_changed or envelope.report.pricing_revision != desired_pricing_revision:
         catalog, aliases, custom_models, errors = current_pricing_configuration(source)
         # Older cache schemas did not retain the per-call timestamp/context needed
         # for exact repricing. Rebuild them once rather than silently revaluing only
@@ -357,6 +406,12 @@ def save_incremental_cache(source: UsageSource, report: UsageReport) -> None:
             pickle.dump(envelope, handle, protocol=pickle.HIGHEST_PROTOCOL)
         temporary_path.chmod(0o600)
         temporary_path.replace(incremental_cache_path(source))
+        variant = tier_cache_path(source, report.configured_service_tier_fallback)
+        if variant is not None:
+            # Atomic replacements keep prior tier snapshots intact. Hard links
+            # avoid serializing or storing the current report twice.
+            os.link(incremental_cache_path(source), temporary_path)
+            temporary_path.replace(variant)
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
@@ -968,6 +1023,7 @@ class SessionDescriptor:
     orphan_internal: bool = False
     context_window: int = 0
     thread: ThreadInfo = field(default_factory=ThreadInfo)
+    leading_meta: list[dict[str, Any]] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -1036,6 +1092,7 @@ class BillableUsageEvent:
     service_tier: str
     timestamp: datetime
     usage: Counter
+    service_tier_inferred: bool | None = None
 
 
 @dataclass
@@ -1119,6 +1176,9 @@ class UsageReport:
         default_factory=dict,
         repr=False,
     )
+    inferred_tier_fingerprints: set[tuple[Any, ...]] = field(default_factory=set, repr=False)
+    tier_change_requires_rebuild: bool = False
+    records_cache: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -1415,14 +1475,22 @@ def lineage_depth(session_id: str, parent_map: dict[str, str]) -> int:
 def discover_sessions(
     sessions_root: Path,
     thread_info: dict[str, ThreadInfo],
+    cached_states: dict[str, FileParserState] | None = None,
 ) -> list[SessionDescriptor]:
     paths = sorted(sessions_root.rglob("*.jsonl"))
     leading_meta: dict[Path, list[dict[str, Any]]] = {}
     physical_parent_map: dict[str, str] = {}
     user_parent_map: dict[str, str] = {}
+    path_keys = {path: normalized_path(path) for path in paths}
 
     for path in paths:
-        rows = read_leading_session_meta(path)
+        state = (cached_states or {}).get(path_keys[path])
+        stat = path.stat()
+        if (state is not None and state.descriptor.leading_meta is not None
+            and stat.st_size == state.size and stat.st_mtime_ns == state.mtime_ns):
+            rows = state.descriptor.leading_meta
+        else:
+            rows = read_leading_session_meta(path)
         leading_meta[path] = rows
         for row in rows:
             if row["id"]:
@@ -1456,7 +1524,8 @@ def discover_sessions(
                 conversation_id=str(first.get("conversation_id") or ""),
                 is_internal=bool(first.get("is_internal")),
                 context_window=safe_int(first.get("context_window")),
-                thread=thread_info.get(normalized_path(path), thread_info.get(f"id:{session_id}", ThreadInfo())),
+                thread=thread_info.get(path_keys[path], thread_info.get(f"id:{session_id}", ThreadInfo())),
+                leading_meta=rows,
             )
         )
 
@@ -2220,6 +2289,51 @@ def reprice_usage_report(report: UsageReport) -> None:
             stats.costs_by_day_model[day][event.model].update(cost)
 
 
+def retier_inferred_usage(report: UsageReport, service_tier: str) -> bool:
+    """Rebuild route aggregates from recorded calls when the fallback tier changes."""
+    if report.tier_change_requires_rebuild:
+        return False
+    owners = {state.descriptor.session_id: state.logical_owner_id for state in report.file_states.values()}
+    if record_event_provenance(report, owners) is None:
+        return False
+    seen: dict[tuple[Any, ...], str] = {}
+    inferred: set[tuple[Any, ...]] = set()
+    for event, (fingerprint, owner) in zip(report.billable_events, report.seen_fingerprints.items()):
+        if event.service_tier_inferred is None:
+            return False  # Legacy caches need one parse to establish attribution.
+        if event.service_tier_inferred:
+            fingerprint = (*fingerprint[:4], service_tier, *fingerprint[5:])
+            inferred.add(fingerprint)
+        if fingerprint in seen:
+            return False  # A tier change can alter replay deduplication.
+        seen[fingerprint] = owner
+
+    report.seen_fingerprints = seen
+    report.inferred_tier_fingerprints = inferred
+    report.totals_by_service_tier.clear()
+    report.usage_by_route.clear()
+    report.usage_by_day_route.clear()
+    sessions = {stats.descriptor.session_id: stats for stats in report.sessions}
+    for stats in report.sessions:
+        stats.by_service_tier.clear()
+        stats.by_route.clear()
+    for event in report.billable_events:
+        if event.service_tier_inferred:
+            event.service_tier = service_tier
+        route = (event.route_provider, event.model, event.service_tier)
+        report.totals_by_service_tier[event.service_tier].update(event.usage)
+        report.usage_by_route[route].update(event.usage)
+        report.usage_by_day_route[event.timestamp.date()][route].update(event.usage)
+        stats = sessions[owners.get(event.session_id, event.session_id)]
+        stats.by_service_tier[event.service_tier].update(event.usage)
+        stats.by_route[route].update(event.usage)
+    for state in report.file_states.values():
+        if not state.service_tier_from_event:
+            state.active_service_tier = service_tier
+    report.configured_service_tier_fallback = service_tier
+    return True
+
+
 def event_fingerprint(
     root_id: str,
     turn_id: str,
@@ -2253,7 +2367,10 @@ def add_usage(
     reasoning_effort: str,
     timestamp: datetime,
     usage: Counter,
+    *,
+    service_tier_inferred: bool = False,
 ) -> None:
+    report.records_cache = None
     report.billable_events.append(BillableUsageEvent(
         session_id=stats.descriptor.session_id,
         route_provider=route_provider,
@@ -2261,6 +2378,7 @@ def add_usage(
         service_tier=service_tier,
         timestamp=timestamp,
         usage=Counter(usage),
+        service_tier_inferred=service_tier_inferred,
     ))
     day = timestamp.date()
     hour = timestamp.replace(minute=0, second=0, microsecond=0)
@@ -2666,6 +2784,8 @@ def collect_usage(
                     }
                 )
                 if owner is not None:
+                    if (fingerprint in report.inferred_tier_fingerprints) != service_tier_fallback:
+                        report.tier_change_requires_rebuild = True
                     previous_cumulative = current_cumulative
                     report.duplicate_events += 1
                     if owner == descriptor.session_id:
@@ -2676,6 +2796,8 @@ def collect_usage(
                         report.inherited_events += 1
                     continue
                 seen[fingerprint] = descriptor.session_id
+                if service_tier_fallback:
+                    report.inferred_tier_fingerprints.add(fingerprint)
                 if provider_fallback:
                     stats.fallback_provider_events += 1
                 if service_tier_fallback:
@@ -2712,6 +2834,7 @@ def collect_usage(
                     active_reasoning_effort,
                     timestamp,
                     usage,
+                    service_tier_inferred=service_tier_fallback,
                 )
 
         report.fallback_delta_events += stats.fallback_delta_events
@@ -2961,6 +3084,8 @@ def process_incremental_file(
                 }
             )
             if owner is not None:
+                if (fingerprint in report.inferred_tier_fingerprints) != service_tier_fallback:
+                    report.tier_change_requires_rebuild = True
                 state.previous_cumulative = current_cumulative
                 report.duplicate_events += 1
                 if owner == descriptor.session_id:
@@ -2971,6 +3096,8 @@ def process_incremental_file(
                     report.inherited_events += 1
                 continue
             report.seen_fingerprints[fingerprint] = descriptor.session_id
+            if service_tier_fallback:
+                report.inferred_tier_fingerprints.add(fingerprint)
             if provider_fallback:
                 target.fallback_provider_events += 1
                 report.fallback_provider_events += 1
@@ -3022,6 +3149,7 @@ def process_incremental_file(
                 state.active_reasoning_effort,
                 timestamp,
                 usage,
+                service_tier_inferred=service_tier_fallback,
             )
 
     try:
@@ -3035,11 +3163,11 @@ def process_incremental_file(
 
 def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
     report = load_incremental_cache(source)
-    if report is None or not report.file_states or not report.seen_fingerprints:
+    if report is None:
         return None
 
     thread_info = read_thread_info(source.state_db, source.session_index)
-    descriptors = discover_sessions(source.sessions_root, thread_info)
+    descriptors = discover_sessions(source.sessions_root, thread_info, report.file_states)
     descriptors_by_path = {
         normalized_path(descriptor.path): descriptor for descriptor in descriptors
     }
@@ -3061,20 +3189,16 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
             return None
         if stat.st_size == state.size and stat.st_mtime_ns != state.mtime_ns:
             return None
+        if descriptor.thread.title != state.descriptor.thread.title:
+            report.records_cache = None
         state.descriptor = descriptor
 
     logical_by_id = {
         stats.descriptor.session_id: stats for stats in report.sessions
     }
+    descriptors_by_id = {descriptor.session_id: descriptor for descriptor in descriptors}
     for stats in report.sessions:
-        current = next(
-            (
-                descriptor
-                for descriptor in descriptors
-                if descriptor.session_id == stats.descriptor.session_id
-            ),
-            None,
-        )
+        current = descriptors_by_id.get(stats.descriptor.session_id)
         if current is not None:
             stats.descriptor.thread = current.thread
 
@@ -3083,6 +3207,8 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
         for descriptor in descriptors
         if normalized_path(descriptor.path) not in report.file_states
     ]
+    if new_descriptors:
+        report.records_cache = None
     for descriptor in new_descriptors:
         owner_id = owner_ids.get(descriptor.session_id, descriptor.session_id)
         if owner_id != descriptor.session_id:
@@ -3643,6 +3769,13 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
     }
 
 
+def cached_usage_records(report: UsageReport) -> dict[str, Any]:
+    today = datetime.now(LOCAL_TZ).date()
+    if report.records_cache is None or report.records_cache.get("as_of") != today.isoformat():
+        report.records_cache = build_usage_records(report, today)
+    return report.records_cache
+
+
 def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
     models = sorted(
         report.totals_by_model,
@@ -3843,7 +3976,7 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
         "timeline_hourly": timeline_hourly,
         "daily": daily,
         "sessions": sessions,
-        "records": build_usage_records(report),
+        "records": cached_usage_records(report),
         "audit": {
             "session_files": report.rollout_files,
             "sessions_with_usage": sum(
@@ -4774,8 +4907,9 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
 """
 
 
-def render_html(report: UsageReport) -> str:
-    dashboard_data = build_dashboard_data(report)
+def render_html(report: UsageReport, dashboard_data: dict[str, Any] | None = None) -> str:
+    if dashboard_data is None:
+        dashboard_data = build_dashboard_data(report)
     encoded = json.dumps(dashboard_data, ensure_ascii=False, separators=(",", ":"))
     encoded = encoded.replace("<", "\\u003c").replace("&", "\\u0026")
     return (
@@ -4980,7 +5114,10 @@ def write_session_csv(report: UsageReport, path: Path = OUTPUT_SESSION_CSV) -> N
 def summary_payload(
     report: UsageReport,
     input_manifest: list[list[str | int]] | None = None,
+    dashboard: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if dashboard is None:
+        dashboard = build_dashboard_data(report)
     active_days = sorted(report.by_day)
     models = {
         model: counter_dict(usage)
@@ -5006,7 +5143,7 @@ def summary_payload(
         "source_id": report.source_key,
         "source_label": report.source_label,
         "sessions_root": str(report.sessions_root),
-        "dashboard": build_dashboard_data(report),
+        "dashboard": dashboard,
         "totals": counter_dict(report.totals),
         "usage_by_model": models,
         "usage_by_provider": {
@@ -5021,7 +5158,8 @@ def summary_payload(
             effort: counter_dict(usage)
             for effort, usage in sorted(report.totals_by_reasoning_effort.items())
         },
-        "pricing": build_pricing_data(report, list(models)),
+        "pricing": {key: value for key, value in dashboard["pricing"].items()
+                    if key not in {"hourly", "daily", "timeline_hourly"}},
         "date_range": {
             "first": active_days[0].isoformat() if active_days else None,
             "last": active_days[-1].isoformat() if active_days else None,
@@ -5072,18 +5210,26 @@ def write_outputs(
     report: UsageReport,
     input_manifest: list[list[str | int]] | None = None,
 ) -> dict[str, Any]:
-    OUTPUT_HTML.write_text(render_html(report), encoding="utf-8")
+    summary = summary_payload(report, input_manifest)
+    write_export_outputs(report, summary["dashboard"])
+    write_summary_outputs(summary)
+    return summary
+
+
+def write_summary_outputs(summary: dict[str, Any], source: UsageSource | None = None) -> None:
+    encoded = json.dumps(summary, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    atomic_write(OUTPUT_JSON, encoded)
+    if source is not None:
+        atomic_write(source_summary_path(source), encoded)
+
+
+def write_export_outputs(report: UsageReport, dashboard: dict[str, Any]) -> None:
+    atomic_write(OUTPUT_HTML, render_html(report, dashboard).encode("utf-8"))
     write_daily_csv(report)
     write_hourly_csv(report)
     write_model_csv(report)
     write_route_csv(report)
     write_session_csv(report)
-    summary = summary_payload(report, input_manifest)
-    OUTPUT_JSON.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return summary
 
 
 def synthetic_event(
@@ -5481,7 +5627,7 @@ def run_records_self_test() -> None:
     assert all(a["rule"] and [level["name"] for level in a["levels"][:3]] == ["铜", "银", "金"] for a in empty["achievements"])
     assert {a["id"] for a in empty["achievements"] if len(a["levels"]) == 4} == {"days", "sessions", "collaborative_days", "total_tokens", "output_tokens"}
     assert all(level["hidden"] == (level["name"] == "钻石") for a in empty["achievements"] for level in a["levels"])
-    assert REPORT_SCHEMA_VERSION == 11 and INCREMENTAL_CACHE_VERSION == 3
+    assert REPORT_SCHEMA_VERSION == 11 and INCREMENTAL_CACHE_VERSION == 4
 
 
 def run_self_test() -> None:
@@ -6125,16 +6271,8 @@ def run_self_test() -> None:
 
 
 def collect_source_usage(source: UsageSource) -> UsageReport:
-    fallback_service_tier = (
-        read_configured_service_tier(source.config_file)
-        if source.read_service_tier
-        else DEFAULT_SERVICE_TIER
-    )
-    billing_context = (
-        read_billing_context(source.auth_file)
-        if source.read_billing_context
-        else {}
-    )
+    fallback_service_tier = source_service_tier(source)
+    billing_context = source_billing_context(source)
     report = collect_usage(
         source.sessions_root,
         thread_info=read_thread_info(source.state_db, source.session_index),
@@ -6175,19 +6313,32 @@ def main() -> None:
             f"Compatible sessions directory not found: {source.sessions_root}"
         )
 
+    started = time.perf_counter()
     input_manifest = source_input_manifest(source)
+    scanned = time.perf_counter()
     summary = cached_summary(source, input_manifest)
     if summary is None:
         report = incrementally_refresh_usage(source)
         if report is None:
-            print("Parser cache unavailable; rebuilding full history.")
+            print("Parser cache unavailable or accounting inputs changed; rebuilding full history.", flush=True)
             report = collect_source_usage(source)
         else:
-            print("Loaded the source-specific parser cache; processed appended data only.")
-        summary = write_outputs(report, input_manifest)
+            print("Loaded the source-specific parser cache; processed appended data only.", flush=True)
+        parsed = time.perf_counter()
+        summary = summary_payload(report, input_manifest)
+        aggregated = time.perf_counter()
+        write_export_outputs(report, summary["dashboard"])
+        write_summary_outputs(summary, source)
+        exported = time.perf_counter()
         save_incremental_cache(source, report)
+        print(f"Refresh timing: manifest={scanned-started:.3f}s parse={parsed-scanned:.3f}s "
+              f"aggregate={aggregated-parsed:.3f}s export={exported-aggregated:.3f}s "
+              f"cache={time.perf_counter()-exported:.3f}s", flush=True)
     else:
         print("Usage inputs unchanged; reused the existing report.")
+        if not source_summary_path(source).is_file():
+            write_summary_outputs(summary, source)
+    print(f"Refresh completed in {time.perf_counter()-started:.3f}s", flush=True)
     totals = summary["totals"]
 
     print(f"Data source: {source.label} ({source.home})")
