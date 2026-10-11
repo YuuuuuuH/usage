@@ -27,21 +27,29 @@ jobs:
           set -euo pipefail
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/Info.plist)"
           tag="v${version}"
-          release_dmg_path="dist/Codex-Token-Atlas.dmg"
-          cp "dist/Codex Token Atlas.dmg" "$release_dmg_path"
-          (cd dist && shasum -a 256 "Codex-Token-Atlas.dmg" > "Codex-Token-Atlas.dmg.sha256")
+          release_dmg_path="dist/Token-Atlas.dmg"
+          cp "dist/Token Atlas.dmg" "$release_dmg_path"
+          (cd dist && shasum -a 256 "Token-Atlas.dmg" > "Token-Atlas.dmg.sha256")
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "title=Codex Token Atlas ${version}" >> "$GITHUB_OUTPUT"
+          echo "title=Token Atlas ${version}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
+          set -euo pipefail
+          release_notes="docs/releases/${RELEASE_VERSION}.md"
+          notes_args=(--generate-notes)
+          if [[ -f "$release_notes" ]]; then
+            notes_args=(--notes-file "$release_notes")
+          fi
           gh release create "$RELEASE_TAG" \
-            "dist/Codex-Token-Atlas.dmg" \
-            "dist/Codex-Token-Atlas.dmg.sha256" \
+            "dist/Token-Atlas.dmg" \
+            "dist/Token-Atlas.dmg.sha256" \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
-            --notes "Automated installer build for commit $GITHUB_SHA on $GITHUB_REF_NAME."
+            "${notes_args[@]}"
