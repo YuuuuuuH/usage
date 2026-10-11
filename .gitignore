@@ -12,3 +12,7 @@ dist/
 /codex_token_usage_by_route.csv
 /codex_token_usage_by_session.csv
 /codex_token_usage_summary.json
+
+/token_atlas.html
+/token_atlas_usage_*.csv
+/token_atlas_usage_summary.json

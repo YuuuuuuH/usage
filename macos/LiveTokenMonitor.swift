@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 struct LiveTokenUsage: Equatable {
     var inputTokens: Int64 = 0
@@ -113,7 +114,9 @@ final class LiveTokenMonitor {
         let usage: LiveTokenUsage
     }
 
-    private let sessionRoot: URL
+    private let sessionRoots: [URL]
+    private let claude: Bool
+    private var claudeMessages: [String: LiveTokenUsage] = [:]
     private let callback: SnapshotHandler
     private let queue = DispatchQueue(label: "local.codex.token-atlas.live", qos: .utility)
     private let fileManager = FileManager.default
@@ -125,8 +128,13 @@ final class LiveTokenMonitor {
     private var rateSamples: [Double] = []
     private var lastEventAt: Date?
 
-    init(sessionRoot: URL, callback: @escaping SnapshotHandler) {
-        self.sessionRoot = sessionRoot
+    convenience init(sessionRoot: URL, callback: @escaping SnapshotHandler) {
+        self.init(sessionRoots: [sessionRoot], callback: callback)
+    }
+
+    init(sessionRoots: [URL], claude: Bool = false, callback: @escaping SnapshotHandler) {
+        self.sessionRoots = sessionRoots
+        self.claude = claude
         self.callback = callback
     }
 
@@ -159,6 +167,7 @@ final class LiveTokenMonitor {
             self.timer = nil
             self.initialized = false
             self.cursors.removeAll()
+            self.claudeMessages.removeAll()
             self.windowEvents.removeAll()
             self.rateSamples.removeAll()
             self.lastEventAt = nil
@@ -180,6 +189,7 @@ final class LiveTokenMonitor {
 
     private func baselineCurrentFiles() {
         let files = sessionFiles()
+        if claude { files.forEach { baselineClaudeFile($0.url) } }
         cursors = Dictionary(uniqueKeysWithValues: files.map { file in
             (file.url.path, Cursor(offset: file.size))
         })
@@ -199,6 +209,7 @@ final class LiveTokenMonitor {
             guard var cursor = cursors[path] else {
                 // A newly discovered rollout may be a fork containing inherited history.
                 cursors[path] = Cursor(offset: file.size, ignoreUntil: now.addingTimeInterval(5))
+                if claude { baselineClaudeFile(file.url) }
                 continue
             }
             if file.size < cursor.offset {
@@ -208,6 +219,7 @@ final class LiveTokenMonitor {
             }
             if let ignoreUntil = cursor.ignoreUntil {
                 if file.size != cursor.offset {
+                    if claude { baselineClaudeFile(file.url) }
                     cursor.offset = file.size
                     cursor.remainder.removeAll(keepingCapacity: true)
                     cursor.ignoreUntil = now.addingTimeInterval(5)
@@ -235,9 +247,16 @@ final class LiveTokenMonitor {
                 for index in bytes.indices where bytes[index] == 0x0A {
                     let line = bytes.subdata(in: lineStart..<index)
                     lineStart = bytes.index(after: index)
-                    guard let parsed = Self.parseTokenCountLine(line, previousCumulative: cursor.cumulative) else { continue }
-                    cursor.cumulative = parsed.cumulative
-                    guard cursor.remember(parsed.fingerprint), let usage = parsed.usage else { continue }
+                    let usage: LiveTokenUsage
+                    if claude {
+                        guard let delta = Self.claudeDelta(line, seen: &claudeMessages), delta.totalTokens > 0 else { continue }
+                        usage = delta
+                    } else {
+                        guard let parsed = Self.parseTokenCountLine(line, previousCumulative: cursor.cumulative) else { continue }
+                        cursor.cumulative = parsed.cumulative
+                        guard cursor.remember(parsed.fingerprint), let parsedUsage = parsed.usage else { continue }
+                        usage = parsedUsage
+                    }
                     intervalUsage = intervalUsage.adding(usage)
                     windowEvents.append(WindowEvent(observedAt: now, usage: usage))
                     lastEventAt = now
@@ -280,18 +299,63 @@ final class LiveTokenMonitor {
 
     private func sessionFiles() -> [(url: URL, size: UInt64)] {
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        var files: [(URL, UInt64)] = []
+        var seen = Set<String>()
+        for sessionRoot in sessionRoots {
         guard let enumerator = fileManager.enumerator(
             at: sessionRoot,
             includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return [] }
+        ) else { continue }
 
-        var files: [(URL, UInt64)] = []
         for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            if url.pathComponents.contains("skills-plugin") || url.pathComponents.contains("memory") { continue }
             guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else { continue }
+            guard seen.insert(url.standardizedFileURL.resolvingSymlinksInPath().path).inserted else { continue }
             files.append((url, UInt64(max(0, values.fileSize ?? 0))))
         }
+        }
         return files
+    }
+
+    private func baselineClaudeFile(_ url: URL) {
+        guard let bytes = try? Data(contentsOf: url) else { return }
+        var start = bytes.startIndex
+        for index in bytes.indices where bytes[index] == 0x0A {
+            _ = Self.claudeDelta(bytes.subdata(in: start..<index), seen: &claudeMessages)
+            start = bytes.index(after: index)
+        }
+    }
+
+    static func claudeDelta(_ line: Data, seen: inout [String: LiveTokenUsage]) -> LiveTokenUsage? {
+        guard let root = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+              root["type"] as? String == "assistant", let message = root["message"] as? [String: Any],
+              let fields = message["usage"] as? [String: Any],
+              fields["input_tokens"] != nil || fields["output_tokens"] != nil,
+              let identity = (message["id"] as? String) ?? (root["requestId"] as? String), !identity.isEmpty
+        else { return nil }
+        guard (message["role"] as? String ?? "assistant") == "assistant" else { return nil }
+        let names = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        for name in names {
+            if let value = fields[name] {
+                guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      number.doubleValue >= 0, number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+            }
+        }
+        let input = integer(fields["input_tokens"]) + integer(fields["cache_read_input_tokens"]) + integer(fields["cache_creation_input_tokens"])
+        let output = integer(fields["output_tokens"])
+        let usage = LiveTokenUsage(inputTokens: input, cachedInputTokens: integer(fields["cache_read_input_tokens"]),
+                                   outputTokens: output, totalTokens: input + output)
+        if let previous = seen[identity] {
+            guard output > previous.outputTokens || (output == previous.outputTokens && input > previous.inputTokens) else { return .zero }
+            seen[identity] = usage
+            return LiveTokenUsage(inputTokens: max(0, input - previous.inputTokens),
+                cachedInputTokens: max(0, usage.cachedInputTokens - previous.cachedInputTokens),
+                outputTokens: output - previous.outputTokens,
+                totalTokens: max(0, input - previous.inputTokens) + output - previous.outputTokens)
+        }
+        seen[identity] = usage
+        return usage
     }
 
     static func parseTokenCountLine(_ line: Data, previousCumulative: LiveTokenUsage? = nil) -> ParsedLiveTokenEvent? {

@@ -24,7 +24,8 @@ enum AtlasThemeTests {
         theme.setColor(AtlasTheme.color(hex: "#258279")!)
         precondition(theme.accentHex == "#258279")
         precondition(AtlasMedal(name: "铜") == .bronze && AtlasMedal(name: "银") == .silver && AtlasMedal(name: "金") == .gold)
-        precondition(AtlasMedal(name: "钻石") == .diamond && AtlasMedal.allCases.count == 4)
+        precondition(AtlasMedal(name: "钻石") == .diamond && AtlasMedal.allCases.count == 6)
+        precondition(AtlasMedal(name: "星耀") == .star && AtlasMedal(name: "传奇") == .legend)
         precondition(AtlasMedal(name: "待解锁") == nil)
         for dark in [false, true] {
             for background in AtlasMedal.diamondCardColors(dark: dark) {

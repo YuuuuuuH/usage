@@ -24,6 +24,15 @@ enum LiveTokenMonitorTests {
         let unrelatedLine = Data(#"{"type":"event_msg","payload":{"type":"agent_message"}}"#.utf8)
         try require(LiveTokenMonitor.parseTokenCountLine(unrelatedLine) == nil, "non-token event was accepted")
 
+        var seen: [String: LiveTokenUsage] = [:]
+        let claudeLine = Data(#"{"type":"assistant","message":{"id":"msg-a","usage":{"input_tokens":100,"cache_read_input_tokens":300,"cache_creation_input_tokens":50,"output_tokens":20}}}"#.utf8)
+        try require(LiveTokenMonitor.claudeDelta(claudeLine, seen: &seen)?.totalTokens == 470, "Claude cache categories differ")
+        try require(LiveTokenMonitor.claudeDelta(claudeLine, seen: &seen) == .zero, "Claude repeated content block was counted twice")
+        let updated = Data(String(decoding: claudeLine, as: UTF8.self).replacingOccurrences(of: "\"output_tokens\":20", with: "\"output_tokens\":30").utf8)
+        try require(LiveTokenMonitor.claudeDelta(updated, seen: &seen)?.totalTokens == 10, "Claude streaming delta differs")
+        try require(LiveTokenMonitor.claudeDelta(claudeLine, seen: &seen) == .zero, "Claude replay moved usage backwards")
+        try require(LiveTokenMonitor.claudeDelta(lastUsageLine, seen: &seen) == nil, "Codex was parsed as Claude")
+
         try testCombinedSnapshots()
         try testIncrementalSampling(historicalLine: lastUsageLine)
         print("Live token monitor tests passed")

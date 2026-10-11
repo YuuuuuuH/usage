@@ -24,7 +24,7 @@ private func normalizedDataHomeURL(_ candidate: URL) -> URL {
         atPath: nestedSessions.path,
         isDirectory: &nestedIsDirectory
     ) && nestedIsDirectory.boolValue
-    if normalized.lastPathComponent == "sessions", !hasNestedSessions {
+    if ["sessions", "projects"].contains(normalized.lastPathComponent), !hasNestedSessions {
         return normalized.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
     }
     return normalized
@@ -32,7 +32,6 @@ private func normalizedDataHomeURL(_ candidate: URL) -> URL {
 
 private func defaultDataHomeURL() -> URL {
     FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".codex", isDirectory: true)
         .standardizedFileURL
 }
 
@@ -560,7 +559,8 @@ private struct UsageRecords: Decodable {
             let target: Int
             let unlocked_on: String?
             var hidden: Bool? = nil
-            var isHidden: Bool { hidden ?? (name == "钻石") }
+            var title: String? = nil
+            var isHidden: Bool { hidden ?? ["钻石", "星耀", "传奇"].contains(name) }
         }
         let id: String
         let title: String
@@ -573,11 +573,23 @@ private struct UsageRecords: Decodable {
         let category: String?
         let rule: String?
         var categoryID: String { category ?? "habit" }
-        func formatted(_ amount: Int) -> String { unit == "Token" ? shortNumber(Int64(amount)) : formatInt(Int64(amount)) }
-        var valueLabel: String { "\(formatted(value)) \(unit)" }
+        func formatted(_ amount: Int) -> String {
+            guard unit == "Token" else { return formatInt(Int64(amount)) }
+            if amount >= 100_000_000 { return String(format: "%.1f亿", Double(amount) / 100_000_000).replacingOccurrences(of: ".0亿", with: "亿") }
+            if amount >= 10_000 { return String(format: "%.1f万", Double(amount) / 10_000).replacingOccurrences(of: ".0万", with: "万") }
+            return formatInt(Int64(amount))
+        }
+        func formattedWithUnit(_ amount: Int) -> String {
+            if unit == "分钟", amount >= 60 {
+                let hours = amount / 60, minutes = amount % 60
+                return minutes == 0 ? "\(hours) 小时" : "\(hours) 小时 \(minutes) 分钟"
+            }
+            return "\(formatted(amount)) \(unit)"
+        }
+        var valueLabel: String { formattedWithUnit(value) }
         var visibleLevels: [Level] { levels.filter { !$0.isHidden || value >= $0.target } }
         var completedLabel: String { visibleLevels.last.map { "\($0.name)级已达成" } ?? "已达成" }
-        var remainingLabel: String { nextLevel.map { "还差 \(formatted(max(0, $0.target - current_value))) \(unit)" } ?? completedLabel }
+        var remainingLabel: String { nextLevel.map { "还差 \(formattedWithUnit(max(0, $0.target - current_value)))" } ?? completedLabel }
         var unlockedLevels: Int { levels.filter { value >= $0.target }.count }
         var currentLevelIndex: Int? { levels.lastIndex { value >= $0.target } }
         var nextLevel: Level? { visibleLevels.first { value < $0.target } }
@@ -585,7 +597,8 @@ private struct UsageRecords: Decodable {
         var progressLabel: String {
             guard let next = nextLevel else { return completedLabel }
             if id == "streak" { return "本轮连续 \(current_value)/\(next.target) 天 · 目标\(next.name)级" }
-            return "距\(next.name)级还差 \(formatted(max(0, next.target - current_value))) \(unit)"
+            if let title = next.title { return "下一站：\(title) · 还差 \(formatted(max(0, next.target - current_value))) \(unit)" }
+            return "距\(next.name)级还差 \(formattedWithUnit(max(0, next.target - current_value)))"
         }
     }
     let as_of: String
@@ -627,7 +640,7 @@ private struct UsageRecords: Decodable {
         achievements.flatMap { achievement in
             achievement.levels.enumerated().compactMap { index, level -> Milestone? in
                 guard achievement.value >= level.target, let date = level.unlocked_on else { return nil }
-                return Milestone(id: "\(achievement.id)-\(index)", title: achievement.title, symbol: achievement.symbol,
+                return Milestone(id: "\(achievement.id)-\(index)", title: level.title ?? achievement.title, symbol: achievement.symbol,
                     level: level.name, date: date, target: "\(achievement.formatted(level.target)) \(achievement.unit)")
             }
         }.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
@@ -649,6 +662,7 @@ private func recordWindowLabel(_ start: String, _ end: String, includeSeconds: B
 private struct DashboardData: Decodable {
     let source_id: String?
     let source_label: String?
+    let source_notice: String?
     let generated_at_label: String
     let timezone: String
     let range: DateRange
@@ -883,13 +897,13 @@ private enum ExportFormat: Int, CaseIterable {
 
     var fileName: String {
         switch self {
-        case .html: return "codex_token_heatmap.html"
-        case .json: return "codex_token_atlas_selection.json"
-        case .daily: return "codex_token_atlas_daily.csv"
-        case .hourly: return "codex_token_atlas_hourly.csv"
-        case .model: return "codex_token_atlas_models.csv"
-        case .route: return "codex_token_atlas_routes.csv"
-        case .session: return "codex_token_atlas_sessions.csv"
+        case .html: return "token_atlas.html"
+        case .json: return "token_atlas_selection.json"
+        case .daily: return "token_atlas_daily.csv"
+        case .hourly: return "token_atlas_hourly.csv"
+        case .model: return "token_atlas_models.csv"
+        case .route: return "token_atlas_routes.csv"
+        case .session: return "token_atlas_sessions.csv"
         case .all: return ""
         }
     }
@@ -1255,16 +1269,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private let fileManager = FileManager.default
     private lazy var homeURL = fileManager.homeDirectoryForCurrentUser
-    private lazy var summaryURL = homeURL.appendingPathComponent("codex_token_usage_summary.json")
-    private lazy var logURL = homeURL.appendingPathComponent("Library/Logs/Codex Token Atlas.log")
+    private lazy var summaryURL = homeURL.appendingPathComponent("token_atlas_usage_summary.json")
+    private lazy var logURL = homeURL.appendingPathComponent("Library/Logs/Token Atlas.log")
     private lazy var exportFiles: [(ExportFormat, URL)] = [
-        (.html, homeURL.appendingPathComponent("codex_token_heatmap.html")),
+        (.html, homeURL.appendingPathComponent("token_atlas.html")),
         (.json, summaryURL),
-        (.daily, homeURL.appendingPathComponent("codex_token_usage_by_day.csv")),
-        (.hourly, homeURL.appendingPathComponent("codex_token_usage_by_hour.csv")),
-        (.model, homeURL.appendingPathComponent("codex_token_usage_by_model.csv")),
-        (.route, homeURL.appendingPathComponent("codex_token_usage_by_route.csv")),
-        (.session, homeURL.appendingPathComponent("codex_token_usage_by_session.csv"))
+        (.daily, homeURL.appendingPathComponent("token_atlas_usage_by_day.csv")),
+        (.hourly, homeURL.appendingPathComponent("token_atlas_usage_by_hour.csv")),
+        (.model, homeURL.appendingPathComponent("token_atlas_usage_by_model.csv")),
+        (.route, homeURL.appendingPathComponent("token_atlas_usage_by_route.csv")),
+        (.session, homeURL.appendingPathComponent("token_atlas_usage_by_session.csv"))
     ]
 
     private var dataHomeURL: URL {
@@ -1301,12 +1315,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         normalizedDataHomeURL(homeURL.appendingPathComponent(".codex", isDirectory: true))
     }
 
+    private var claudeDataHomeURL: URL {
+        let desktop = homeURL.appendingPathComponent("Library/Application Support/Claude")
+        if fileManager.fileExists(atPath: desktop.path) { return desktop }
+        if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        return homeURL.appendingPathComponent(".claude")
+    }
+
+    fileprivate var claudeDataHomeAvailable: Bool { isCompatibleDataHome(claudeDataHomeURL) }
+    fileprivate func activateClaudeDataHome() { activateDataHome(claudeDataHomeURL) }
+    fileprivate func activateAllDataHomes() { activateDataHome(homeURL) }
+    fileprivate var isUsingAllDataHomes: Bool { atlasIsAllHome(dataHomeURL) }
+
     private var qodexDataHomeURL: URL {
         normalizedDataHomeURL(homeURL.appendingPathComponent(".qodex", isDirectory: true))
     }
 
     fileprivate var dataHomeDisplayPath: String {
-        abbreviatedDataHomePath(dataHomeURL)
+        if isUsingAllDataHomes {
+            var labels: [String] = []
+            if codexDataHomeAvailable { labels.append("Codex") }
+            if qodexDataHomeAvailable { labels.append("Qodex") }
+            if claudeDataHomeAvailable { labels.append("Claude") }
+            return labels.joined(separator: " + ")
+        }
+        return abbreviatedDataHomePath(dataHomeURL)
     }
 
     private func abbreviatedDataHomePath(_ dataHome: URL) -> String {
@@ -1320,6 +1355,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     fileprivate var currentDataSourceID: String {
+        if isUsingAllDataHomes { return "all" }
+        if atlasIsClaudeHome(dataHomeURL) { return "claude" }
         if dataHomeURL.path == codexDataHomeURL.path { return "codex" }
         if dataHomeURL.path == qodexDataHomeURL.path { return "qodex" }
         if let sourceID = dashboard?.source_id?.trimmingCharacters(in: .whitespacesAndNewlines), !sourceID.isEmpty {
@@ -1329,6 +1366,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     fileprivate var currentDataSourceLabel: String {
+        if isUsingAllDataHomes { return "全部" }
+        if atlasIsClaudeHome(dataHomeURL) { return "Claude" }
         if dataHomeURL.path == codexDataHomeURL.path { return "Codex" }
         if dataHomeURL.path == qodexDataHomeURL.path { return "Qodex" }
         if let sourceLabel = dashboard?.source_label?.trimmingCharacters(in: .whitespacesAndNewlines), !sourceLabel.isEmpty {
@@ -1348,19 +1387,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func isCompatibleDataHome(_ candidate: URL) -> Bool {
-        let sessions = normalizedDataHomeURL(candidate).appendingPathComponent("sessions", isDirectory: true)
+        let normalized = normalizedDataHomeURL(candidate)
+        if atlasIsAllHome(normalized) { return true }
+        if atlasIsClaudeHome(normalized), fileManager.fileExists(atPath: normalized.path) { return true }
+        let sessions = normalized.appendingPathComponent("sessions", isDirectory: true)
         var isDirectory: ObjCBool = false
         return fileManager.fileExists(atPath: sessions.path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     private func normalizeInitialDataHomeSelection() {
+        if !UserDefaults.standard.bool(forKey: "allSourcesDefaultV1") {
+            dataHomePath = homeURL.path
+            UserDefaults.standard.set(homeURL.path, forKey: dataHomeDefaultsKey)
+            UserDefaults.standard.set(true, forKey: "allSourcesDefaultV1")
+        }
         let selected = dataHomeURL
         if isCompatibleDataHome(selected) {
             dataHomePath = selected.path
             UserDefaults.standard.set(selected.path, forKey: dataHomeDefaultsKey)
             return
         }
-        if let fallback = [codexDataHomeURL, qodexDataHomeURL]
+        if let fallback = [codexDataHomeURL, qodexDataHomeURL, claudeDataHomeURL]
             .first(where: { isCompatibleDataHome($0) }) {
             dataHomePath = fallback.path
             UserDefaults.standard.set(fallback.path, forKey: dataHomeDefaultsKey)
@@ -1379,7 +1426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         guard !generatorRunning else { return }
         let panel = NSOpenPanel()
         panel.title = "选择会话数据目录"
-        panel.message = "请选择包含 sessions 子目录的数据目录；也可以直接选择 sessions 目录。"
+        panel.message = "请选择 Codex 数据目录、Claude 配置目录（含 projects）或 Claude 桌面数据目录。"
         panel.prompt = "使用此目录"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -1400,7 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         guard !generatorRunning else { return }
         let selected = normalizedDataHomeURL(candidate)
         guard isCompatibleDataHome(selected) else {
-            presentError("所选目录不兼容：需要存在 \(selected.path)/sessions。")
+            presentError("所选目录不兼容：请选择包含 sessions、projects 或 Claude 桌面会话目录的数据源。")
             return
         }
 
@@ -1475,8 +1522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private func configureMainMenu() {
         let mainMenu = NSMenu()
         let appMenuItem = NSMenuItem()
-        let appMenu = NSMenu(title: "Codex Token Atlas")
-        appMenu.addItem(withTitle: "关于 Codex Token Atlas", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let appMenu = NSMenu(title: "Token Atlas")
+        appMenu.addItem(withTitle: "关于 Token Atlas", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         let personalize = appMenu.addItem(withTitle: "个性化…", action: #selector(showPersonalization(_:)), keyEquivalent: ",")
         personalize.target = self
         appMenu.addItem(.separator())
@@ -1484,9 +1531,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         liveItem.target = self
         liveMenuItem = liveItem
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "隐藏 Codex Token Atlas", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "隐藏 Token Atlas", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "退出 Codex Token Atlas", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "退出 Token Atlas", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
 
@@ -1759,7 +1806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             backing: .buffered,
             defer: false
         )
-        window.title = "Codex Token Atlas"
+        window.title = "Token Atlas"
         window.minSize = NSSize(width: 990, height: 612)
         window.center()
         window.isReleasedWhenClosed = false
@@ -1799,12 +1846,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         rebuildLiveMonitors(startIfEnabled: false)
         setLiveMonitorEnabled(liveMonitorEnabled, persist: false, ensureReachability: false)
-        let historyTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
-            self?.publishHistoricalTotal()
+        let historyTimer = Timer(timeInterval: 600, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.publishHistoricalTotal()
+            if !self.generatorRunning {
+                self.refreshReport(nil)
+            }
         }
-        historyTimer.tolerance = 5
+        historyTimer.tolerance = 1
         RunLoop.main.add(historyTimer, forMode: .common)
         historicalDisplayTimer = historyTimer
+        appendLog("Automatic statistics refresh: every 600 seconds; next at \(ISO8601DateFormatter().string(from: historyTimer.fireDate))\n")
     }
 
     private func availableLiveMonitorSources() -> [LiveMonitorSource] {
@@ -1824,7 +1876,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         append(codexDataHomeURL, label: "Codex")
         append(qodexDataHomeURL, label: "Qodex")
-        append(dataHomeURL, label: currentDataSourceLabel)
+        append(atlasIsClaudeHome(dataHomeURL) ? dataHomeURL : claudeDataHomeURL, label: "Claude")
+        if !isUsingAllDataHomes { append(dataHomeURL, label: currentDataSourceLabel) }
         return sources
     }
 
@@ -1840,6 +1893,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func selectedLiveHistoricalTotal() -> Int64? {
+        if selectedLiveMonitorSourceID == allLiveMonitorSourcesID,
+           let total = historicalTotalsByDataHome[homeURL.path] { return total }
         let sources = selectedLiveSources()
         let totals = sources.compactMap { historicalTotalsByDataHome[$0.dataHome.path] }
         guard !sources.isEmpty, totals.count == sources.count else { return nil }
@@ -1911,7 +1966,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         for source in sources {
             let monitor = LiveTokenMonitor(
-                sessionRoot: source.dataHome.appendingPathComponent("sessions", isDirectory: true)
+                sessionRoots: atlasSessionRoots(source.dataHome),
+                claude: atlasIsClaudeHome(source.dataHome)
             ) { [weak self] snapshot in
                 guard let self, generation == self.liveMonitorGeneration else { return }
                 self.liveSnapshots[source.id] = snapshot
@@ -2285,10 +2341,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         guard !generatorRunning else { return }
         let selectedDataHome = dataHomeURL
         guard isCompatibleDataHome(selectedDataHome) else {
-            presentError("当前数据目录不兼容：需要存在 \(selectedDataHome.path)/sessions。")
+            presentError("当前数据目录不兼容：请选择包含 sessions、projects 或 Claude 桌面会话目录的数据源。")
             return
         }
-        guard let generatorURL = Bundle.main.resourceURL?.appendingPathComponent("codex_token_heatmap.py") else {
+        guard let generatorURL = Bundle.main.resourceURL?.appendingPathComponent("token_atlas.py") else {
             presentError("应用内的统计生成器缺失。")
             return
         }
@@ -2491,11 +2547,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             if let peak = records.peak_hour { try require(peak.window_seconds == 3600, "hourly volume window is invalid") }
             if let peak = records.peak_throughput { try require(peak.window_seconds == 60 && peak.rate(output: false) == Double(peak.total_tokens) / 60, "throughput denominator is invalid") }
             if let peak = records.peak_output_throughput { try require(peak.window_seconds == 60 && peak.rate(output: true) == Double(peak.output_tokens) / 60, "output throughput denominator is invalid") }
-            try require(records.achievements.count == 12 && records.achievements.allSatisfy { $0.levels.prefix(3).map(\.name) == ["铜", "银", "金"] }, "tiered achievement wall is incomplete")
-            let hiddenFamilies = Set(records.achievements.filter { $0.levels.contains { $0.isHidden } }.map(\.id))
-            try require(hiddenFamilies == Set(["days", "sessions", "collaborative_days", "total_tokens", "output_tokens"]), "hidden achievements are not selective")
+            try require(records.achievements.count == 19 && Set(records.achievements.map(\.id)).count == 19, "achievement catalog is incomplete")
+            try require(records.achievements.allSatisfy { badge in
+                badge.levels.allSatisfy { $0.target > 0 && AtlasMedal(name: $0.name) != nil }
+                && badge.levels.map(\.target) == badge.levels.map(\.target).sorted()
+            }, "achievement tiers are invalid")
+            let baseLevels = records.achievements.reduce(0) { $0 + $1.levels.filter { !$0.isHidden }.count }
             let revealedLevels = records.achievements.reduce(0) { total, badge in total + badge.levels.filter { $0.isHidden && badge.value >= $0.target }.count }
-            try require(records.levelCount == 36 + revealedLevels, "locked secret tiers leaked into total count")
+            try require(records.levelCount == baseLevels + revealedLevels, "locked secret tiers leaked into total count")
             try require(Set(records.achievements.map(\.categoryID)) == Set(UsageRecords.categories.map(\.0)), "achievement categories are incomplete")
             try require(records.milestones.count <= records.unlockedCount, "milestone dates exceed earned levels")
             try require(records.nextAchievement?.nextLevel != nil || records.unlockedCount == records.levelCount, "next achievement is invalid")
@@ -2512,7 +2571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 try require((insights.largest_team_session?.worker_count ?? 0) <= insights.worker_count, "single-conversation worker record exceeds all workers")
             }
             if let streak = records.achievements.first(where: { $0.id == "streak" }) {
-                try require(streak.levels.map(\.target) == [3, 7, 14], "streak tiers differ from the intended milestones")
+                try require(streak.levels.map(\.target) == [3, 7, 14, 30], "streak tiers differ from the intended milestones")
                 try require(streak.current_value == records.current_streak, "streak progress uses a past record")
             }
         }
@@ -2539,6 +2598,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         try require(badgeFixture(500).completedLabel == "钻石级已达成" && badgeFixture(500).remainingLabel == "钻石级已达成", "diamond completion label is incorrect")
         try require(badgeFixture(100).nextLevel == nil && badgeFixture(499).progress == 1 && badgeFixture(499).completedLabel == "金级已达成", "gold preview exposes hidden progression")
         try require(badgeFixture(100, levels: Array(tierFixtures.prefix(3))).completedLabel == "金级已达成", "legacy three-tier reports are not supported")
+        let journeyLevels = zip(["铜", "银", "金", "钻石", "星耀", "传奇"], [100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000, 50_000_000_000, 100_000_000_000]).enumerated().map { index, entry in
+            UsageRecords.Achievement.Level(name: entry.0, target: entry.1, unlocked_on: nil, hidden: index >= 3, title: ["亿点灵感", "十亿俱乐部", "灵感星河", "钻石宇宙", "星耀远航", "千亿传说"][index])
+        }
+        for (value, count) in [(0, 3), (5_000_000_000, 3), (24_999_999_999, 3), (25_000_000_000, 4), (49_999_999_999, 4), (50_000_000_000, 5), (100_000_000_000, 6)] {
+            let badge = UsageRecords.Achievement(id: "total_tokens", title: "用量里程碑", symbol: "chart.bar", detail: "累计 Token", value: value, current_value: value, unit: "Token", levels: journeyLevels, category: "volume", rule: nil)
+            try require(badge.visibleLevels.count == count, "prestige tiers must reveal at their own threshold")
+            try require(badge.visibleLevels.filter(\.isHidden).allSatisfy { value >= $0.target }, "a locked prestige badge is visible")
+            if value >= 5_000_000_000 && value < 25_000_000_000 {
+                try require(badge.nextLevel == nil && badge.progressLabel == "金级已达成", "Token journey reveals a secret target")
+            }
+            try require(badge.formatted(100_000_000_000) == "1000亿", "Token stages are not readable")
+        }
+        let streakLevels = zip(["铜", "银", "金", "钻石"], [3, 7, 14, 30]).map {
+            UsageRecords.Achievement.Level(name: $0.0, target: $0.1, unlocked_on: nil, hidden: $0.0 == "钻石")
+        }
+        for value in [29, 30] {
+            let badge = UsageRecords.Achievement(id: "streak", title: "持之以恒", symbol: "flame", detail: "最长连续使用", value: value, current_value: 1, unit: "天", levels: streakLevels, category: "habit", rule: nil)
+            try require(badge.visibleLevels.count == (value == 30 ? 4 : 3), "streak diamond appears before thirty days")
+            try require(badge.currentLevelIndex.map { badge.levels[$0].name } == (value == 30 ? "钻石" : "金"), "earned streak badge was lost after a break")
+        }
         if ProcessInfo.processInfo.environment["TOKEN_ATLAS_RENDER_ACHIEVEMENTS"] == "1" {
             try renderAchievementPreviews([10, 30, 100, 500].map { badgeFixture($0) })
         }
@@ -3055,7 +3134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         appendLog("ERROR: \(message)\n")
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "Codex Token Atlas"
+        alert.messageText = "Token Atlas"
         alert.informativeText = "\(message)\n\n详细日志：\(logURL.path)"
         alert.addButton(withTitle: "好")
         alert.addButton(withTitle: "显示日志")
@@ -3324,6 +3403,8 @@ private struct AtlasDashboardView: View {
     @ObservedObject var controller: AppDelegate
     @State private var sessionSearch = ""
     @State private var sessionPage = 0
+    @State private var modelPage = 0
+    @State private var dayPage = 0
     @State private var showingAchievements = false
     @State private var achievementCategory = "all"
     @State private var achievementState = "all"
@@ -3449,11 +3530,11 @@ private struct AtlasDashboardView: View {
         .environment(\.atlasGlassFrostAmount, controller.appGlassFrostAmount)
         .environment(\.atlasWindowBackdropActive, controller.usesWindowBackdrop)
         .onChange(of: sessionSearch) { _ in sessionPage = 0 }
-        .onChange(of: controller.selectedModel) { _ in sessionPage = 0 }
-        .onChange(of: controller.selectedMetric) { _ in sessionPage = 0 }
-        .onChange(of: controller.selectedStartDate) { _ in sessionPage = 0 }
-        .onChange(of: controller.selectedEndDate) { _ in sessionPage = 0 }
-        .onChange(of: controller.dataHomePath) { _ in sessionPage = 0; sessionSearch = "" }
+        .onChange(of: controller.selectedModel) { _ in sessionPage = 0; modelPage = 0; dayPage = 0 }
+        .onChange(of: controller.selectedMetric) { _ in sessionPage = 0; modelPage = 0; dayPage = 0 }
+        .onChange(of: controller.selectedStartDate) { _ in sessionPage = 0; modelPage = 0; dayPage = 0 }
+        .onChange(of: controller.selectedEndDate) { _ in sessionPage = 0; modelPage = 0; dayPage = 0 }
+        .onChange(of: controller.dataHomePath) { _ in sessionPage = 0; modelPage = 0; dayPage = 0; sessionSearch = "" }
     }
 
     private func navigate(to section: String, proxy: ScrollViewProxy, anchor overrideAnchor: String? = nil) {
@@ -3683,7 +3764,7 @@ private struct AtlasDashboardView: View {
         return AtlasPanel(title: "成就墙", trailing: "已解锁 \(records.unlockedCount) / \(records.levelCount) 级") {
             HStack(spacing: 14) {
                 AtlasSegmentedControl(items: [("all", "全部")] + UsageRecords.categories.map { ($0.0, $0.1) }, selection: $achievementCategory)
-                    .frame(width: 460)
+                    .frame(width: 440)
                 Spacer(minLength: 0)
                 AtlasSegmentedControl(items: [("all", "全部状态"), ("unlocked", "已解锁"), ("progress", "可晋级")], selection: $achievementState)
                     .frame(width: 258)
@@ -3692,17 +3773,21 @@ private struct AtlasDashboardView: View {
                 Text(achievementState == "progress" ? "当前筛选的成就已全部达成。" : "尚未解锁成就。")
                     .font(.system(size: 12)).foregroundStyle(Color(nsColor: AtlasColor.muted)).padding(.vertical, 18)
             }
-            if achievementCategory != "all", !filtered.isEmpty,
-               let category = UsageRecords.categories.first(where: { $0.0 == achievementCategory }) {
-                HStack {
-                    Text(category.1).font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text("\(filtered.reduce(0) { $0 + $1.unlockedLevels }) / \(filtered.reduce(0) { $0 + $1.visibleLevels.count }) 级")
-                        .font(.system(size: 10)).foregroundStyle(Color(nsColor: AtlasColor.muted))
+            ForEach(UsageRecords.categories, id: \.0) { category in
+                let group = filtered.filter { $0.categoryID == category.0 }
+                if !group.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text(category.1).font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Text("\(group.reduce(0) { $0 + $1.unlockedLevels }) / \(group.reduce(0) { $0 + $1.visibleLevels.count }) 级")
+                                .font(.system(size: 10)).foregroundStyle(Color(nsColor: AtlasColor.muted))
+                        }
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+                            ForEach(group) { achievement in AtlasAchievementCard(achievement: achievement) }
+                        }
+                    }.padding(.top, 8)
                 }
-            }
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
-                ForEach(filtered) { achievement in AtlasAchievementCard(achievement: achievement) }
             }
         }
     }
@@ -3831,6 +3916,12 @@ private struct AtlasDashboardView: View {
     private var dataSourceMenu: some View {
         Menu {
             Button {
+                controller.activateAllDataHomes()
+            } label: {
+                Label("全部", systemImage: controller.isUsingAllDataHomes ? "checkmark" : "square.stack.3d.up")
+            }
+            Divider()
+            Button {
                 controller.activateCodexDataHome()
             } label: {
                 Label("Codex · ~/.codex", systemImage: controller.isUsingCodexDataHome ? "checkmark" : "folder")
@@ -3843,6 +3934,10 @@ private struct AtlasDashboardView: View {
                 } label: {
                     Label("Qodex · ~/.qodex", systemImage: controller.isUsingQodexDataHome ? "checkmark" : "folder")
                 }
+            }
+
+            if controller.claudeDataHomeAvailable {
+                Button("Claude · 本机记录") { controller.activateClaudeDataHome() }
             }
 
             Divider()
@@ -3917,34 +4012,56 @@ private struct AtlasDashboardView: View {
         )
     }
 
+    private func tablePagination(_ label: String, page: Binding<Int>, count: Int, size: Int) -> some View {
+        let pages = max(1, (count + size - 1) / size)
+        let current = min(page.wrappedValue, pages - 1)
+        return HStack {
+            Text("\(count) 条").foregroundStyle(Color(nsColor: AtlasColor.muted))
+            Spacer()
+            Button("上一页") { page.wrappedValue = max(0, current - 1) }
+                .accessibilityLabel("上一页\(label)").disabled(current == 0)
+            Text("\(current + 1) / \(pages)").font(.system(size: 11, design: .monospaced))
+            Button("下一页") { page.wrappedValue = min(pages - 1, current + 1) }
+                .accessibilityLabel("下一页\(label)").disabled(current + 1 >= pages)
+        }.font(.system(size: 11))
+    }
+
     private func modelTable(_ data: DashboardData) -> some View {
-        let overall = max(Int64(1), controller.filteredUsage(scope: "all", data: data).total_tokens)
-        let rows = data.models.map { model -> [String] in
-            let usage = controller.filteredUsage(scope: model, data: data)
+        let overall = max(1, controller.filteredUsage(scope: "all", data: data).total_tokens)
+        let usages: [(String, Usage)] = data.models.map { model in
+            (model, controller.filteredUsage(scope: model, data: data))
+        }
+        let active = usages.filter { $0.1.total_tokens > 0 }
+        let models = active.sorted { lhs, rhs in
+            if lhs.1.total_tokens == rhs.1.total_tokens { return lhs.0 < rhs.0 }
+            return lhs.1.total_tokens > rhs.1.total_tokens
+        }
+        let pages = max(1, (models.count + 9) / 10)
+        let current = min(modelPage, pages - 1)
+        let rows = models.dropFirst(current * 10).prefix(10).map { model, usage -> [String] in
             let share = Double(usage.total_tokens) / Double(overall) * 100
             let cache = usage.input_tokens > 0 ? Double(usage.cached_input_tokens) / Double(usage.input_tokens) * 100 : 0
             return [model, shortNumber(usage.total_tokens), String(format: "%.1f%%", share), formatInt(usage.calls), String(format: "%.1f%%", cache)]
         }
-        return AtlasTable(
-            headers: ["MODEL", "TOTAL", "SHARE", "CALLS", "CACHE"],
-            rows: rows,
-            widths: [],
-            adaptiveWeights: [2.2, 1, 0.8, 0.9, 0.8]
-        )
+        return VStack(spacing: 12) {
+            tablePagination("模型", page: $modelPage, count: models.count, size: 10)
+            AtlasTable(headers: ["MODEL", "TOTAL", "SHARE", "CALLS", "CACHE"],
+                       rows: Array(rows), widths: [], adaptiveWeights: [2.2, 1, 0.8, 0.9, 0.8])
+        }
     }
 
     private func topDaysTable(_ data: DashboardData) -> some View {
-        let rows = (data.daily[controller.selectedModel] ?? [:])
+        let days = (data.daily[controller.selectedModel] ?? [:])
             .filter { controller.isIncluded($0.key, in: data) && $0.value.value(for: controller.selectedMetric) > 0 }
-            .sorted { $0.value.value(for: controller.selectedMetric) > $1.value.value(for: controller.selectedMetric) }
-            .prefix(10)
+            .sorted { $0.value.value(for: controller.selectedMetric) == $1.value.value(for: controller.selectedMetric) ? $0.key > $1.key : $0.value.value(for: controller.selectedMetric) > $1.value.value(for: controller.selectedMetric) }
+        let pages = max(1, (days.count + 9) / 10)
+        let current = min(dayPage, pages - 1)
+        let rows = days.dropFirst(current * 10).prefix(10)
             .map { [$0.key, formatInt($0.value.value(for: controller.selectedMetric)), shortNumber($0.value.total_tokens), formatInt($0.value.calls)] }
-        return AtlasTable(
-            headers: ["DATE", "METRIC", "TOTAL", "CALLS"],
-            rows: Array(rows),
-            widths: [],
-            adaptiveWeights: [1.35, 1.45, 1, 0.75]
-        )
+        return VStack(spacing: 12) {
+            tablePagination("日期", page: $dayPage, count: days.count, size: 10)
+            AtlasTable(headers: ["DATE", "METRIC", "TOTAL", "CALLS"], rows: Array(rows), widths: [], adaptiveWeights: [1.35, 1.45, 1, 0.75])
+        }
     }
 
     private func sessionPanel(_ data: DashboardData) -> some View {
@@ -3960,13 +4077,13 @@ private struct AtlasDashboardView: View {
             let lhs = $0.1.value(for: controller.selectedMetric), rhs = $1.1.value(for: controller.selectedMetric)
             return lhs == rhs ? $0.0.id < $1.0.id : lhs > rhs
         }
-        let pageCount = max(1, (matches.count + 29) / 30)
+        let pageCount = max(1, (matches.count + 19) / 20)
         let currentPage = min(sessionPage, pageCount - 1)
-        let rows = matches.dropFirst(currentPage * 30).prefix(30).map { session, usage -> [String] in
+        let rows = matches.dropFirst(currentPage * 20).prefix(20).map { session, usage -> [String] in
             let cost = controller.filteredSessionCost(session, data: data)
             return [session.title, session.by_model.keys.sorted().joined(separator: " · "), session.by_provider.keys.sorted().joined(separator: " · "), formatInt(usage.value(for: controller.selectedMetric)), formatInt(usage.calls), cost.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(cost)) : "—", session.lineageLabel]
         }
-        return AtlasPanel(title: "会话用量", subtitle: "内部线程用量归入所属会话；用户 fork 单列。按当前指标排序，每页 30 条。", trailing: "\(matches.count) 条") {
+        return AtlasPanel(title: "会话用量", subtitle: "按当前指标排序，每页 20 条。", trailing: "\(matches.count) 条") {
             HStack {
                 TextField("搜索会话标题、ID 或模型", text: $sessionSearch)
                     .textFieldStyle(.roundedBorder)
@@ -4003,22 +4120,27 @@ private struct AtlasDashboardView: View {
         let standardValue = hasTrustedPricing ? formatUSD(cost.standard_equivalent_cost_usd) : "未定价"
         let secondaryValue = hasTrustedPricing ? formatUSD(controller.pricingMode == .tiered ? cost.service_tier_premium_usd : 0) : "—"
         let cacheValue = hasTrustedPricing ? formatUSD(controller.pricingMode.cacheSavings(cost)) : "—"
-        let routes = data.pricing.routes.compactMap { route -> [String]? in
-            guard controller.selectedModel == "all" || route.model == controller.selectedModel else { return nil }
-            let filtered = controller.filteredRoute(route, data: data)
-            guard filtered.0.calls > 0 else { return nil }
-            let rates = route.displayedRates(for: controller.pricingMode)
-            let model = route.pricing_model.map { $0 == route.model ? route.model : "\(route.model) → \($0)" } ?? route.model
-            let tier = route.service_tier == "priority" ? "Fast / Priority" : route.service_tier
-            let value = filtered.1.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(filtered.1)) : route.pricing_model == nil ? "未匹配价格" : "暂无可计价用量"
-            let unclassified = min(filtered.0.unclassified_tokens, filtered.1.unpriced_tokens)
-            let missingRate = max(0, filtered.1.unpriced_tokens - unclassified)
-            let valueDetail = route.pricing_model == nil
-                ? "\n\(shortNumber(filtered.1.unpriced_tokens)) tokens"
-                : (unclassified > 0 ? "\n\(shortNumber(unclassified)) 未分类" : "")
-                    + (missingRate > 0 ? "\n\(shortNumber(missingRate)) 缺少类别单价" : "")
-            return [model, "\(route.route_provider) · \(tier)", value + valueDetail, rates?.input.map(formatRate) ?? "—", rates?.cached_input.map(formatRate) ?? "—", rates?.cache_write_input.map(formatRate) ?? "—", rates?.output.map(formatRate) ?? "—", formatInt(filtered.0.calls)]
-        }
+        let modelGroups = Dictionary(grouping: data.pricing.routes.filter {
+            controller.selectedModel == "all" || $0.model == controller.selectedModel
+        }, by: \.model)
+        let routes = modelGroups.compactMap { model, members -> (Int64, [String])? in
+            let filtered = members.map { controller.filteredRoute($0, data: data) }
+            let usage = filtered.reduce(Usage()) { $0.adding($1.0) }
+            let modelCost = filtered.reduce(Cost()) { $0.adding($1.1) }
+            guard usage.calls > 0 else { return nil }
+            let rateSets = members.compactMap { $0.displayedRates(for: controller.pricingMode) }
+            func rate(_ key: KeyPath<RateSet, Double?>) -> String {
+                let values = Set(rateSets.compactMap { $0[keyPath: key] }).sorted()
+                guard let first = values.first, let last = values.last else { return "—" }
+                return first == last ? formatRate(first) : "\(formatRate(first))–\(formatRate(last))"
+            }
+            let read = usage.cached_input_tokens > 0 && modelCost.priced_tokens > 0
+                ? formatRate(controller.pricingMode.cacheReadCost(modelCost) * 1_000_000 / Double(usage.cached_input_tokens)) : rate(\.cached_input)
+            let write = usage.cache_write_input_tokens > 0 && modelCost.priced_tokens > 0
+                ? formatRate(controller.pricingMode.cacheWriteCost(modelCost) * 1_000_000 / Double(usage.cache_write_input_tokens)) : rate(\.cache_write_input)
+            let value = modelCost.priced_tokens > 0 ? formatUSD(controller.pricingMode.value(modelCost)) : "未匹配价格"
+            return (usage.total_tokens, [model, formatInt(usage.total_tokens), value, rate(\.input), read, write, rate(\.output), formatInt(usage.calls)])
+        }.sorted { $0.0 == $1.0 ? $0.1[0] < $1.1[0] : $0.0 > $1.0 }.map { $0.1 }
         return AtlasPanel(
             title: "Token 价值估算",
             subtitle: hasTrustedPricing
@@ -4048,10 +4170,7 @@ private struct AtlasDashboardView: View {
                     tint: Color(nsColor: AtlasColor.teal).opacity(0.01),
                     clear: true
                 )
-                AtlasTable(headers: ["MODEL", "PROVIDER / TIER", "VALUE", "INPUT", "READ", "WRITE", "OUTPUT", "CALLS"], rows: routes, widths: [], adaptiveWeights: [1.6, 1.4, 1.2, 0.7, 0.7, 0.7, 0.7, 0.8])
-                Text("未分类 = 日志 total − input − output 的差额；保留在总量中，但无法确定计价类别。‘未匹配价格’才表示模型没有可用单价。")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color(nsColor: AtlasColor.muted))
+                AtlasTable(headers: ["MODEL", "TOKENS", "VALUE", "INPUT", "READ", "WRITE", "OUTPUT", "CALLS"], rows: routes, widths: [], adaptiveWeights: [1.6, 1.4, 1.2, 0.7, 0.7, 0.7, 0.7, 0.8])
                 Text(!hasTrustedPricing
                     ? "当前来源仅提供用量统计。可在设置中为已识别模型填写价格。"
                     : hasCustomPricing
@@ -4206,8 +4325,9 @@ private struct AtlasEtchedMedalShape: Shape {
 private struct AtlasEtchedMedal: View {
     let symbol: String
     let size: CGFloat
+    var medal: AtlasMedal = .diamond
     private var foil: LinearGradient {
-        LinearGradient(colors: AtlasMedal.diamond.fillColors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing)
+        LinearGradient(colors: medal.fillColors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
     var body: some View {
         ZStack {
@@ -4224,7 +4344,7 @@ private struct AtlasEtchedMedal: View {
             AtlasEtchedMedalShape().fill(Color(red: 0.10, green: 0.13, blue: 0.17)).scaleEffect(0.57)
             Image(systemName: symbol).font(.system(size: size * 0.31, weight: .semibold)).foregroundStyle(Color.black.opacity(0.8)).offset(y: size * 0.013)
             Image(systemName: symbol).font(.system(size: size * 0.31, weight: .semibold)).foregroundStyle(foil)
-            Image(systemName: "diamond.fill").font(.system(size: size * 0.065)).foregroundStyle(foil).offset(y: size * 0.40)
+            Image(systemName: medal == .star ? "star.fill" : medal == .legend ? "crown.fill" : "diamond.fill").font(.system(size: size * 0.065)).foregroundStyle(foil).offset(y: size * 0.40)
         }.frame(width: size, height: size)
     }
 }
@@ -4248,8 +4368,8 @@ private struct AtlasMedalBadge: View {
     var body: some View {
         ZStack {
             if let medal {
-                if medal == .diamond {
-                    AtlasEtchedMedal(symbol: symbol, size: size)
+                if medal.isPrestige {
+                    AtlasEtchedMedal(symbol: symbol, size: size, medal: medal)
                 } else {
                     Image(systemName: "seal.fill").font(.system(size: size * 0.93))
                         .foregroundStyle(LinearGradient(colors: medal.fillColors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing))
@@ -4265,13 +4385,15 @@ private struct AtlasMedalBadge: View {
 }
 
 private struct AtlasAchievementCard: View {
+    static let height: CGFloat = 220
     @ObservedObject private var theme = AtlasTheme.shared
     let achievement: UsageRecords.Achievement
 
     private var currentMedal: AtlasMedal? { achievement.currentLevelIndex.flatMap { AtlasMedal(name: achievement.levels[$0].name) } }
+    private var isPrestige: Bool { currentMedal?.isPrestige == true }
     private var currentColor: NSColor { currentMedal.map(atlasMedalAccent) ?? AtlasColor.muted }
     private var diamondGradient: LinearGradient {
-        LinearGradient(colors: AtlasMedal.diamond.fillColors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing)
+        LinearGradient(colors: (currentMedal ?? .diamond).fillColors.map { Color(nsColor: $0) }, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
     private var diamondCardGradient: LinearGradient {
         LinearGradient(colors: zip(AtlasMedal.diamondCardColors(dark: false), AtlasMedal.diamondCardColors(dark: true)).map {
@@ -4280,52 +4402,67 @@ private struct AtlasAchievementCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-                AtlasMedalBadge(symbol: achievement.symbol, medal: currentMedal)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(achievement.title).font(.system(size: 16, weight: .semibold))
-                    Text(currentMedal == .diamond ? "钻石徽章" : achievement.currentLevelIndex.map { "\(achievement.levels[$0].name)级徽章" } ?? "待解锁")
-                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(nsColor: currentColor))
+                AtlasMedalBadge(symbol: achievement.symbol, medal: currentMedal, size: 48)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(achievement.title).font(.system(size: 16, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.85)
+                    if !isPrestige {
+                        Text(achievement.currentLevelIndex.map { "\(achievement.levels[$0].name)级徽章" } ?? "待解锁")
+                            .font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(nsColor: currentColor))
+                    }
                 }
                 Spacer(minLength: 0)
-            }
-            Text("\(achievement.id == "sessions" ? "累计会话" : achievement.detail) · \(achievement.unit == "Token" ? achievement.formatted(achievement.value) : achievement.valueLabel)")
+            }.frame(height: 48)
+            Text(isPrestige ? achievement.detail : "\(achievement.id == "sessions" ? "累计会话" : achievement.detail) · \(achievement.unit == "Token" ? achievement.formatted(achievement.value) : achievement.valueLabel)")
                 .font(.system(size: 12)).foregroundStyle(Color(nsColor: AtlasColor.inkSoft))
                 .lineLimit(1).minimumScaleFactor(0.85)
-            HStack(spacing: 6) {
-                ForEach(Array(achievement.visibleLevels.enumerated()), id: \.offset) { _, level in
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 4) {
-                            Image(systemName: achievement.value >= level.target ? "checkmark.circle.fill" : "circle")
-                            Text(level.name)
-                        }.foregroundStyle(Color(nsColor: AtlasMedal(name: level.name).map(atlasMedalAccent) ?? AtlasColor.muted))
-                        Text("\(achievement.formatted(level.target))\(achievement.unit == "Token" ? "" : achievement.unit)")
-                            .foregroundStyle(Color(nsColor: achievement.value >= level.target ? AtlasColor.inkSoft : AtlasColor.muted))
-                            .lineLimit(1).minimumScaleFactor(0.8)
+            Group {
+                if isPrestige {
+                    Text(achievement.valueLabel).font(.system(size: 24, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color(nsColor: currentColor)).lineLimit(1).minimumScaleFactor(0.7)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: min(3, achievement.visibleLevels.count)), alignment: .leading, spacing: 6) {
+                        ForEach(Array(achievement.visibleLevels.enumerated()), id: \.offset) { _, level in
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: achievement.value >= level.target ? "checkmark.circle.fill" : "circle")
+                                    Text(level.name)
+                                }.foregroundStyle(Color(nsColor: AtlasMedal(name: level.name).map(atlasMedalAccent) ?? AtlasColor.muted))
+                                Text(achievement.unit == "Token" ? achievement.formatted(level.target) : achievement.formattedWithUnit(level.target))
+                                    .foregroundStyle(Color(nsColor: achievement.value >= level.target ? AtlasColor.inkSoft : AtlasColor.muted))
+                                    .lineLimit(1).minimumScaleFactor(0.8)
+                                if let title = level.title {
+                                    Text(title).font(.system(size: 9)).foregroundStyle(Color(nsColor: AtlasColor.muted)).lineLimit(1).help(title)
+                                }
+                            }
+                            .font(.system(size: 10, weight: .medium))
+                            .frame(maxWidth: .infinity, alignment: .leading).frame(height: 46, alignment: .top)
+                        }
                     }
-                    .font(.system(size: 10, weight: .medium))
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-            }
+            }.frame(height: 46, alignment: .top)
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color(nsColor: AtlasColor.zero))
-                    if currentMedal == .diamond {
+                    if currentMedal?.isPrestige == true {
                         Capsule().fill(diamondGradient).frame(width: geometry.size.width * achievement.progress)
                     } else {
                         Capsule().fill(Color(nsColor: currentColor)).frame(width: geometry.size.width * achievement.progress)
                     }
                 }
             }.frame(height: 5)
-            Text(achievement.progressLabel)
+            Text(isPrestige ? "已达成" : achievement.progressLabel)
                 .font(.system(size: 11)).foregroundStyle(Color(nsColor: AtlasColor.muted))
+                .lineLimit(1).minimumScaleFactor(0.8)
             Text(achievement.currentLevelIndex.map { achievement.levels[$0].unlocked_on.map { "\($0) · 达成记录" } ?? "已达成 · 日期待确认" } ?? " ")
                 .font(.system(size: 10, design: .monospaced)).foregroundStyle(Color(nsColor: AtlasColor.muted))
+                .lineLimit(1)
         }
-        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading).frame(height: Self.height, alignment: .top)
         .background {
-            if currentMedal == .diamond {
+            if currentMedal?.isPrestige == true {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12).fill(diamondCardGradient)
                     RoundedRectangle(cornerRadius: 12).fill(diamondGradient.opacity(0.055))
@@ -4337,7 +4474,7 @@ private struct AtlasAchievementCard: View {
             }
         }
         .overlay {
-            if currentMedal == .diamond {
+            if currentMedal?.isPrestige == true {
                 RoundedRectangle(cornerRadius: 12).stroke(diamondGradient, lineWidth: 1.2)
                     .overlay(RoundedRectangle(cornerRadius: 11).inset(by: 2.2).stroke(diamondGradient.opacity(0.22), lineWidth: 0.5))
             } else {
@@ -4363,20 +4500,20 @@ private func renderAchievementPreviews(_ fixtures: [UsageRecords.Achievement]) t
             }
         }
         .padding(20)
-        .frame(width: 680, height: 570)
+        .frame(width: 680, height: AtlasAchievementCard.height * 2 + 52)
         .background(Color(nsColor: AtlasColor.canvas))
         .environment(\.colorScheme, dark ? .dark : .light)
-        try writeAchievementPreview(content, size: NSSize(width: 680, height: 570), appearance: appearance,
+        try writeAchievementPreview(content, size: NSSize(width: 680, height: AtlasAchievementCard.height * 2 + 52), appearance: appearance,
             path: "/tmp/token-atlas-achievements-\(dark ? "dark" : "light").png")
         let showcase = HStack(spacing: 30) {
             AtlasEtchedMedal(symbol: fixtures[3].symbol, size: 144)
             AtlasAchievementCard(achievement: fixtures[3]).frame(width: 340)
         }
         .padding(28)
-        .frame(width: 570, height: 310)
+        .frame(width: 570, height: AtlasAchievementCard.height + 56)
         .background(Color(nsColor: AtlasColor.canvas))
         .environment(\.colorScheme, dark ? .dark : .light)
-        try writeAchievementPreview(showcase, size: NSSize(width: 570, height: 310), appearance: appearance,
+        try writeAchievementPreview(showcase, size: NSSize(width: 570, height: AtlasAchievementCard.height + 56), appearance: appearance,
             path: "/tmp/token-atlas-foil-\(dark ? "dark" : "light").png")
     }
 }
@@ -5038,7 +5175,7 @@ private struct DailyHeatmap: View {
 }
 
 @main
-enum CodexTokenAtlasMain {
+enum TokenAtlasMain {
     private static let delegate = AppDelegate()
 
     static func main() {

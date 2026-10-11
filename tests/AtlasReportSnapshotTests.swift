@@ -22,6 +22,17 @@ struct AtlasReportSnapshotTests {
         precondition(!matches(root: "/synthetic/.qodex/sessions"))
         precondition(!matches(root: "/synthetic/archive/.codex/sessions"))
         precondition(!matches(dashboard: "qodex"))
+        precondition(atlasIsAllHome(home, userHome: home))
+        precondition(!atlasIsAllHome(codex, userHome: home))
+        precondition(atlasSnapshotMatchesSource(schema: 11, sessionsRoot: home.path, sourceID: "all", dashboardSourceID: "all", dataHome: home, userHome: home))
+        precondition(!atlasSnapshotMatchesSource(schema: 11, sessionsRoot: codex.path, sourceID: "all", dashboardSourceID: "all", dataHome: home, userHome: home))
+        let claude = home.appendingPathComponent(".claude")
+        precondition(atlasIsClaudeHome(claude))
+        precondition(atlasSnapshotMatchesSource(schema: 11, sessionsRoot: claude.path, sourceID: "claude", dashboardSourceID: "claude", dataHome: claude))
+        precondition(!atlasSnapshotMatchesSource(schema: 11, sessionsRoot: codex.path, sourceID: "claude", dashboardSourceID: "claude", dataHome: claude))
+        let roots = atlasSessionRoots(claude, userHome: home)
+        precondition(roots.contains(claude.appendingPathComponent("projects")))
+        precondition(roots.contains(home.appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions")))
         print("Report snapshot tests passed")
     }
 }

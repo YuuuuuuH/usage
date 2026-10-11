@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a fork-safe, model-aware dashboard from a Codex-compatible data home."""
+"""Build a local token dashboard from Codex, Qodex, or Claude transcripts."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import sqlite3
 import tempfile
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -45,13 +45,13 @@ TOKENIZER_SEARCH_ROOTS = (
     HOME / ".cache" / "modelscope" / "hub" / "models",
 )
 
-OUTPUT_HTML = HOME / "codex_token_heatmap.html"
-OUTPUT_DAILY_CSV = HOME / "codex_token_usage_by_day.csv"
-OUTPUT_HOURLY_CSV = HOME / "codex_token_usage_by_hour.csv"
-OUTPUT_MODEL_CSV = HOME / "codex_token_usage_by_model.csv"
-OUTPUT_ROUTE_CSV = HOME / "codex_token_usage_by_route.csv"
-OUTPUT_SESSION_CSV = HOME / "codex_token_usage_by_session.csv"
-OUTPUT_JSON = HOME / "codex_token_usage_summary.json"
+OUTPUT_HTML = HOME / "token_atlas.html"
+OUTPUT_DAILY_CSV = HOME / "token_atlas_usage_by_day.csv"
+OUTPUT_HOURLY_CSV = HOME / "token_atlas_usage_by_hour.csv"
+OUTPUT_MODEL_CSV = HOME / "token_atlas_usage_by_model.csv"
+OUTPUT_ROUTE_CSV = HOME / "token_atlas_usage_by_route.csv"
+OUTPUT_SESSION_CSV = HOME / "token_atlas_usage_by_session.csv"
+OUTPUT_JSON = HOME / "token_atlas_usage_summary.json"
 OUTPUT_ARTIFACTS = (
     OUTPUT_HTML,
     OUTPUT_DAILY_CSV,
@@ -68,24 +68,40 @@ INCREMENTAL_CACHE_VERSION = 4
 INCREMENTAL_CACHE_COMPATIBLE_VERSIONS = {1, 2, 3, INCREMENTAL_CACHE_VERSION}
 CACHE_ROOT = HOME / "Library" / "Caches" / "CodexTokenAtlas"
 ALL_MODELS_KEY = "all"
-ACHIEVEMENT_LEVEL_NAMES = ("铜", "银", "金", "钻石")
-STREAK_ACHIEVEMENT_TARGETS = (3, 7, 14)
+ACHIEVEMENT_CATALOG_REVISION = 3
+ACHIEVEMENT_LEVEL_NAMES = ("铜", "银", "金", "钻石", "星耀", "传奇")
+HIDDEN_ACHIEVEMENT_LEVELS = {"钻石", "星耀", "传奇"}
+STREAK_ACHIEVEMENT_TARGETS = (3, 7, 14, 30)
 ACTIVE_DAY_ACHIEVEMENT_TARGETS = (7, 30, 90, 365)
 CONVERSATION_ACHIEVEMENT_TARGETS = (10, 30, 100, 500)
 RECORD_ACHIEVEMENT_TARGETS = {
     "streak": STREAK_ACHIEVEMENT_TARGETS,
     "days": ACTIVE_DAY_ACHIEVEMENT_TARGETS,
     "sessions": CONVERSATION_ACHIEVEMENT_TARGETS,
-    "models": (2, 4, 6),
-    "session_models": (2, 3, 4),
-    "daily_sessions": (2, 4, 8),
-    "collaborative_sessions": (3, 10, 30),
+    "models": (2, 4, 6, 10),
+    "session_models": (2, 3, 4, 6),
+    "daily_sessions": (2, 4, 8, 16),
+    "collaborative_sessions": (3, 10, 30, 100),
     "collaborative_days": (3, 10, 30, 100),
-    "total_tokens": (100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000),
+    "total_tokens": (100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000, 50_000_000_000, 100_000_000_000),
     "output_tokens": (1_000_000, 5_000_000, 20_000_000, 100_000_000),
-    "reasoning_tokens": (500_000, 2_000_000, 10_000_000),
-    "cached_tokens": (100_000_000, 1_000_000_000, 5_000_000_000),
+    "reasoning_tokens": (500_000, 2_000_000, 10_000_000, 50_000_000),
+    "cached_tokens": (100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000),
+    "weekend_days": (1, 4, 12, 30),
+    "active_months": (2, 3, 6, 12),
+    "daily_models": (2, 3, 4, 6),
+    "team_workers": (2, 4, 8, 16),
+    "marathon_minutes": (10, 60, 480, 1440),
+    "daily_output_tokens": (100_000, 500_000, 1_000_000, 5_000_000),
+    "first_million": (1_000_000,),
 }
+TOKEN_JOURNEY_TITLES = ("亿点灵感", "十亿俱乐部", "灵感星河", "钻石宇宙", "星耀远航", "千亿传说")
+ACHIEVEMENT_DISPLAY_ORDER = (
+    "streak", "days", "weekend_days", "active_months", "marathon_minutes", "sessions",
+    "models", "daily_models", "session_models", "daily_sessions",
+    "collaborative_sessions", "collaborative_days", "team_workers",
+    "first_million", "total_tokens", "output_tokens", "daily_output_tokens", "reasoning_tokens", "cached_tokens",
+)
 RECORD_VOLUME_FIELDS = {
     "total_tokens": "total_tokens",
     "output_tokens": "output_tokens",
@@ -126,7 +142,7 @@ RELEVANT_USAGE_LINE_MARKERS = tuple(
     for marker in (f'"type":"{event_type}"', f'"type": "{event_type}"')
 ) + (b"<think",)
 
-PRICING_AS_OF = "2026-09-07"
+PRICING_AS_OF = "2026-10-11"
 LONG_CONTEXT_THRESHOLD = 272_000
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
 
@@ -142,15 +158,25 @@ def relevant_usage_line(line: bytes) -> bool:
 
 
 def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
-    entries: list[list[str | int]] = []
-    for path in sorted(source.sessions_root.rglob("*.jsonl")):
+    if source.format == "all":
+        entries = [["@all_sources_parser", 1]]
+        for child in available_usage_sources():
+            entries.append(["@source", child.key, str(child.home)])
+            entries.extend([[f"{child.key}:{row[0]}", *row[1:]] for row in source_input_manifest(child)])
+        entries.extend(_auxiliary_input_manifest(source, include_pricing=True))
+        return entries
+    entries: list[list[str | int]] = [["@achievement_catalog", ACHIEVEMENT_CATALOG_REVISION]]
+    paths = claude_log_files(source) if source.format == "claude" else sorted(source.sessions_root.rglob("*.jsonl"))
+    if source.format == "claude":
+        entries.append(["@claude_parser", 1])
+    for path in paths:
         try:
             stat = path.stat()
         except OSError:
             continue
         entries.append(
             [
-                str(path.relative_to(source.home)),
+                str(path) if source.format == "claude" else str(path.relative_to(source.home)),
                 int(stat.st_size),
                 int(stat.st_mtime_ns),
             ]
@@ -263,6 +289,9 @@ def pricing_configuration_revision(source: UsageSource) -> str:
     digest = hashlib.sha256()
     digest.update(PRICING_AS_OF.encode("utf-8"))
     digest.update(b"\0cost-schema=2")
+    if source.format == "all":
+        for child in available_usage_sources():
+            digest.update(child.key.encode() + pricing_configuration_revision(child).encode())
     digest.update(b"\0official=" + str(source.enable_official_pricing).encode("ascii"))
     if source.enable_official_pricing:
         digest.update(
@@ -450,7 +479,35 @@ def pricing_rate(
 
 
 PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
+    "claude-opus-5-5": pricing_rate(
+        4.0, 0.20, 20.0, cache_write_input_rate=5.0,
+        priority_rates=(8.0, 0.40, 10.0, 40.0), provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-sonnet-5-5": pricing_rate(
+        2.0, 0.10, 10.0, cache_write_input_rate=2.5, provider="Anthropic",
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
+    "claude-haiku-5-5": pricing_rate(
+        0.10, 0.01, 0.50, cache_write_input_rate=0.125, provider="Anthropic",
+        long_context_threshold=100_000, long_context_rates=(0.50, 0.05, 0.625, 2.50),
+        source="https://platform.claude.com/docs/en/about-claude/pricing",
+    ),
     # Current GPT families and historical standard API models.
+    "gpt-6.1-sol": pricing_rate(
+        2.0, 0.10, 10.0, cache_write_input_rate=2.5,
+        priority_rates=(4.0, 0.20, 5.0, 20.0),
+        long_context_threshold=LONG_CONTEXT_THRESHOLD,
+        long_context_rates=(4.0, 0.20, 5.0, 15.0),
+        source="https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    ),
+    "gpt-6-luna": pricing_rate(
+        0.10, 0.01, 0.50, cache_write_input_rate=0.125,
+        priority_rates=(0.20, 0.02, 0.25, 1.0),
+        long_context_threshold=LONG_CONTEXT_THRESHOLD,
+        long_context_rates=(0.20, 0.02, 0.25, 0.75),
+        source="https://developers.openai.com/api/docs/pricing",
+    ),
     "gpt-6-astra": pricing_rate(
         10.0, 1.0, 50.0,
         cache_write_input_rate=12.5,
@@ -930,9 +987,12 @@ class UsageSource:
     read_billing_context: bool = True
     read_service_tier: bool = True
     enable_official_pricing: bool = True
+    format: str = "codex"
 
     @property
     def sessions_root(self) -> Path:
+        if self.format in ("claude", "all"):
+            return self.home
         return self.home / "sessions"
 
     @property
@@ -958,6 +1018,12 @@ class UsageSource:
 
 def usage_source_from_home(home: Path) -> UsageSource:
     home = home.expanduser().resolve(strict=False)
+    if home == HOME.resolve():
+        return UsageSource("all", "全部", home, False, False, False, "all")
+    if (home.name == ".claude" or (home / "projects").is_dir()
+        or (home / "claude-code-sessions").is_dir()
+        or (home / "local-agent-mode-sessions").is_dir()):
+        return UsageSource("claude", "Claude", home, False, False, True, "claude")
     is_qodex = home == QODEX_HOME.resolve(strict=False) or home.name.lower() == ".qodex"
     if is_qodex:
         # Qodex can point at a local provider. Token accounting does not require
@@ -988,9 +1054,29 @@ def usage_source_from_home(home: Path) -> UsageSource:
     )
 
 
+def available_usage_sources() -> list[UsageSource]:
+    sources = []
+    seen = set()
+    for name in (".codex", ".qodex"):
+        home = (HOME / name).resolve()
+        root = (home / "sessions").resolve()
+        if root.is_dir() and root not in seen:
+            seen.add(root)
+            sources.append(usage_source_from_home(home))
+    desktop = HOME / "Library/Application Support/Claude"
+    configured = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(HOME / ".claude"))).expanduser()
+    for home in (desktop, HOME / ".claude", configured):
+        if any((home / name).is_dir() for name in ("projects", "claude-code-sessions", "local-agent-mode-sessions")):
+            sources.append(usage_source_from_home(home))
+            break
+    return sources
+
+
 def normalize_data_home(path: Path) -> Path:
     data_home = path.expanduser().resolve(strict=False)
     if data_home.name == "sessions" and not (data_home / "sessions").is_dir():
+        return data_home.parent
+    if data_home.name == "projects" and not (data_home / "projects").is_dir():
         return data_home.parent
     return data_home
 
@@ -1100,6 +1186,8 @@ class UsageReport:
     sessions: list[SessionStats]
     source_key: str = "codex"
     source_label: str = "Codex"
+    source_notice: str = ""
+    source_totals: dict[str, dict[str, Any]] = field(default_factory=dict)
     sessions_root: Path = SESSIONS_ROOT
     model_aliases_path: Path = MODEL_ALIASES_FILE
     billing_context: dict[str, Any] = field(default_factory=dict)
@@ -2147,7 +2235,12 @@ def cost_for_rates(usage: Counter, rates: dict[str, float | None]) -> Counter:
         if rate is None:
             result["unpriced_tokens"] += tokens
             continue
-        result[cost_field] = tokens / 1_000_000 * float(rate)
+        if token_field == "cache_write_input_tokens" and usage["cache_write_1h_input_tokens"]:
+            one_hour = min(tokens, usage["cache_write_1h_input_tokens"])
+            rate_1h = 2 * float(rates["input"] or 0)
+            result[cost_field] = ((tokens - one_hour) * float(rate) + one_hour * rate_1h) / 1_000_000
+        else:
+            result[cost_field] = tokens / 1_000_000 * float(rate)
         result["priced_tokens"] += tokens
     result["unpriced_tokens"] += int(usage["unclassified_tokens"])
     result["estimated_cost_usd"] = sum(
@@ -3618,6 +3711,7 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
     peak_rate, peak_output_rate = peak_usage_windows(events, PEAK_RATE_WINDOW_SECONDS)
     activity: dict[str, dict[str, Any]] = {}
     longest_activity = None
+    duration_unlocks: dict[int, str] = {}
     for event in events:
         stamp = event.timestamp.timestamp()
         owner = owners.get(event.session_id, event.session_id)
@@ -3631,6 +3725,9 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
         segment["last"] = stamp
         segment["total_tokens"] += event.usage["total_tokens"]
         duration = int(stamp - segment["first"])
+        for target in RECORD_ACHIEVEMENT_TARGETS["marathon_minutes"]:
+            if duration >= target * 60 and target not in duration_unlocks:
+                duration_unlocks[target] = event.timestamp.astimezone(LOCAL_TZ).date().isoformat()
         if duration > 0 and (longest_activity is None or duration > longest_activity["seconds"]):
             longest_activity = {
                 "session_id": owner, "title": clean_text(stats.descriptor.thread.title or "(untitled)", limit=500),
@@ -3641,6 +3738,7 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
     # One chronological pass establishes the earliest confirmable attainment
     # dates, independently of cumulative counters whose timestamps may be absent.
     unlocks: dict[str, dict[int, str]] = defaultdict(dict)
+    unlocks["marathon_minutes"].update(duration_unlocks)
     day_usage: dict[str, Counter] = defaultdict(Counter)
     day_sessions: dict[str, set[str]] = defaultdict(set)
     day_models: dict[str, set[str]] = defaultdict(set)
@@ -3650,6 +3748,8 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
     observed_session_models: dict[str, set[str]] = defaultdict(set)
     observed_workers: dict[str, set[str]] = defaultdict(set)
     collaborative_days: set[str] = set()
+    weekend_days: set[str] = set()
+    active_months: set[str] = set()
     observed_volumes: Counter = Counter()
 
     def confirm(key: str, value: int, day: str) -> None:
@@ -3662,9 +3762,16 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
         model = normalized_model_id(event.model)
         owner = owners.get(event.session_id, event.session_id)
         day_usage[day].update(event.usage)
+        active_months.add(day[:7])
+        confirm("active_months", len(active_months), day)
+        if date.fromisoformat(day).weekday() >= 5:
+            weekend_days.add(day)
+            confirm("weekend_days", len(weekend_days), day)
+        confirm("daily_output_tokens", day_usage[day]["output_tokens"], day)
         model_dates.setdefault(model, {"first_used": day})["last_used"] = day
         if known_model(model):
             day_models[day].add(model)
+            confirm("daily_models", len(day_models[day]), day)
             observed_models.add(model)
             confirm("models", len(observed_models), day)
         if owner in visible_ids:
@@ -3677,12 +3784,14 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
                 confirm("session_models", len(observed_session_models[owner]), day)
             if worker_id is not None:
                 observed_workers[owner].add(worker_id)
+                confirm("team_workers", len(observed_workers[owner]), day)
                 collaborative_days.add(day)
                 confirm("collaborative_sessions", len(observed_workers), day)
                 confirm("collaborative_days", len(collaborative_days), day)
         for key, field_name in RECORD_VOLUME_FIELDS.items():
             observed_volumes[key] += event.usage[field_name]
             confirm(key, observed_volumes[key], day)
+        confirm("first_million", observed_volumes["total_tokens"], day)
 
     days = [
         {"date": day, "total_tokens": usage["total_tokens"], "output_tokens": usage["output_tokens"],
@@ -3742,6 +3851,13 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
         ("output_tokens", "输出积累", "text.alignleft", "volume", "累计输出 Token", "累计报告输出用量；日期以可确认时间的事件累计首次达到门槛为准。", report.totals["output_tokens"], "Token"),
         ("reasoning_tokens", "推理足迹", "brain", "volume", "累计推理 Token", "累计报告推理用量，包含报告已计入的估算值；日期以可确认时间的事件累计为准。", report.totals["reasoning_output_tokens"], "Token"),
         ("cached_tokens", "缓存接力", "arrow.triangle.2.circlepath", "volume", "累计缓存输入 Token", "累计报告缓存输入用量；日期以可确认时间的事件累计首次达到门槛为准。", report.totals["cached_input_tokens"], "Token"),
+        ("weekend_days", "周末漫游", "sun.horizon", "habit", "周末有用量的日期", "累计在报告时区的周六或周日使用的不同日期，同一天计一次。", len(weekend_days), "天"),
+        ("active_months", "跨月足迹", "calendar.badge.clock", "habit", "留下足迹的月份", "累计有可确认用量的不同年月，同一个月计一次。", len(active_months), "月"),
+        ("daily_models", "模型调色盘", "paintpalette", "exploration", "单日尝试的最多模型", "记录同一天使用过的最多已知模型，同一模型的不同服务档位合并计数。", max(map(len, day_models.values()), default=0), "种"),
+        ("team_workers", "一呼百应", "person.3.sequence", "collaboration", "单条对话的协作队伍", "记录单条用户对话中参与自身调用的不同工作线程数量。", len(workers_by_session.get(largest_team_id, set())), "个"),
+        ("marathon_minutes", "一气呵成", "figure.run", "habit", "最长连续对话片段", "用量记录相邻间隔不超过30分钟，计为同一段连续对话；取最长片段时长。", (longest_activity["seconds"] // 60) if longest_activity else 0, "分钟"),
+        ("daily_output_tokens", "输出小宇宙", "sparkles.rectangle.stack", "volume", "单日最多输出 Token", "记录有可确认时间的单日输出峰值。", peak_output_day["output_tokens"] if peak_output_day else 0, "Token"),
+        ("first_million", "百万起航", "paperplane", "volume", "第一站：百万 Token", "累计报告用量达到100万 Token，点亮起航徽章。", report.totals["total_tokens"], "Token"),
     ):
         levels = []
         for name, goal in zip(ACHIEVEMENT_LEVEL_NAMES, RECORD_ACHIEVEMENT_TARGETS[key]):
@@ -3750,12 +3866,17 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
                 unlocked_on = streak_unlocks.get(goal)
             elif key == "days" and len(active_days) >= goal:
                 unlocked_on = active_days[goal - 1].isoformat()
-            levels.append({"name": name, "target": goal, "unlocked_on": unlocked_on, "hidden": name == "钻石"})
+            level_title = TOKEN_JOURNEY_TITLES[len(levels)] if key == "total_tokens" else None
+            levels.append({"name": name, "target": goal, "unlocked_on": unlocked_on,
+                           "hidden": name in HIDDEN_ACHIEVEMENT_LEVELS, "title": level_title})
         achievements.append({"id": key, "title": title, "symbol": symbol, "detail": detail,
                              "category": category, "rule": rule,
                              "value": value, "current_value": current_streak if key == "streak" else value,
                              "unit": unit, "levels": levels})
+    display_order = {key: index for index, key in enumerate(ACHIEVEMENT_DISPLAY_ORDER)}
+    achievements.sort(key=lambda badge: display_order[badge["id"]])
     return {
+        "catalog_revision": ACHIEVEMENT_CATALOG_REVISION,
         "as_of": today.isoformat(), "active_days": len(active_days),
         "current_streak": current_streak, "longest_streak": longest_streak,
         "longest_streak_start": longest_start.isoformat() if longest_start else None,
@@ -3771,7 +3892,8 @@ def build_usage_records(report: UsageReport, today: date | None = None) -> dict[
 
 def cached_usage_records(report: UsageReport) -> dict[str, Any]:
     today = datetime.now(LOCAL_TZ).date()
-    if report.records_cache is None or report.records_cache.get("as_of") != today.isoformat():
+    if (report.records_cache is None or report.records_cache.get("as_of") != today.isoformat()
+        or report.records_cache.get("catalog_revision") != ACHIEVEMENT_CATALOG_REVISION):
         report.records_cache = build_usage_records(report, today)
     return report.records_cache
 
@@ -3948,6 +4070,8 @@ def build_dashboard_data(report: UsageReport) -> dict[str, Any]:
     return {
         "source_id": report.source_key,
         "source_label": report.source_label,
+        "source_notice": getattr(report, "source_notice", ""),
+        "source_totals": getattr(report, "source_totals", {}),
         "generated_at": generated_at.isoformat(),
         "generated_at_label": generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "timezone": LOCAL_TZ.key,
@@ -4017,7 +4141,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex Token Atlas</title>
+<title>Token Atlas</title>
 <style>
 :root {
   color-scheme: light;
@@ -4543,14 +4667,14 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   </section>
 
   <div class="split">
-    <section class="panel"><div class="panel-inner"><div class="panel-head"><div><h2>模型分布</h2><p class="panel-kicker">模型取自每次调用前最近的 turn_context，不使用会话最终模型覆盖历史。</p></div></div><div class="table-wrap"><table><thead><tr><th>Model</th><th>Total</th><th>Share</th><th>Calls</th><th>Cache</th></tr></thead><tbody id="modelRows"></tbody></table></div></div></section>
-    <section class="panel"><div class="panel-inner"><div class="panel-head"><div><h2>高用量日期</h2><p class="panel-kicker" id="topDaysCaption"></p></div></div><div class="table-wrap"><table><thead><tr><th>Date</th><th id="topDaysMetric">Metric</th><th>Total</th><th>Calls</th></tr></thead><tbody id="topDayRows"></tbody></table></div></div></section>
+    <section class="panel"><div class="panel-inner"><div class="panel-head"><div><h2>模型分布</h2><p class="panel-kicker">按模型汇总调用用量。</p></div></div><div class="controls" id="modelsPager"></div><div class="table-wrap"><table><thead><tr><th>Model</th><th>Total</th><th>Share</th><th>Calls</th><th>Cache</th></tr></thead><tbody id="modelRows"></tbody></table></div></div></section>
+    <section class="panel"><div class="panel-inner"><div class="panel-head"><div><h2>高用量日期</h2><p class="panel-kicker" id="topDaysCaption"></p></div></div><div class="controls" id="daysPager"></div><div class="table-wrap"><table><thead><tr><th>Date</th><th id="topDaysMetric">Metric</th><th>Total</th><th>Calls</th></tr></thead><tbody id="topDayRows"></tbody></table></div></div></section>
   </div>
 
   <section class="panel">
     <div class="panel-inner">
-      <div class="panel-head"><div><h2>会话用量</h2><p class="panel-kicker">每行是一段用户可见会话；内部线程归并到所属会话，显式用户 fork 单独列出。</p></div><div class="scale-note">TOP 30 / CURRENT FILTER</div></div>
-      <div class="table-wrap"><table><thead><tr><th>Session</th><th>Models</th><th>Routing</th><th id="sessionMetric">Metric</th><th>Calls</th><th>Branch</th></tr></thead><tbody id="sessionRows"></tbody></table></div>
+      <div class="panel-head"><div><h2>会话用量</h2><p class="panel-kicker">每行是一段用户可见会话；内部线程归并到所属会话，显式用户 fork 单独列出。</p></div><div class="scale-note">20 / PAGE</div></div>
+      <div class="table-wrap"><table><thead><tr><th>Session</th><th>Models</th><th>Routing</th><th id="sessionMetric">Metric</th><th>Calls</th><th>Branch</th></tr></thead><tbody id="sessionRows"></tbody></table></div><div class="controls" id="sessionsPager"></div>
     </div>
   </section>
 
@@ -4566,7 +4690,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
         <div class="cost-metric"><span class="cost-label">Tier premium</span><strong class="cost-value" id="tierPremium">$0.00</strong><small class="cost-detail" id="tierPremiumDetail"></small></div>
         <div class="cost-metric"><span class="cost-label">Cache savings</span><strong class="cost-value" id="cacheSavings">$0.00</strong><small class="cost-detail" id="cacheSavingsDetail"></small></div>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>Route provider</th><th>Model</th><th>Tier</th><th>Priced as</th><th>Value</th><th>Input / MTok</th><th>Cache read</th><th>Cache write</th><th>Output / MTok</th><th>Calls</th><th>Unpriced</th></tr></thead><tbody id="costRows"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Model</th><th>Tokens</th><th>Value</th><th>Input / MTok</th><th>Cache read</th><th>Cache write</th><th>Output / MTok</th><th>Calls</th></tr></thead><tbody id="costRows"></tbody></table></div>
       <p class="method" id="costMethod"></p>
       <div class="pricing-sources" id="pricingSources"></div>
     </div>
@@ -4603,7 +4727,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   };
   const weekdays = ["周一","周二","周三","周四","周五","周六","周日"];
   const palette = ["#087968","#2878a8","#d67834","#ba4d3c","#6b8c2f","#b48716","#39756c","#8b6353"];
-  const state = {model:"all", metric:"total_tokens"};
+  const state = {model:"all", metric:"total_tokens", pages:{models:0,days:0,sessions:0}};
   const modelSelect = document.getElementById("modelSelect");
   const metricSelect = document.getElementById("metricSelect");
 
@@ -4740,9 +4864,21 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("calendarLegendMax").textContent = short(cap);
   }
 
+  function pageRows(rows, section, size) {
+    const pages = Math.max(1, Math.ceil(rows.length / size));
+    const page = state.pages[section] = Math.min(state.pages[section], pages - 1);
+    document.getElementById(`${section}Pager`).innerHTML = `<span>${rows.length} 条</span><button data-page-section="${section}" data-page-step="-1" ${page === 0 ? "disabled" : ""}>上一页</button><span>${page+1} / ${pages}</span><button data-page-section="${section}" data-page-step="1" ${page+1 === pages ? "disabled" : ""}>下一页</button>`;
+    return rows.slice(page * size, (page + 1) * size);
+  }
+  document.addEventListener("click", event => {
+    const button = event.target.closest("[data-page-section]");
+    if (!button || button.disabled) return;
+    state.pages[button.dataset.pageSection] += Number(button.dataset.pageStep);
+    renderModels(); renderTopDays(); renderSessions();
+  });
   function renderModels() {
     const all = data.totals.all.total_tokens || 1;
-    document.getElementById("modelRows").innerHTML = data.models.map((model, index) => {
+    document.getElementById("modelRows").innerHTML = pageRows(data.models, "models", 10).map((model, index) => {
       const usage = data.totals[model] || zeroUsage;
       const share = usage.total_tokens / all;
       const cache = usage.input_tokens ? usage.cached_input_tokens / usage.input_tokens : 0;
@@ -4752,18 +4888,18 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
 
   function renderTopDays() {
     const daily = data.daily[state.model] || data.daily.all;
-    const rows = Object.entries(daily).map(([day, usage]) => ({day, usage, value:metricValue(usage)})).filter(item => item.value > 0).sort((a,b) => b.value-a.value).slice(0,10);
+    const rows = Object.entries(daily).map(([day, usage]) => ({day, usage, value:metricValue(usage)})).filter(item => item.value > 0).sort((a,b) => b.value-a.value);
     document.getElementById("topDaysMetric").textContent = metrics[state.metric].short;
     document.getElementById("topDaysCaption").textContent = `${modelLabel(state.model)} · ${metrics[state.metric].label}`;
-    document.getElementById("topDayRows").innerHTML = rows.map(item => `<tr><td>${item.day}</td><td>${fmt(item.value)}</td><td>${short(item.usage.total_tokens)}</td><td>${fmt(item.usage.calls)}</td></tr>`).join("") || `<tr><td colspan="4">No usage</td></tr>`;
+    document.getElementById("topDayRows").innerHTML = pageRows(rows, "days", 10).map(item => `<tr><td>${item.day}</td><td>${fmt(item.value)}</td><td>${short(item.usage.total_tokens)}</td><td>${fmt(item.usage.calls)}</td></tr>`).join("") || `<tr><td colspan="4">No usage</td></tr>`;
   }
 
   function sessionUsage(session) { return state.model === "all" ? session.totals : (session.by_model[state.model] || zeroUsage); }
   function tierLabel(tier) { return tier === "priority" ? "priority / fast" : tier; }
   function renderSessions() {
-    const rows = data.sessions.map(session => ({session, usage:sessionUsage(session)})).filter(item => metricValue(item.usage) > 0).sort((a,b) => metricValue(b.usage)-metricValue(a.usage)).slice(0,30);
+    const rows = data.sessions.map(session => ({session, usage:sessionUsage(session)})).filter(item => metricValue(item.usage) > 0).sort((a,b) => metricValue(b.usage)-metricValue(a.usage));
     document.getElementById("sessionMetric").textContent = metrics[state.metric].short;
-    document.getElementById("sessionRows").innerHTML = rows.map(({session,usage}) => {
+    document.getElementById("sessionRows").innerHTML = pageRows(rows, "sessions", 20).map(({session,usage}) => {
       const models = Object.entries(session.by_model).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([model]) => `<span class="badge">${escapeHtml(model)}</span>`).join("");
       const providers = Object.entries(session.by_provider || {}).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([provider]) => `<span class="badge provider-badge">${escapeHtml(provider)}</span>`).join("");
       const tiers = Object.entries(session.by_service_tier || {}).sort((a,b) => b[1].total_tokens-a[1].total_tokens).map(([tier]) => `<span class="badge tier-badge">${escapeHtml(tierLabel(tier))}</span>`).join("");
@@ -4803,18 +4939,24 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       : "UNPRICED SOURCE";
 
     const visibleRoutes = pricing.routes.filter(route => state.model === "all" || route.model === state.model);
-    const rateCell = value => value == null ? "—" : usd(value);
-    document.getElementById("costRows").innerHTML = visibleRoutes.map(detail => {
-      const rates = detail.rates;
-      const routeCost = detail.costs || zeroCost;
-      const pricedAs = detail.pricing_model
-        ? `${escapeHtml(detail.pricing_provider || "")}${detail.pricing_provider ? " / " : ""}${escapeHtml(detail.pricing_model)}`
-        : `<span class="cost-warning">Not priced</span>`;
-      const valueTooltip = `Input: ${usd(routeCost.uncached_input_cost_usd)} · Cache read: ${usd(routeCost.cached_input_cost_usd)} · Cache write: ${usd(routeCost.cache_write_input_cost_usd)} · Output: ${usd(routeCost.output_cost_usd)}`;
-      return `<tr><td><span class="badge provider-badge">${escapeHtml(detail.route_provider)}</span></td><td>${escapeHtml(detail.model)}</td><td><span class="badge tier-badge">${escapeHtml(tierLabel(detail.service_tier))}</span></td><td>${pricedAs}</td><td data-tooltip="${escapeHtml(valueTooltip)}">${routeCost.priced_tokens ? usd(routeCost.estimated_cost_usd) : "—"}</td><td>${rateCell(rates?.input)}</td><td>${rateCell(rates?.cached_input)}</td><td>${rateCell(rates?.cache_write_input)}</td><td>${rateCell(rates?.output)}</td><td>${fmt(detail.usage.calls)}</td><td>${short(routeCost.unpriced_tokens)}</td></tr>`;
-    }).join("") || `<tr><td colspan="11">No usage for this filter</td></tr>`;
+    const grouped = new Map();
+    visibleRoutes.forEach(detail => {
+      const group = grouped.get(detail.model) || {model:detail.model,usage:{},costs:{},rates:[]};
+      Object.entries(detail.usage).forEach(([key,value]) => group.usage[key] = (group.usage[key] || 0) + value);
+      Object.entries(detail.costs).forEach(([key,value]) => group.costs[key] = (group.costs[key] || 0) + value);
+      if (detail.rates) group.rates.push(detail.rates);
+      grouped.set(detail.model, group);
+    });
+    document.getElementById("costRows").innerHTML = [...grouped.values()].sort((a,b) => b.usage.total_tokens-a.usage.total_tokens).map(group => {
+      const rateCell = key => {
+        const rates = [...new Set(group.rates.map(r => r[key]).filter(v => v != null))].sort((a,b) => a-b);
+        return !rates.length ? "—" : rates.length === 1 ? usd(rates[0]) : `${usd(rates[0])}–${usd(rates[rates.length-1])}`;
+      };
+      const write = group.usage.cache_write_input_tokens && group.costs.priced_tokens ? usd(group.costs.cache_write_input_cost_usd * 1e6 / group.usage.cache_write_input_tokens) : rateCell("cache_write_input");
+      return `<tr><td>${escapeHtml(group.model)}</td><td>${fmt(group.usage.total_tokens)}</td><td>${group.costs.priced_tokens ? usd(group.costs.estimated_cost_usd) : "未匹配价格"}</td><td>${rateCell("input")}</td><td>${rateCell("cached_input")}</td><td>${write}</td><td>${rateCell("output")}</td><td>${fmt(group.usage.calls)}</td></tr>`;
+    }).join("") || `<tr><td colspan="8">No usage for this filter</td></tr>`;
 
-    const unpricedNote = cost.unpriced_tokens ? ` ${fmt(cost.unpriced_tokens)} 个无法分类或暂无官方价格的 token 未计价。` : "";
+    const unpricedNote = "";
     const authMode = String(pricing.billing_context?.current_auth_mode || "unknown").toLowerCase();
     const authNote = authMode.includes("api")
       ? "当前认证为 API key；Priority/Fast 路由按官方 API Priority 价估算。"
@@ -4915,6 +5057,7 @@ def render_html(report: UsageReport, dashboard_data: dict[str, Any] | None = Non
     return (
         HTML_TEMPLATE
         .replace("__SOURCE_LABEL__", html.escape(report.source_label))
+        .replace("__SOURCE_NOTICE__", html.escape(getattr(report, "source_notice", "")))
         .replace("__DATA_JSON__", encoded)
     )
 
@@ -5133,15 +5276,25 @@ def summary_payload(
         "generated_at": datetime.now(LOCAL_TZ).isoformat(),
         "timezone": LOCAL_TZ.key,
         "accounting_method": (
+            "sum source-deduplicated Codex and Claude usage events"
+            if report.source_key == "all" else
+            "sum unique Claude assistant message usage, including cache read and creation"
+            if report.source_key == "claude" else
             "sum unique last_token_usage events; roll internal threads into "
             "their user-visible conversation"
         ),
         "deduplication_key": (
+            "source namespace + source-native event identity"
+            if report.source_key == "all" else
+            "Claude message ID (request ID fallback); retain most complete usage snapshot"
+            if report.source_key == "claude" else
             "physical_lineage_root + turn_id + route + cumulative_usage + "
             "last_usage + context_window"
         ),
         "source_id": report.source_key,
         "source_label": report.source_label,
+        "source_notice": getattr(report, "source_notice", ""),
+        "source_totals": getattr(report, "source_totals", {}),
         "sessions_root": str(report.sessions_root),
         "dashboard": dashboard,
         "totals": counter_dict(report.totals),
@@ -5283,8 +5436,8 @@ def run_records_self_test() -> None:
     streak_badge = next(a for a in records["achievements"] if a["id"] == "streak")
     assert streak_badge["levels"][0]["unlocked_on"] == "2026-01-03"
     assert streak_badge["levels"][1]["unlocked_on"] == "2026-01-07"
-    assert [level["target"] for level in streak_badge["levels"]] == [3, 7, 14]
-    assert [level["name"] for level in streak_badge["levels"]] == ["铜", "银", "金"]
+    assert [level["target"] for level in streak_badge["levels"]] == [3, 7, 14, 30]
+    assert [level["name"] for level in streak_badge["levels"]] == ["铜", "银", "金", "钻石"]
     interrupted = build_usage_records(report, date(2026, 1, 10))
     assert interrupted["current_streak"] == 0 and interrupted["longest_streak"] == 7
     interrupted_badge = next(a for a in interrupted["achievements"] if a["id"] == "streak")
@@ -5302,7 +5455,7 @@ def run_records_self_test() -> None:
     milestones = UsageReport(sessions=[milestone_session])
     for offset in range(365):
         add_usage(milestones, milestone_session, "test", "test", "default", "", start + timedelta(days=offset), Counter(total_tokens=1, calls=1))
-    for days, streak_levels, active_levels in ((2, 0, 0), (3, 1, 0), (6, 1, 0), (7, 2, 1), (13, 2, 1), (14, 3, 1), (29, 3, 1), (30, 3, 2), (89, 3, 2), (90, 3, 3), (364, 3, 3), (365, 3, 4)):
+    for days, streak_levels, active_levels in ((2, 0, 0), (3, 1, 0), (6, 1, 0), (7, 2, 1), (13, 2, 1), (14, 3, 1), (29, 3, 1), (30, 4, 2), (89, 4, 2), (90, 4, 3), (364, 4, 3), (365, 4, 4)):
         milestone_records = build_usage_records(milestones, start.date() + timedelta(days=days - 1))
         for badge, expected_levels in zip(milestone_records["achievements"][:2], (streak_levels, active_levels)):
             assert sum(badge["value"] >= level["target"] for level in badge["levels"]) == expected_levels
@@ -5368,7 +5521,7 @@ def run_records_self_test() -> None:
     badges = {a["id"]: a for a in exploration_records["achievements"]}
     assert badges["models"]["value"] == badges["session_models"]["value"] == 4
     assert badges["models"]["levels"][0]["unlocked_on"] == "2026-01-02"
-    assert [level["unlocked_on"] for level in badges["session_models"]["levels"]] == ["2026-01-02", "2026-01-04", "2026-01-05"]
+    assert [level["unlocked_on"] for level in badges["session_models"]["levels"]] == ["2026-01-02", "2026-01-04", "2026-01-05", None]
     footprints = exploration_records["insights"]["models"]
     assert [item["id"] for item in footprints[:2]] == ["claude-y", "gpt-x"]
     footprint_by_id = {item["id"]: item for item in footprints}
@@ -5454,6 +5607,9 @@ def run_records_self_test() -> None:
     assert team_badges["collaborative_days"]["levels"][0]["unlocked_on"] == "2026-01-05"
     assert team_records["insights"]["collaborative_days"] == 3
     assert team_records["insights"]["largest_team_session"] == {"session_id": "team-parent", "title": "team-parent", "worker_count": 2}
+    assert team_badges["team_workers"]["value"] == 2
+    assert team_badges["team_workers"]["levels"][0]["unlocked_on"] == "2026-01-04"
+    assert all(level["unlocked_on"] is None for level in team_badges["team_workers"]["levels"][1:])
     assert team_badges["sessions"]["value"] == 2
     assert team_records["insights"]["busiest_day"]["sessions"] == 1
     assert team_records["insights"]["most_models_session"]["model_count"] == 5
@@ -5614,19 +5770,14 @@ def run_records_self_test() -> None:
         "peak_day": None, "peak_output_day": None, "busiest_day": None, "most_models_session": None, "models": [],
         "collaborative_days": 0, "largest_team_session": None,
     }
-    assert [a["id"] for a in empty["achievements"]] == [
-        "streak", "days", "sessions", "models", "session_models", "daily_sessions", "collaborative_sessions",
-        "collaborative_days", "total_tokens", "output_tokens", "reasoning_tokens", "cached_tokens",
-    ]
-    assert [a["category"] for a in empty["achievements"]] == ["habit"] * 3 + ["exploration"] * 3 + ["collaboration"] * 2 + ["volume"] * 4
-    assert [list(level["target"] for level in a["levels"]) for a in empty["achievements"]] == [
-        [3, 7, 14], [7, 30, 90, 365], [10, 30, 100, 500], [2, 4, 6], [2, 3, 4], [2, 4, 8], [3, 10, 30], [3, 10, 30, 100],
-        [100_000_000, 1_000_000_000, 5_000_000_000, 25_000_000_000], [1_000_000, 5_000_000, 20_000_000, 100_000_000],
-        [500_000, 2_000_000, 10_000_000], [100_000_000, 1_000_000_000, 5_000_000_000],
-    ]
-    assert all(a["rule"] and [level["name"] for level in a["levels"][:3]] == ["铜", "银", "金"] for a in empty["achievements"])
-    assert {a["id"] for a in empty["achievements"] if len(a["levels"]) == 4} == {"days", "sessions", "collaborative_days", "total_tokens", "output_tokens"}
-    assert all(level["hidden"] == (level["name"] == "钻石") for a in empty["achievements"] for level in a["levels"])
+    assert tuple(a["id"] for a in empty["achievements"]) == ACHIEVEMENT_DISPLAY_ORDER
+    assert set(ACHIEVEMENT_DISPLAY_ORDER) == set(RECORD_ACHIEVEMENT_TARGETS)
+    assert {a["category"] for a in empty["achievements"]} == {"habit", "exploration", "collaboration", "volume"}
+    for badge in empty["achievements"]:
+        assert tuple(level["target"] for level in badge["levels"]) == RECORD_ACHIEVEMENT_TARGETS[badge["id"]]
+        assert badge["rule"] and [level["name"] for level in badge["levels"][:3]] == list(ACHIEVEMENT_LEVEL_NAMES[:min(3, len(badge["levels"]))])
+    assert all(level["hidden"] == (level["name"] in HIDDEN_ACHIEVEMENT_LEVELS) for a in empty["achievements"] for level in a["levels"])
+    assert empty["catalog_revision"] == ACHIEVEMENT_CATALOG_REVISION
     assert REPORT_SCHEMA_VERSION == 11 and INCREMENTAL_CACHE_VERSION == 4
 
 
@@ -6270,7 +6421,231 @@ def run_self_test() -> None:
     )
 
 
+def claude_log_roots(source: UsageSource) -> list[Path]:
+    """Only transcript locations; never walk browser storage or credentials."""
+    desktop = HOME / "Library/Application Support/Claude"
+    homes = [source.home]
+    if source.home in (HOME / ".claude", desktop):
+        homes.extend([HOME / ".claude", desktop])
+        configured = os.environ.get("CLAUDE_CONFIG_DIR")
+        if configured:
+            homes.append(Path(configured).expanduser().resolve())
+    roots = []
+    for home in homes:
+        for name in ("projects", "claude-code-sessions", "local-agent-mode-sessions"):
+            root = home / name
+            if root not in roots:
+                roots.append(root)
+    return roots
+
+
+def claude_log_files(source: UsageSource) -> list[Path]:
+    files: set[Path] = set()
+    for root in claude_log_roots(source):
+        for directory, names, filenames in os.walk(root, followlinks=False):
+            names[:] = [n for n in names if n not in ("skills-plugin", "memory", ".git", "node_modules")]
+            for name in filenames:
+                path = Path(directory) / name
+                if name.endswith(".jsonl") and path.is_file() and not path.is_symlink():
+                    files.add(path.resolve())
+    return sorted(files)
+
+
+def claude_usage_values(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict) or not any(k in value for k in ("input_tokens", "output_tokens")):
+        return None
+    fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    if any(not isinstance(value.get(k, 0), int) or isinstance(value.get(k, 0), bool)
+           or value.get(k, 0) < 0 for k in fields):
+        return None
+    uncached, output, cached, written = (value.get(k, 0) for k in fields)
+    # Anthropic reports uncached input separately from cache reads and writes.
+    creation = value.get("cache_creation", {})
+    one_hour = creation.get("ephemeral_1h_input_tokens", 0) if isinstance(creation, dict) else 0
+    if not isinstance(one_hour, int) or isinstance(one_hour, bool) or not 0 <= one_hour <= written:
+        one_hour = 0
+    return {"input_tokens": uncached + cached + written, "cached_input_tokens": cached,
+            "cache_write_input_tokens": written, "output_tokens": output,
+            "cache_write_1h_input_tokens": one_hour,
+            "total_tokens": uncached + cached + written + output}
+
+
+def collect_claude_usage(source: UsageSource) -> UsageReport:
+    prices, aliases, custom_models, errors = current_pricing_configuration(source)
+    report = UsageReport(sessions=[], source_key=source.key, source_label=source.label,
+                         sessions_root=source.sessions_root, model_aliases_path=source.model_aliases_file,
+                         pricing_catalog=prices, custom_pricing_models=custom_models,
+                         pricing_aliases=aliases, pricing_config_errors=errors,
+                         pricing_revision=pricing_configuration_revision(source))
+    stats_by_id: dict[str, SessionStats] = {}
+    calls: dict[str, dict[str, Any]] = {}
+    files = claude_log_files(source)
+    unreadable = malformed = skipped = 0
+    # Oldest original wins ownership when a resumed/forked transcript replays a message.
+    for path in sorted(files, key=lambda p: (p.stat().st_mtime_ns, str(p))):
+        try:
+            handle = path.open("rb")
+        except OSError:
+            unreadable += 1
+            continue
+        with handle:
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    break  # An actively written final record is read on the next refresh.
+                try:
+                    obj = decode_json(line)
+                except ValueError:
+                    malformed += 1
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                    continue
+                message = obj.get("message")
+                if not isinstance(message, dict) or message.get("role", "assistant") != "assistant":
+                    continue
+                values = claude_usage_values(message.get("usage"))
+                identity = clean_text(message.get("id")) or clean_text(obj.get("requestId"))
+                if values is None or not identity:
+                    skipped += 1
+                    continue
+                stamp = clean_text(obj.get("timestamp"))
+                try:
+                    parsed_stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                    valid_stamp = parsed_stamp.tzinfo is not None
+                except ValueError:
+                    valid_stamp = False
+                session_id = clean_text(obj.get("sessionId")) or path.stem
+                parent = ""
+                if path.parent.name == "subagents":
+                    parent = path.parent.parent.name
+                    session_id = parent + "/" + path.stem
+                elif obj.get("isSidechain") and path.stem.startswith("agent-"):
+                    parent, session_id = session_id, session_id + "/" + path.stem
+                if session_id not in stats_by_id:
+                    descriptor = SessionDescriptor(path=path, session_id=session_id, parent_id="",
+                        root_id=parent or session_id, dedupe_root_id=parent or session_id,
+                        lineage_depth=1 if parent else 0, created_at=stamp if valid_stamp else "",
+                        model_provider="anthropic", source="claude", physical_parent_id=parent,
+                        conversation_id=parent or session_id, is_internal=bool(parent),
+                        thread=ThreadInfo(thread_id=session_id, title="Claude · " + path.stem))
+                    stats_by_id[session_id] = SessionStats(descriptor)
+                stats = stats_by_id[session_id]
+                stats.raw_events += 1
+                report.raw_events += 1
+                if identity in calls:
+                    old = calls[identity]
+                    report.duplicate_events += 1
+                    if old["owner"] == session_id:
+                        stats.local_duplicate_events += 1
+                        report.local_duplicate_events += 1
+                    else:
+                        stats.inherited_events += 1
+                        report.inherited_events += 1
+                    # Content blocks and streaming snapshots repeat the same message.
+                    # Retain the most complete output snapshot, never sum the repeats.
+                    if (values["output_tokens"], values["total_tokens"]) > (old["values"]["output_tokens"], old["values"]["total_tokens"]):
+                        old["values"] = values
+                    continue
+                calls[identity] = {"owner": session_id, "values": values, "timestamp": stamp,
+                    "valid_timestamp": valid_stamp, "model": clean_text(message.get("model")) or UNKNOWN_MODEL,
+                    "tier": "priority" if message.get("usage", {}).get("speed") == "fast" else normalize_service_tier(message.get("usage", {}).get("service_tier"))}
+    for identity, call in calls.items():
+        stats = stats_by_id[call["owner"]]
+        values = call["values"]
+        usage = usage_from_values(values, stats)
+        usage["cache_write_1h_input_tokens"] = values["cache_write_1h_input_tokens"]
+        timestamp = parse_timestamp(call["timestamp"], datetime.fromtimestamp(stats.descriptor.path.stat().st_mtime, tz=LOCAL_TZ))
+        if not call["valid_timestamp"]:
+            stats.missing_timestamp_events += 1
+            report.missing_timestamp_events += 1
+        stamps = [s for s in [stats.first_timestamp, stats.last_timestamp, timestamp.isoformat()] if s]
+        stats.first_timestamp, stats.last_timestamp = min(stamps), max(stamps)
+        stats.unique_events += 1
+        fingerprint = event_fingerprint(stats.descriptor.root_id, identity, "anthropic", call["model"],
+                                        call["tier"], "", values, values, 0)
+        report.seen_fingerprints[fingerprint] = call["owner"]
+        add_usage(report, stats, "anthropic", call["model"], call["tier"], "", timestamp, usage)
+    report.sessions = list(stats_by_id.values())
+    report.rollout_files = len(files)
+    report.internal_threads = sum(s.descriptor.is_internal for s in report.sessions)
+    report.conversation_sessions = len(report.sessions) - report.internal_threads
+    aggregate_internal_threads(report)
+    report.null_usage_events = skipped
+    report.source_notice = (
+        "等待本地记录：尚未发现带 Token 用量的会话日志。扫描范围：Claude Code 与桌面任务记录；普通聊天需有完整的本地用量记录才能统计。"
+        if not calls else
+        ""
+    )
+    if unreadable or malformed or skipped:
+        report.source_notice += f" 未读取文件 {unreadable}，无效记录 {malformed}，缺少用量或消息标识 {skipped}。"
+    return report
+
+
+def collect_combined_usage(source: UsageSource) -> UsageReport:
+    report = UsageReport(sessions=[], source_key="all", source_label="全部",
+                         sessions_root=source.home, model_aliases_path=source.model_aliases_file,
+                         configured_service_tier_fallback="per-source",
+                         pricing_revision=pricing_configuration_revision(source))
+
+    def merge_counters(target, incoming):
+        if isinstance(incoming, Counter):
+            target.update(incoming)
+        else:
+            for key, value in incoming.items():
+                merge_counters(target[key], value)
+
+    counter_maps = {f.name for f in fields(report)
+                    if isinstance(getattr(report, f.name), (Counter, defaultdict))}
+    for child in available_usage_sources():
+        parsed = incrementally_refresh_usage(child) if child.format == "codex" else None
+        if parsed is None:
+            parsed = collect_source_usage(child)
+        if child.format == "codex":
+            save_incremental_cache(child, parsed)
+        report.source_totals[child.key] = {"label": child.label, "home": str(child.home),
+            "totals": counter_dict(parsed.totals),
+            "costs": cost_dict(sum(parsed.costs_by_model.values(), Counter()))}
+        report.pricing_catalog.update(parsed.pricing_catalog)
+        report.pricing_aliases.update(parsed.pricing_aliases)
+        report.custom_pricing_models.update(parsed.custom_pricing_models)
+        report.pricing_config_errors.extend(parsed.pricing_config_errors)
+        for attribute in counter_maps:
+            merge_counters(getattr(report, attribute), getattr(parsed, attribute))
+        for f in fields(report):
+            value = getattr(parsed, f.name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                setattr(report, f.name, getattr(report, f.name) + value)
+        def namespaced(value):
+            return f"{child.key}:{value}" if value else ""
+        descriptors = [s.descriptor for s in parsed.sessions] + [s.descriptor for s in parsed.file_states.values()]
+        visited = set()
+        for descriptor in descriptors:
+            if id(descriptor) in visited:
+                continue
+            visited.add(id(descriptor))
+            for attribute in ("session_id", "parent_id", "root_id", "dedupe_root_id", "physical_parent_id", "conversation_id"):
+                setattr(descriptor, attribute, namespaced(getattr(descriptor, attribute)))
+        report.sessions.extend(parsed.sessions)
+        for path, state in parsed.file_states.items():
+            state.logical_owner_id = namespaced(state.logical_owner_id)
+            report.file_states[f"{child.key}:{path}"] = state
+        report.billable_events.extend(replace(event, session_id=namespaced(event.session_id)) for event in parsed.billable_events)
+        for fingerprint, owner in parsed.seen_fingerprints.items():
+            report.seen_fingerprints[(namespaced(fingerprint[0]), *fingerprint[1:])] = namespaced(owner)
+    aliases, custom, errors = read_pricing_config(source.model_aliases_file, report.pricing_catalog)
+    report.pricing_aliases.update(aliases)
+    report.pricing_catalog.update(custom)
+    report.custom_pricing_models.update(custom)
+    report.pricing_config_errors.extend(errors)
+    if aliases or custom:
+        reprice_usage_report(report)
+    return report
+
+
 def collect_source_usage(source: UsageSource) -> UsageReport:
+    if source.format == "all":
+        return collect_combined_usage(source)
+    if source.format == "claude":
+        return collect_claude_usage(source)
     fallback_service_tier = source_service_tier(source)
     billing_context = source_billing_context(source)
     report = collect_usage(
@@ -6299,8 +6674,8 @@ def main() -> None:
     parser.add_argument(
         "--data-home",
         type=Path,
-        default=CODEX_HOME,
-        help="Codex-compatible data home containing sessions/ (SQLite metadata is optional)",
+        default=HOME,
+        help="Codex home (sessions/), Claude config home (projects/), or Claude desktop data directory",
     )
     args = parser.parse_args()
     if args.self_test:
@@ -6318,9 +6693,14 @@ def main() -> None:
     scanned = time.perf_counter()
     summary = cached_summary(source, input_manifest)
     if summary is None:
-        report = incrementally_refresh_usage(source)
+        report = incrementally_refresh_usage(source) if source.format == "codex" else None
         if report is None:
-            print("Parser cache unavailable or accounting inputs changed; rebuilding full history.", flush=True)
+            if source.format == "all":
+                print("Refreshing and combining local usage sources.", flush=True)
+            elif source.format == "claude":
+                print("Reading updated Claude transcripts.", flush=True)
+            else:
+                print("Parser cache unavailable or accounting inputs changed; rebuilding full history.", flush=True)
             report = collect_source_usage(source)
         else:
             print("Loaded the source-specific parser cache; processed appended data only.", flush=True)
@@ -6330,7 +6710,8 @@ def main() -> None:
         write_export_outputs(report, summary["dashboard"])
         write_summary_outputs(summary, source)
         exported = time.perf_counter()
-        save_incremental_cache(source, report)
+        if source.format == "codex":
+            save_incremental_cache(source, report)
         print(f"Refresh timing: manifest={scanned-started:.3f}s parse={parsed-scanned:.3f}s "
               f"aggregate={aggregated-parsed:.3f}s export={exported-aggregated:.3f}s "
               f"cache={time.perf_counter()-exported:.3f}s", flush=True)

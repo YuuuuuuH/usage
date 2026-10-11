@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/Codex Token Atlas.app"
-DMG_PATH="$DIST_DIR/Codex Token Atlas.dmg"
+APP_DIR="$DIST_DIR/Token Atlas.app"
+DMG_PATH="$DIST_DIR/Token Atlas.dmg"
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-token-atlas-dmg.XXXXXX")"
 
 cleanup() {
@@ -14,12 +14,12 @@ trap cleanup EXIT
 
 "$ROOT_DIR/scripts/build_app.sh"
 
-ditto "$APP_DIR" "$STAGING_DIR/Codex Token Atlas.app"
+ditto "$APP_DIR" "$STAGING_DIR/Token Atlas.app"
 ln -s /Applications "$STAGING_DIR/Applications"
 
 hdiutil create \
   -ov \
-  -volname "Codex Token Atlas" \
+  -volname "Token Atlas" \
   -srcfolder "$STAGING_DIR" \
   -format UDZO \
   -imagekey zlib-level=9 \

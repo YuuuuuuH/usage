@@ -1,8 +1,22 @@
-# Codex Token Atlas
+# Token Atlas
 
-Codex Token Atlas scans a selected Codex-compatible data home and builds a route-aware token dashboard for macOS. It supports the standard `~/.codex` home, local Qodex at `~/.qodex`, and other compatible directories without mixing their usage. The app uses a native SwiftUI/AppKit interface with no embedded browser or WebKit dependency.
+Token Atlas is a local token dashboard for Codex, Qodex, and Claude on macOS. The default **全部** view combines available Codex, Qodex, and Claude usage, and refreshes automatically every 10 minutes while the app runs. Filter by source, model, metric, or period to explore token totals, cache traffic, sessions, and daily activity. The native SwiftUI/AppKit app parses records on your computer.
 
 All session parsing and report generation happen locally. The repository does not contain session logs, prompts, generated reports, or personal usage data.
+
+## Claude local records
+
+Claude usage joins the **全部** overview automatically. Choose **Claude · 本机记录** to filter to its records. Token Atlas scans JSONL transcripts under `~/.claude/projects` and the Claude desktop app's `claude-code-sessions` and `local-agent-mode-sessions` folders. A `CLAUDE_CONFIG_DIR` inherited by the app is also included. Use **选择其他兼容目录…** to select another Claude configuration directory containing `projects/`.
+
+Only assistant messages with explicit usage counters and a message/request ID are counted. Input includes uncached input, cache reads, and cache creation; output is added once. Repeated content blocks and copied transcripts are deduplicated by message ID. A later streaming snapshot updates that message's output. Subagent transcripts in a session's `subagents/` directory contribute to the parent conversation. Partial final lines wait until the next refresh.
+
+Claude uses the same dashboard, value estimates, and audit views as Codex. Official model rates include cache reads, five-minute and one-hour cache creation, and output. Per-model prices can be adjusted in Settings. Reports contain usage and session metadata.
+
+Unchanged Claude inputs reuse their saved report. Changed Claude transcripts are rescanned to account for updated message snapshots, file rewrites, and deleted records. The menu-bar monitor deduplicates appended message snapshots across files and excludes historical content when it starts.
+
+Transcript formats are internal and may change between Claude versions. See [Claude's session documentation](https://code.claude.com/docs/en/sessions#where-transcripts-are-stored). Automated tests use synthetic transcripts; verify new desktop formats against real local records when they become available.
+
+The app retains its existing macOS bundle identifier and cache location to preserve preferences across upgrades. New installers and exports use the Token Atlas name.
 
 ## Highlights
 
@@ -13,7 +27,7 @@ All session parsing and report generation happen locally. The repository does no
 - Aggregates usage into continuous-color 7 x 24 and daily heatmaps.
 - Uses a neutral slate-and-blue adaptive palette, responsive hourly grids, and an expandable daily detail strip below the calendar.
 - Offers presets, a native color picker, and HEX input under Settings → Personalization (⌘,). Accent colors and heatmaps update immediately; light/dark variants preserve readable contrast.
-- Opens on the 7 × 24 dashboard. Recent-achievement, next-level and peak-speed summaries follow the daily history. The Achievements page contains 12 achievement tracks, personal records, daily highlights, model footprints and a milestone timeline.
+- Opens on the 7 × 24 dashboard. Recent-achievement, next-level and peak-speed summaries follow the daily history. The Achievements page contains 19 achievement tracks, personal records, daily highlights, model footprints and a milestone timeline. Weekend activity, visits across months, daily model variety, collaboration teams, continuous conversations and daily output add new milestones. The Token journey starts with a million-token badge and gives each lifetime stage its own title. Diamond, Star and Legend badges appear when earned. Compact cards share one height; earned prestige cards emphasize the medal, current record and attainment date. Tracks are grouped under habits, model exploration, collaboration, and Token milestones, with a fixed order within each group.
 - Provides persistent section navigation and searchable, paginated session tables. Session and pricing columns fit the window; truncated text remains available on hover.
 - Shows tokens, calls, and the selected official direct-API equivalent value for every hourly and daily heatmap cell on hover.
 - Selects `~/.codex`, `~/.qodex`, or another compatible data home from the dashboard, then filters that source by model, metric, all history, the latest 7 or 30 days, or an exact custom date range.
@@ -39,7 +53,7 @@ The menu-bar monitor is off by default and can be enabled from the main toolbar 
 
 The session table represents user-visible conversations. Internal `subagent`/worker rollouts remain part of token, model, date, and cost totals, but are recursively folded into their owning conversation. Explicit user forks remain separate rows. The audit panel reports rollout files, conversations, user forks, internal threads, and orphan internal threads independently.
 
-Refreshes keep an append-only parser cache under `~/Library/Caches/CodexTokenAtlas`. After the first full rebuild, unchanged files are reused and growing rollout files are read only from their previous byte offset while retaining fork-deduplication state. Pricing revisions and edits to per-source prices revalue stored billable events directly without rereading unchanged session logs. A rewritten, truncated, removed, or structurally changed rollout invalidates the cache and triggers a safe full rebuild. The dashboard remains visible behind a compact progress badge during a background refresh, preserving the scroll position and expanded day within the same source. Report decoding runs off the UI thread.
+Codex/Qodex refreshes keep an append-only parser cache under `~/Library/Caches/CodexTokenAtlas`. After the first full rebuild, unchanged files are reused and growing rollout files are read only from their previous byte offset while retaining fork-deduplication state. Pricing revisions and edits to per-source prices revalue stored billable events directly without rereading unchanged session logs. A rewritten, truncated, removed, or structurally changed rollout invalidates the cache and triggers a safe full rebuild. The dashboard remains visible behind a compact progress badge during a background refresh, preserving the scroll position and expanded day within the same source. Report decoding runs off the UI thread.
 
 Startup and source switching first display that source's last saved report, labelled as updating, while fresh statistics are prepared. Unrelated preferences and credential rotation preserve the parser cache. Inferred service-tier changes reuse recorded calls when deduplication remains equivalent; separate Default/Priority checkpoints cover histories that require distinct deduplication. A missing checkpoint or legacy attribution may require one rebuild. Session metadata and achievement records are reused until their inputs change, and JSON/HTML share one dashboard calculation. Refresh-stage timings are written to the local app log.
 
@@ -59,7 +73,7 @@ Channel interpretation remains separate from those controls:
 - **Other provider or relay:** the logged provider and model are retained. A recognized DeepSeek, Gemini, Claude, Grok, or GPT model is valued at that vendor's official direct rate even when it was reached through an OpenAI-compatible relay.
 - **Unknown or internal model:** usage remains in every total and export, but value is unpriced until it can be mapped to a built-in official model.
 
-Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, and remain unpriced until a per-model price is saved from Settings. Model names in alternate data homes do not automatically inherit official API prices.
+Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, with per-model prices configurable in Settings. Model names in alternate data homes do not automatically inherit official API prices.
 
 Unclassified tokens (`total − input − output`) are retained in usage but excluded from value because their billing category is unknown. The native route table distinguishes this from a model with no matching price and from a missing category rate. Cache writes use a published write rate when one exists; otherwise they use the uncached input rate. DeepSeek V4 historical value follows its official UTC weekday peak/off-peak schedule; the route table shows the peak rate. Pricing sources are listed in the generated report.
 
@@ -128,7 +142,7 @@ The current authentication mode is shown only as context. Codex logs do not pres
 - macOS 12 or later
 - Xcode Command Line Tools or Xcode
 - Python 3.9 or later
-- A local Codex-compatible data home containing `sessions/`
+- Local Codex/Qodex transcripts (`sessions/`), Claude Code transcripts (`projects/`), or a Claude desktop data directory
 
 ## Build
 
@@ -146,45 +160,47 @@ Build the app and distributable DMG:
 
 Artifacts are written to `dist/`. The app icon is generated at all standard macOS resolutions from `scripts/render_icon.swift` during every build; `assets/AppIcon.icns` is the checked-in preview asset.
 
-See [the 0.3.7 review and verification notes](docs/QA-0.3.7.md) for the latest usability and regression coverage.
+See [the 0.5.2 release notes](docs/releases/0.5.2.md) for current features and validation, and [the 0.3.7 review notes](docs/QA-0.3.7.md) for earlier usability coverage.
 
 ## Releases
 
 Every branch push triggers `.github/workflows/release.yml`. The workflow runs the regression tests, builds and verifies a Universal macOS DMG, and creates a uniquely tagged GitHub Release containing:
 
-- `Codex-Token-Atlas.dmg`
-- `Codex-Token-Atlas.dmg.sha256`
+- `Token-Atlas.dmg`
+- `Token-Atlas.dmg.sha256`
 
-Release tags use the semantic app version, such as `v2.1.4`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases.
+Release tags use the semantic app version, such as `v0.5.2`. Bump `CFBundleShortVersionString` before every push so each commit produces a distinct installer without rewriting earlier releases. Version-specific notes are read from `docs/releases/<version>.md` when available.
 
 ## Generator
 
 Run the report generator without the app:
 
 ```bash
-python3 src/codex_token_heatmap.py
+python3 src/token_atlas.py
 ```
 
 Choose another compatible data home, for example local Qodex:
 
 ```bash
-python3 src/codex_token_heatmap.py --data-home ~/.qodex
+python3 src/token_atlas.py --data-home ~/.qodex
 ```
 
 Run synthetic regression tests:
 
 ```bash
-python3 src/codex_token_heatmap.py --self-test
+python3 src/token_atlas.py --self-test
 ```
 
 Generated files for the currently selected data home are written to the home directory:
 
-- `~/codex_token_heatmap.html`
-- `~/codex_token_usage_by_day.csv`
-- `~/codex_token_usage_by_hour.csv`
-- `~/codex_token_usage_by_model.csv`
-- `~/codex_token_usage_by_route.csv`
-- `~/codex_token_usage_by_session.csv`
-- `~/codex_token_usage_summary.json`
+- `~/token_atlas.html`
+- `~/token_atlas_usage_by_day.csv`
+- `~/token_atlas_usage_by_hour.csv`
+- `~/token_atlas_usage_by_model.csv`
+- `~/token_atlas_usage_by_route.csv`
+- `~/token_atlas_usage_by_session.csv`
+- `~/token_atlas_usage_summary.json`
 
-Pricing data is versioned in `src/codex_token_heatmap.py` with an `as_of` date. Models without a matching official rate are still fully counted but excluded from the value estimate.
+Pricing data is versioned in `src/token_atlas.py` with an `as_of` date. Models without a matching official rate are still fully counted but excluded from the value estimate.
+
+The model distribution and high-usage dates show 10 rows per page; conversations show 20. The value table groups calls by model and shows Token volume alongside estimated value.

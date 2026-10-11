@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 enum AtlasMedal: Int, CaseIterable {
-    case bronze, silver, gold, diamond
+    case bronze, silver, gold, diamond, star, legend
 
     init?(name: String) {
         switch name {
@@ -10,9 +10,13 @@ enum AtlasMedal: Int, CaseIterable {
         case "银": self = .silver
         case "金": self = .gold
         case "钻石": self = .diamond
+        case "星耀": self = .star
+        case "传奇": self = .legend
         default: return nil
         }
     }
+
+    var isPrestige: Bool { rawValue >= AtlasMedal.diamond.rawValue }
 
     var fillColors: [NSColor] {
         let colors: [String]
@@ -21,6 +25,8 @@ enum AtlasMedal: Int, CaseIterable {
         case .silver: colors = ["#F0F5FA", "#9BAFC4"]
         case .gold: colors = ["#FFE58A", "#DDA627"]
         case .diamond: colors = ["#ECF7F4", "#94DFD6", "#B3C7ED", "#D4B3EF", "#ECB6CF", "#E1D49F", "#D3F0E9"]
+        case .star: colors = ["#EEE7FF", "#B9DDF5", "#D2BCFF", "#C7A4F2"]
+        case .legend: colors = ["#FFE8BB", "#FFCCD9", "#FFE29D", "#ECAE86"]
         }
         return colors.map { AtlasTheme.color(hex: $0)! }
     }
@@ -32,6 +38,8 @@ enum AtlasMedal: Int, CaseIterable {
         case .silver: colors = ("#455D78", "#D0E0F4")
         case .gold: colors = ("#876000", "#F5CD4C")
         case .diamond: colors = ("#62507F", "#D6C7EB")
+        case .star: colors = ("#594382", "#D9CCFF")
+        case .legend: colors = ("#7D3B1D", "#FFD7B2")
         }
         return AtlasTheme.color(hex: dark ? colors.1 : colors.0)!
     }
