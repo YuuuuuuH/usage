@@ -12,10 +12,13 @@ import math
 import os
 import pickle
 import re
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +30,11 @@ try:
     import orjson as _fast_json
 except ImportError:
     _fast_json = None
+
+try:
+    from compression import zstd as _zstd
+except ImportError:
+    _zstd = None
 
 
 HOME = Path.home()
@@ -157,6 +165,100 @@ def relevant_usage_line(line: bytes) -> bool:
     return any(marker in line for marker in RELEVANT_USAGE_LINE_MARKERS)
 
 
+def is_compressed_session(path: Path) -> bool:
+    return path.name.endswith(".jsonl.zst")
+
+
+def session_log_files(root: Path) -> list[Path]:
+    plain = set(root.rglob("*.jsonl"))
+    compressed = (
+        path for path in root.rglob("*.jsonl.zst")
+        if path.with_suffix("") not in plain
+    )
+    return sorted([*plain, *compressed])
+
+
+def zstd_executable() -> str | None:
+    executable = shutil.which("zstd")
+    if executable:
+        return executable
+    for candidate in ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"):
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+@contextmanager
+def open_session_log(path: Path, *, complete: bool = True):
+    """Stream transcript bytes; compressed offsets refer to decoded bytes."""
+    if not is_compressed_session(path):
+        with path.open("rb") as handle:
+            yield handle
+        return
+    if _zstd is not None:
+        try:
+            with _zstd.open(path, "rb") as handle:
+                yield handle
+        except _zstd.ZstdError as error:
+            raise OSError(f"Could not decode compressed session log: {path}") from error
+        return
+
+    executable = zstd_executable()
+    if executable is None:
+        raise OSError("Compressed session logs require Python 3.14+ or the zstd executable.")
+    process = subprocess.Popen(
+        [executable, "-q", "-d", "-c", "--", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield process.stdout
+        # Metadata readers intentionally stop after the leading records.
+        if complete and process.wait() != 0:
+            raise OSError(f"Could not decode compressed session log: {path}")
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+        process.wait()
+
+
+def extend_session_digest(digest: str, line: bytes) -> str:
+    return hashlib.sha256(bytes.fromhex(digest) + line).hexdigest()
+
+
+def matching_session_prefix(path: Path, state: FileParserState) -> bool:
+    """Verify a newly compressed/replaced stream against its cached prefix."""
+    expected = getattr(state, "content_digest", None)
+    if expected is None:
+        return False
+    offset, digest = 0, ""
+    with open_session_log(path, complete=False) as handle:
+        while offset < state.offset:
+            line = handle.readline()
+            if not line or not line.endswith(b"\n"):
+                return False
+            offset += len(line)
+            if offset > state.offset:
+                return False
+            digest = extend_session_digest(digest, line)
+    return digest == expected
+
+
+def seek_session_offset(handle, offset: int) -> None:
+    if not offset:
+        return
+    if handle.seekable():
+        handle.seek(offset)
+        return
+    remaining = offset
+    while remaining:
+        chunk = handle.read(min(remaining, 1024 * 1024))
+        if not chunk:
+            raise OSError("Session log ended before its cached offset.")
+        remaining -= len(chunk)
+
+
 def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
     if source.format == "all":
         entries = [["@all_sources_parser", 1]]
@@ -166,9 +268,11 @@ def source_input_manifest(source: UsageSource) -> list[list[str | int]]:
         entries.extend(_auxiliary_input_manifest(source, include_pricing=True))
         return entries
     entries: list[list[str | int]] = [["@achievement_catalog", ACHIEVEMENT_CATALOG_REVISION]]
-    paths = claude_log_files(source) if source.format == "claude" else sorted(source.sessions_root.rglob("*.jsonl"))
+    paths = claude_log_files(source) if source.format == "claude" else session_log_files(source.sessions_root)
     if source.format == "claude":
         entries.append(["@claude_parser", 1])
+    else:
+        entries.append(["@codex_session_formats", 2])
     for path in paths:
         try:
             stat = path.stat()
@@ -1168,6 +1272,7 @@ class FileParserState:
     service_tier_from_event: bool = False
     previous_cumulative: Counter = field(default_factory=Counter)
     pending_reasoning_parts: list[str] = field(default_factory=list)
+    content_digest: str | None = None
 
 
 @dataclass
@@ -1456,7 +1561,7 @@ def read_thread_info(
 
 def read_leading_session_meta(path: Path) -> list[dict[str, Any]]:
     metadata: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
+    with open_session_log(path, complete=False) as fh:
         for line in fh:
             try:
                 obj = decode_json(line)
@@ -1537,7 +1642,7 @@ def session_id_from_filename(path: Path) -> str:
         path.name,
         flags=re.IGNORECASE,
     )
-    return match.group(1) if match else path.stem
+    return match.group(1) if match else (path.with_suffix("").stem if is_compressed_session(path) else path.stem)
 
 
 def lineage_root(session_id: str, parent_map: dict[str, str]) -> str:
@@ -1565,7 +1670,7 @@ def discover_sessions(
     thread_info: dict[str, ThreadInfo],
     cached_states: dict[str, FileParserState] | None = None,
 ) -> list[SessionDescriptor]:
-    paths = sorted(sessions_root.rglob("*.jsonl"))
+    paths = session_log_files(sessions_root)
     leading_meta: dict[Path, list[dict[str, Any]]] = {}
     physical_parent_map: dict[str, str] = {}
     user_parent_map: dict[str, str] = {}
@@ -2725,13 +2830,14 @@ def collect_usage(
             datetime.fromtimestamp(descriptor.path.stat().st_mtime, tz=LOCAL_TZ),
         )
 
-        file_offset = 0
-        with descriptor.path.open("rb") as fh:
+        file_offset, content_digest = 0, ""
+        with open_session_log(descriptor.path) as fh:
             for line in fh:
                 file_offset += len(line)
                 if not line.endswith(b"\n"):
                     file_offset -= len(line)
                     break
+                content_digest = extend_session_digest(content_digest, line)
                 if not relevant_usage_line(line):
                     continue
                 try:
@@ -2965,6 +3071,7 @@ def collect_usage(
             service_tier_from_event=service_tier_from_event,
             previous_cumulative=Counter(previous_cumulative),
             pending_reasoning_parts=list(pending_reasoning_parts),
+            content_digest=content_digest,
         )
 
     owner_ids = logical_owner_ids(
@@ -3019,17 +3126,20 @@ def process_incremental_file(
         "reasoning_over_output_events",
     )
 
-    with descriptor.path.open("rb") as handle:
-        handle.seek(state.offset)
+    digest_enabled = state.offset == 0 or getattr(state, "content_digest", None) is not None
+    with open_session_log(descriptor.path) as handle:
+        seek_session_offset(handle, state.offset)
         while True:
-            line_start = handle.tell()
+            line_start = state.offset
             line = handle.readline()
             if not line:
                 break
-            state.offset = handle.tell()
+            state.offset += len(line)
             if not line.endswith(b"\n"):
                 state.offset = line_start
                 break
+            if digest_enabled:
+                state.content_digest = extend_session_digest(state.content_digest or "", line)
             if not relevant_usage_line(line):
                 continue
             try:
@@ -3264,8 +3374,18 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
     descriptors_by_path = {
         normalized_path(descriptor.path): descriptor for descriptor in descriptors
     }
-    if not set(report.file_states).issubset(descriptors_by_path):
-        return None
+    compressed_updates: set[str] = set()
+    for path_key in set(report.file_states) - set(descriptors_by_path):
+        replacement_key = path_key + ".zst"
+        descriptor = descriptors_by_path.get(replacement_key)
+        state = report.file_states[path_key]
+        if (descriptor is None or not path_key.endswith(".jsonl")
+            or descriptor_cache_identity(descriptor) != descriptor_cache_identity(state.descriptor)
+            or not matching_session_prefix(descriptor.path, state)):
+            return None
+        report.file_states[replacement_key] = report.file_states.pop(path_key)
+        compressed_updates.add(replacement_key)
+        report.records_cache = None
 
     owner_ids = logical_owner_ids(descriptors)
     for path_key, state in report.file_states.items():
@@ -3278,10 +3398,19 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
             stat = descriptor.path.stat()
         except OSError:
             return None
-        if stat.st_size < state.offset:
-            return None
-        if stat.st_size == state.size and stat.st_mtime_ns != state.mtime_ns:
-            return None
+        if is_compressed_session(descriptor.path):
+            # A compressed file's on-disk size cannot be compared with its
+            # decoded offset. Verify changed streams once, then reuse the prefix.
+            if (path_key not in compressed_updates
+                and (stat.st_size != state.size or stat.st_mtime_ns != state.mtime_ns)):
+                if not matching_session_prefix(descriptor.path, state):
+                    return None
+                compressed_updates.add(path_key)
+        else:
+            if stat.st_size < state.offset:
+                return None
+            if stat.st_size == state.size and stat.st_mtime_ns != state.mtime_ns:
+                return None
         if descriptor.thread.title != state.descriptor.thread.title:
             report.records_cache = None
         state.descriptor = descriptor
@@ -3293,7 +3422,8 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
     for stats in report.sessions:
         current = descriptors_by_id.get(stats.descriptor.session_id)
         if current is not None:
-            stats.descriptor.thread = current.thread
+            current.orphan_internal = stats.descriptor.orphan_internal
+            stats.descriptor = current
 
     new_descriptors = [
         descriptor
@@ -3339,12 +3469,16 @@ def incrementally_refresh_usage(source: UsageSource) -> UsageReport | None:
 
     reasoning_counter = ReasoningTokenCounter(source.home)
     for descriptor in descriptors:
-        state = report.file_states[normalized_path(descriptor.path)]
+        path_key = normalized_path(descriptor.path)
+        state = report.file_states[path_key]
         try:
             current_size = descriptor.path.stat().st_size
         except OSError:
             return None
-        if current_size <= state.offset:
+        if is_compressed_session(descriptor.path):
+            if path_key not in compressed_updates and state.size == current_size and state.mtime_ns:
+                continue
+        elif current_size <= state.offset:
             continue
         target = logical_by_id.get(state.logical_owner_id)
         if target is None:
