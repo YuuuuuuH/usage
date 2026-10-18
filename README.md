@@ -12,7 +12,7 @@ Only assistant messages with explicit usage counters and a message/request ID ar
 
 Claude uses the same dashboard, value estimates, and audit views as Codex. Official model rates include cache reads, five-minute and one-hour cache creation, and output. Per-model prices can be adjusted in Settings. Reports contain usage and session metadata.
 
-Unchanged Claude inputs reuse their saved report. Changed Claude transcripts are rescanned to account for updated message snapshots, file rewrites, and deleted records. The menu-bar monitor deduplicates appended message snapshots across files and excludes historical content when it starts.
+Unchanged Claude inputs reuse their saved report. Changed Claude transcripts are rescanned to account for updated message snapshots, file rewrites, and deleted records.
 
 Transcript formats are internal and may change between Claude versions. See [Claude's session documentation](https://code.claude.com/docs/en/sessions#where-transcripts-are-stored). Automated tests use synthetic transcripts; verify new desktop formats against real local records when they become available.
 
@@ -40,16 +40,15 @@ The app retains its existing macOS bundle identifier and cache location to prese
 - Keeps All Time, last-7-day, and last-30-day ranges anchored to the newest report date after every refresh.
 - Lets the user choose the export format and destination for filtered JSON, daily/hourly/model/route/session CSV, complete HTML, or all formats together.
 - Provides standard macOS Edit menu actions, including copy, paste, and select all.
-- Adds an optional native menu-bar monitor with a compact 60-second rolling Token rate plus historical total and input/cache/output details in its panel. The panel switches instantly between Codex, Qodex, and an aggregate of every available source without rebuilding the historical report.
-- Uses native Liquid Glass for macOS 26 toolbars, controls, summary bands, and the live panel, with system-material fallbacks on older supported releases. Persistent, independent Settings sliders adjust the main app and menu-bar panel from clear to frosted without stacking extra blur layers; macOS 27 system glass preferences still flow through the native material.
-- Defaults live detection to 5 seconds and provides persistent 1-, 2-, or 5-second choices while reading only bytes appended to local session logs.
-- Places Dock presence, System/Light/Dark appearance, and live refresh controls in the toolbar Settings menu immediately left of Refresh.
+- Combines live Token statistics with compact Codex, Claude, and Antigravity quota cards showing remaining percentages and reset times. Settings provides independent visibility switches and persistent component ordering; model details expand into a height-bounded list.
+- Uses native Liquid Glass for macOS 26 toolbars, controls, summary bands, and the quota panel, with system-material fallbacks on older supported releases. Persistent, independent Settings sliders adjust the main app and menu-bar panel from clear to frosted without stacking extra blur layers; macOS 27 system glass preferences still flow through the native material.
+- Places Dock presence, System/Light/Dark appearance, and glass controls in the toolbar Settings menu immediately left of Refresh.
 
 ## Accounting
 
 The dashboard sums unique `last_token_usage` events. When that field is missing, it falls back to a non-negative delta of cumulative usage. Reported `reasoning_output_tokens` is treated as part of output and is not added to the total a second time. If a compatible provider leaves that field at zero but stores plaintext reasoning response items, Token Atlas derives the reasoning subset with a matching local Hugging Face `tokenizer.json` when available and records the inference in the audit panel; a conservative text estimate is used as a fallback. An exact model-to-tokenizer path can be supplied in `<data-home>/token_atlas_tokenizers.json`.
 
-The menu-bar monitor is off by default and can be enabled from the main toolbar or application menu. Its panel switches directly between Codex, Qodex, and all available sources; the aggregate view combines each source's independent rolling window and historical total without changing the dashboard's selected data home or starting a report refresh. Historical totals are the last confirmed report values, reconciled on refresh rather than accumulated from live samples; a source that has not been refreshed is shown as pending. The compact readout shows the selected scope's total 60-second Token rate. It baselines files that already exist when it starts and waits until newly discovered files stop growing before reading appended events. This prevents inherited history from appearing as fresh throughput. The selected refresh interval controls how quickly appended log events are detected, not the averaging window. Usage appears after a model call writes its `token_count` event to disk.
+Account quota updates run independently of historical accounting. Codex and Antigravity queries run once per minute, while Claude updates arrive through its status-line bridge. Open the combined live statistics and quota panel from the status readout, main toolbar, or **窗口 → 显示顶部栏弹窗** (⌘⇧L). Control status-item visibility from **顶部栏 Token 统计** in the application menu.
 
 The session table represents user-visible conversations. Internal `subagent`/worker rollouts remain part of token, model, date, and cost totals, but are recursively folded into their owning conversation. Explicit user forks remain separate rows. The audit panel reports rollout files, conversations, user forks, internal threads, and orphan internal threads independently.
 
@@ -78,6 +77,22 @@ Channel interpretation remains separate from those controls:
 Qodex and custom data homes operate as token-accounting sources. Their models and calls are fully filterable, with per-model prices configurable in Settings. Model names in alternate data homes do not automatically inherit official API prices.
 
 Unclassified tokens (`total − input − output`) are retained in usage but excluded from value because their billing category is unknown. The native route table distinguishes this from a model with no matching price and from a missing category rate. Cache writes use a published write rate when one exists; otherwise they use the uncached input rate. DeepSeek V4 historical value follows its official UTC weekday peak/off-peak schedule; the route table shows the peak rate. Pricing sources are listed in the generated report.
+
+## Menu-bar live tokens and account quotas
+
+The menu-bar readout shows live total Token/s over a rolling 60-second window, based on appended local session events. The popup retains its source selector, confirmed cumulative usage, live rate chart, INPUT/CACHE/OUTPUT breakdown, and file/event status. Source selection is independent of the dashboard. Settings offers one-, two-, or five-second live refresh intervals (five seconds by default). Dragging the popup pins it as a floating window.
+
+By default, three compact provider rows appear below the 300 × 288-point live statistics area. Percentages represent **remaining** quota. Each row can expand to show window or model details and reset times. The default combined panel is 300 × 479 points with details collapsed; large model lists scroll within a bounded detail area. These account rows are independent of the selected transcript source.
+
+Open **设置 → 顶部栏组件…** in the app to show or hide each provider independently and drag components into your preferred order. The live statistics block stays intact. Visibility and order persist across launches; hidden providers stop being queried, and the popup adjusts its height to the visible content. Drag the popup's top handle to move it into a floating window.
+
+Codex uses the installed, signed-in Codex CLI's official [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt) method once per minute. Windows follow the account response: an account that returns only a weekly window shows only that window. The read does not start a model conversation.
+
+Click **连接** on the Claude card to configure a local [Claude Code status-line bridge](https://code.claude.com/docs/en/statusline#rate-limit-usage). The confirmation explains the settings change. Existing command output is forwarded unchanged. After Claude Code's next model response, supported subscriptions can supply five-hour and seven-day percentages and reset times. Availability depends on the official status-line payload. Its quota snapshot contains quota counters and observation time. A separate owner-readable connection backup preserves the previous status-line configuration and installed command for restoration. Both files are stored in the local app cache. To restore the previous status line, run `python3 "/Applications/Token Atlas.app/Contents/Resources/claude_quota_bridge.py" --disconnect` (add `--config-dir` for a custom Claude configuration directory).
+
+Antigravity reads the running macOS app's local `GetUserStatus` service. The reader validates the app process owner and loopback HTTP listener, and passes the app's local CSRF token only to that listener. This is an internal app interface, verified against Antigravity 2.21.1, rather than a published third-party API; an incompatible or stopped app displays an unavailable state. Each returned model remains independent. The compact percentage is explicitly the lowest reported remaining quota, not a sum or average. See Google's [model quota documentation](https://www.antigravity.google/docs/cli/commands/usage) and [plans](https://www.antigravity.google/docs/plans).
+
+Quota queries and bridge reads run independently of historical report refreshes. The panel uses each provider's latest response; stale data is marked for update. The Claude bridge stores its latest quota snapshot locally with restricted file permissions.
 
 ## Personal records
 
@@ -162,7 +177,7 @@ Build the app and distributable DMG:
 
 Artifacts are written to `dist/`. The app icon is generated at all standard macOS resolutions from `scripts/render_icon.swift` during every build; `assets/AppIcon.icns` is the checked-in preview asset.
 
-See [the 0.5.2 release notes](docs/releases/0.5.2.md) for current features and validation, and [the 0.3.7 review notes](docs/QA-0.3.7.md) for earlier usability coverage.
+See [the 0.5.4 release notes](docs/releases/0.5.4.md) for the latest changes, [the 0.5.3 notes](docs/releases/0.5.3.md) for compressed-session support, and [the 0.3.7 review notes](docs/QA-0.3.7.md) for earlier usability coverage.
 
 ## Releases
 

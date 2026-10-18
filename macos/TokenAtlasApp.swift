@@ -7,11 +7,11 @@ private let showInDockDefaultsKey = "showInDockV1"
 private let appearanceModeDefaultsKey = "appearanceModeV1"
 private let appGlassFrostDefaultsKey = "appGlassFrostAmountV1"
 private let liveGlassFrostDefaultsKey = "glassFrostAmountV1"
-private let historicalTotalsByDataHomeDefaultsKey = "confirmedHistoricalTotalsByDataHomeV1"
 private let liveRefreshDefaultsKey = "liveTokenRefreshSecondsV2"
 private let liveMonitorSourceDefaultsKey = "liveTokenMonitorSourceV1"
-private let dataHomeDefaultsKey = "tokenAtlasDataHomePathV1"
 private let allLiveMonitorSourcesID = "__all_live_sources__"
+private let historicalTotalsByDataHomeDefaultsKey = "confirmedHistoricalTotalsByDataHomeV1"
+private let dataHomeDefaultsKey = "tokenAtlasDataHomePathV1"
 private let dashboardRenderScale: CGFloat = 1
 private let defaultAppGlassFrostAmount = 1.0
 private let defaultLiveGlassFrostAmount = 0.58
@@ -100,6 +100,26 @@ private struct LiveMonitorSource {
     let displayPath: String
 }
 
+private func formatTokenRate(_ value: Double) -> String {
+    if value >= 1_000_000_000 { return String(format: "%.1fB", value / 1_000_000_000) }
+    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+    if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+    if value >= 100 { return String(format: "%.0f", value) }
+    if value >= 10 { return String(format: "%.1f", value) }
+    return String(format: "%.2f", value)
+}
+
+private func formatStatusTokenRate(_ value: Double) -> String {
+    if value >= 1_000_000_000 { return String(format: "%.0fB", value / 1_000_000_000) }
+    if value >= 100_000_000 { return String(format: "%.0fM", value / 1_000_000) }
+    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+    if value >= 100_000 { return String(format: "%.0fK", value / 1_000) }
+    if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+    if value >= 100 { return String(format: "%.0f", value) }
+    if value >= 10 { return String(format: "%.1f", value) }
+    return String(format: "%.2f", value)
+}
+
 private extension NSToolbarItem.Identifier {
     static let settings = NSToolbarItem.Identifier("local.codex.token-atlas.settings")
     static let refreshReport = NSToolbarItem.Identifier("local.codex.token-atlas.refresh")
@@ -109,7 +129,7 @@ private extension NSToolbarItem.Identifier {
     static let liveMonitor = NSToolbarItem.Identifier("local.codex.token-atlas.live-monitor")
 }
 
-private enum AtlasColor {
+enum AtlasColor {
     private static func rgb(_ red: Int, _ green: Int, _ blue: Int, alpha: CGFloat = 1) -> NSColor {
         NSColor(srgbRed: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: alpha)
     }
@@ -152,7 +172,7 @@ private struct AtlasWindowBackdropKey: EnvironmentKey {
     static let defaultValue = false
 }
 
-private extension EnvironmentValues {
+extension EnvironmentValues {
     var atlasGlassFrostAmount: Double {
         get { self[AtlasGlassFrostKey.self] }
         set { self[AtlasGlassFrostKey.self] = newValue }
@@ -253,7 +273,7 @@ private struct AtlasGlassModifier<S: Shape>: ViewModifier {
     }
 }
 
-private extension View {
+extension View {
     func atlasGlass<S: Shape>(
         in shape: S,
         tint: Color? = nil,
@@ -846,26 +866,6 @@ private func shortNumber(_ value: Int64) -> String {
     return formatInt(value)
 }
 
-private func formatTokenRate(_ value: Double) -> String {
-    if value >= 1_000_000_000 { return String(format: "%.1fB", value / 1_000_000_000) }
-    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
-    if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
-    if value >= 100 { return String(format: "%.0f", value) }
-    if value >= 10 { return String(format: "%.1f", value) }
-    return String(format: "%.2f", value)
-}
-
-private func formatStatusTokenRate(_ value: Double) -> String {
-    if value >= 1_000_000_000 { return String(format: "%.0fB", value / 1_000_000_000) }
-    if value >= 100_000_000 { return String(format: "%.0fM", value / 1_000_000) }
-    if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
-    if value >= 100_000 { return String(format: "%.0fK", value / 1_000) }
-    if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
-    if value >= 100 { return String(format: "%.0f", value) }
-    if value >= 10 { return String(format: "%.1f", value) }
-    return String(format: "%.2f", value)
-}
-
 private func formatUSD(_ value: Double) -> String {
     NumberFormatter.currency.string(from: NSNumber(value: value)) ?? "$0.00"
 }
@@ -971,6 +971,17 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
         setPinned(false)
     }
 
+    func resizeContent(to size: NSSize) {
+        guard contentView?.frame.size != size else { return }
+        isPositioning = true
+        suppressPinUntil = Date().addingTimeInterval(0.35)
+        let top = frame.maxY
+        setContentSize(size)
+        setFrameOrigin(NSPoint(x: frame.minX, y: top - frame.height))
+        if !isPinned { transientOrigin = frame.origin }
+        DispatchQueue.main.async { [weak self] in self?.isPositioning = false }
+    }
+
     func windowWillMove(_ notification: Notification) {
         if !isPositioning, isVisible, Date() >= suppressPinUntil { setPinned(true) }
     }
@@ -1011,6 +1022,31 @@ private final class LiveMonitorPanel: NSPanel, NSWindowDelegate {
         level = pinned ? .normal : .floating
         collectionBehavior = pinned ? [.moveToActiveSpace] : [.moveToActiveSpace, .fullScreenAuxiliary]
         pinnedChanged?(pinned)
+    }
+}
+
+private struct LivePanelDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> DragView {
+        let view = DragView()
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.image)
+        view.setAccessibilityLabel("拖动实时统计卡片")
+        return view
+    }
+    func updateNSView(_ nsView: DragView, context: Context) {}
+
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+        override func mouseDown(with event: NSEvent) {
+            NSCursor.closedHand.push()
+            defer { NSCursor.pop() }
+            window?.performDrag(with: event)
+        }
+        override func draw(_ dirtyRect: NSRect) {
+            NSColor.secondaryLabelColor.withAlphaComponent(0.6).setFill()
+            NSBezierPath(roundedRect: NSRect(x: (bounds.width - 28) / 2, y: (bounds.height - 3) / 2, width: 28, height: 3), xRadius: 1.5, yRadius: 1.5).fill()
+        }
     }
 }
 
@@ -1216,6 +1252,7 @@ private final class ModelPricingEditor: NSObject {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, ObservableObject {
     private var window: NSWindow!
     private var personalizationWindow: NSWindow?
+    private var topBarSettingsWindow: NSWindow?
     private let toolbarSpinner = NSProgressIndicator()
     private let toolbarStatus = NSTextField(labelWithString: "准备中")
     private var refreshToolbarItem: NSToolbarItem?
@@ -1246,18 +1283,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     @Published fileprivate var liveGlassFrostAmount = preferredLiveGlassFrostAmount()
     @Published fileprivate var usesWindowBackdrop = false
     fileprivate let livePresentation = LiveMonitorPresentation()
+    fileprivate let quotaPresentation = QuotaPanelPresentation()
     fileprivate var liveMonitorEnabled = false
+    private lazy var quotaMonitor = UsageQuotaMonitor { [weak self] states in
+        guard let self else { return }
+        self.quotaPresentation.quotaStates = states
+        self.resizeQuotaPanel()
+    }
 
     private var statusItem: NSStatusItem?
     private var lastStatusRateText: String?
-    private var livePanel: LiveMonitorPanel!
     private var liveMonitors: [String: LiveTokenMonitor] = [:]
     private var liveMonitorSources: [LiveMonitorSource] = []
     private var liveSnapshots: [String: LiveTokenSnapshot] = [:]
-    private var selectedLiveMonitorSourceID = UserDefaults.standard.string(forKey: liveMonitorSourceDefaultsKey)
-        ?? allLiveMonitorSourcesID
     private var liveMonitorGeneration: UInt64 = 0
+    private var selectedLiveMonitorSourceID = UserDefaults.standard.string(forKey: liveMonitorSourceDefaultsKey) ?? allLiveMonitorSourcesID
     private var latestLiveSnapshot = LiveTokenSnapshot.zero
+    private var livePanel: LiveMonitorPanel!
     private var historicalTotalTokens: Int64 = 0
     private var historicalTotalsByDataHome: [String: Int64] = [:]
     private var historicalDisplayTimer: Timer?
@@ -1318,6 +1360,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     private var claudeDataHomeURL: URL {
         let desktop = homeURL.appendingPathComponent("Library/Application Support/Claude")
         if fileManager.fileExists(atPath: desktop.path) { return desktop }
+        if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !custom.isEmpty {
+            return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+        }
+        return homeURL.appendingPathComponent(".claude")
+    }
+
+    private var claudeQuotaConfigURL: URL {
         if let custom = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
         }
@@ -1466,9 +1515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             selectedStartDate = nil
             selectedEndDate = nil
             historicalTotalTokens = historicalTotalsByDataHome[dataHomeHistoryKey] ?? 0
-            if livePanel != nil {
-                rebuildLiveMonitors()
-            }
+            if livePanel != nil { rebuildLiveMonitors() }
         }
         refreshReport(nil)
     }
@@ -1517,6 +1564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         historicalDisplayTimer?.invalidate()
         liveMonitorGeneration &+= 1
         liveMonitors.values.forEach { $0.stop() }
+        quotaMonitor.stop()
     }
 
     private func configureMainMenu() {
@@ -1569,6 +1617,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         let windowMenu = NSMenu(title: "窗口")
         let showWindow = windowMenu.addItem(withTitle: "显示 Token Atlas", action: #selector(showMainWindowAction(_:)), keyEquivalent: "0")
         showWindow.target = self
+        let showLivePanel = windowMenu.addItem(withTitle: "显示顶部栏弹窗", action: #selector(showLivePanelFromMenu(_:)), keyEquivalent: "l")
+        showLivePanel.keyEquivalentModifierMask = [.command, .shift]
+        showLivePanel.target = self
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
@@ -1586,6 +1637,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
         let personalize = settingsMenu.addItem(withTitle: "个性化…", action: #selector(showPersonalization(_:)), keyEquivalent: "")
         personalize.target = self
+        settingsMenu.addItem(.separator())
+
+        let components = settingsMenu.addItem(withTitle: "顶部栏组件…", action: #selector(showTopBarSettings(_:)), keyEquivalent: "")
+        components.target = self
         settingsMenu.addItem(.separator())
 
         let dockItem = settingsMenu.addItem(withTitle: "在程序坞中显示", action: #selector(toggleDockPresence(_:)), keyEquivalent: "")
@@ -1832,9 +1887,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
     }
 
     private func configureLiveMonitor() {
-        livePanel = LiveMonitorPanel(contentSize: NSSize(width: 300, height: 288))
+        livePanel = LiveMonitorPanel(contentSize: NSSize(width: QuotaPanelLayout.width, height: liveQuotaPanelHeight))
+        quotaMonitor.setEnabledProviders(quotaPresentation.preferences.enabledProviders)
+        if let data = try? Data(contentsOf: claudeQuotaConfigURL.appendingPathComponent("settings.json")),
+           let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let status = settings["statusLine"] as? [String: Any], let command = status["command"] as? String {
+            quotaPresentation.claudeQuotaConnected = command.contains("claude_quota_bridge.py")
+        }
         let liveController = NSHostingController(
-            rootView: LiveTokenPopover(controller: self, presentation: livePresentation)
+            rootView: LiveTokenPopover(controller: self, presentation: livePresentation, quotas: quotaPresentation)
         )
         liveController.view.wantsLayer = true
         liveController.view.layer?.cornerRadius = 22
@@ -2040,7 +2101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     private func liveToolbarImage(enabled: Bool) -> NSImage? {
         let symbol = enabled ? "gauge.with.dots.needle.67percent" : "gauge.with.dots.needle.33percent"
-        guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "顶部栏 Token 统计") else {
+        guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "实时 Token 统计与账户额度") else {
             return nil
         }
         guard enabled,
@@ -2063,6 +2124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         liveToolbarItem?.image = liveToolbarImage(enabled: enabled)
         liveMenuItem?.state = enabled ? .on : .off
         if enabled {
+            quotaMonitor.start()
             installStatusItem()
             if liveMonitors.isEmpty {
                 rebuildLiveMonitors(startIfEnabled: false)
@@ -2071,6 +2133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
                 $0.start(interval: TimeInterval(livePresentation.refreshSeconds))
             }
         } else {
+            quotaMonitor.stop()
             livePanel.dismissAndUnpin()
             liveMonitorGeneration &+= 1
             liveMonitors.values.forEach { $0.stop() }
@@ -2081,6 +2144,109 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
             statusItem = nil
             lastStatusRateText = nil
+        }
+    }
+
+    fileprivate var liveQuotaPanelHeight: CGFloat {
+        QuotaPanelLayout.panelHeight(preferences: quotaPresentation.preferences, states: quotaPresentation.quotaStates, expanded: quotaPresentation.expandedProvider)
+    }
+
+    private func resizeQuotaPanel() {
+        guard let panel = livePanel else { return }
+        let size = NSSize(width: QuotaPanelLayout.width, height: liveQuotaPanelHeight)
+        panel.resizeContent(to: size)
+    }
+
+    @objc private func showTopBarSettings(_ sender: Any?) {
+        if topBarSettingsWindow == nil {
+            let settings = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 340), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            settings.title = "顶部栏组件"
+            settings.isReleasedWhenClosed = false
+            settings.contentView = NSHostingView(rootView: TopBarSettingsView(
+                presentation: quotaPresentation,
+                setVisible: { [weak self] provider, visible in
+                    guard let self else { return }
+                    var preferences = self.quotaPresentation.preferences
+                    preferences.setVisible(visible, provider: provider)
+                    self.applyTopBarPreferences(preferences)
+                },
+                move: { [weak self] offsets, destination in
+                    guard let self else { return }
+                    var preferences = self.quotaPresentation.preferences
+                    preferences.move(from: offsets, to: destination)
+                    self.applyTopBarPreferences(preferences)
+                },
+                reset: { [weak self] in self?.applyTopBarPreferences(TopBarPreferences()) }
+            ))
+            settings.center()
+            topBarSettingsWindow = settings
+        }
+        topBarSettingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func applyTopBarPreferences(_ preferences: TopBarPreferences) {
+        quotaPresentation.preferences = preferences
+        preferences.save()
+        if let expanded = quotaPresentation.expandedProvider, preferences.hiddenProviders.contains(expanded) {
+            quotaPresentation.expandedProvider = nil
+        }
+        quotaMonitor.setEnabledProviders(preferences.enabledProviders)
+        resizeQuotaPanel()
+    }
+
+    fileprivate func toggleQuotaDetails(_ provider: QuotaProvider) {
+        quotaPresentation.expandedProvider = quotaPresentation.expandedProvider == provider ? nil : provider
+        resizeQuotaPanel()
+    }
+
+    fileprivate func openAntigravity() {
+        let appURL = URL(fileURLWithPath: "/Applications/Antigravity.app")
+        guard fileManager.fileExists(atPath: appURL.path) else { presentError("请先安装 Antigravity。"); return }
+        NSWorkspace.shared.openApplication(at: appURL, configuration: NSWorkspace.OpenConfiguration()) { [weak self] _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self?.quotaMonitor.refresh() }
+        }
+    }
+
+    fileprivate func refreshQuotas() { quotaMonitor.refresh() }
+
+    fileprivate func connectClaudeQuota() {
+        guard let python = locatePython(), let script = Bundle.main.url(forResource: "claude_quota_bridge", withExtension: "py") else {
+            presentError("无法连接 Claude 额度，请确认 Python 和应用资源完整。")
+            return
+        }
+        let confirmation = NSAlert()
+        confirmation.messageText = "连接 Claude 账户额度？"
+        confirmation.informativeText = "将在 Claude Code 的 settings.json 中配置本地状态栏脚本，保存官方返回的额度百分比和重置时间。已有状态栏命令会继续运行；自定义状态栏可能替换 Claude 的部分内置提示。"
+        confirmation.addButton(withTitle: "连接")
+        confirmation.addButton(withTitle: "取消")
+        guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+        let configHome = claudeQuotaConfigURL
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = python
+            process.arguments = [script.path, "--connect", "--config-dir", configHome.path]
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            let success: Bool
+            do {
+                try process.run()
+                _ = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                success = process.terminationStatus == 0
+            } catch { success = false }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if success {
+                    self.quotaPresentation.claudeQuotaConnected = true
+                    self.quotaMonitor.refresh()
+                    let alert = NSAlert()
+                    alert.messageText = "Claude 额度已连接"
+                    alert.informativeText = "Claude Code 下次模型响应后，顶部栏弹窗会显示官方返回的额度。原有状态栏输出会继续显示。"
+                    alert.runModal()
+                } else { self.presentError("无法连接 Claude 额度，请检查 Claude 的 settings.json。") }
+            }
         }
     }
 
@@ -2097,6 +2263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
 
     @objc private func showMainWindowAction(_ sender: Any?) {
         showMainWindow()
+    }
+
+    @objc private func showLivePanelFromMenu(_ sender: Any?) {
+        if !liveMonitorEnabled { setLiveMonitorEnabled(true, persist: true) }
+        guard let button = statusItem?.button else { return }
+        livePresentation.snapshot = latestLiveSnapshot
+        livePresentation.historicalTotalTokens = selectedLiveHistoricalTotal()
+        livePanel.show(relativeTo: button)
     }
 
     @objc private func toggleDockPresence(_ sender: Any?) {
@@ -2300,11 +2474,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
         case .liveMonitor:
             let item = NSToolbarItem(itemIdentifier: identifier)
             item.label = ""
-            item.paletteLabel = "顶部栏 Token 统计"
-            item.toolTip = "状态栏显示 60 秒实时速率；展开后同时显示历史累计 Token"
+            item.paletteLabel = "实时统计"
+            item.toolTip = "实时 Token 统计与账户额度"
             item.image = liveToolbarImage(enabled: liveMonitorEnabled)
             item.target = self
-            item.action = #selector(toggleLiveMonitor(_:))
+            item.action = #selector(showLivePanelFromMenu(_:))
             liveToolbarItem = item
             return item
         case .revealExports:
@@ -2459,10 +2633,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             }
             reconcileHistoricalTotal(loadedDashboard.totals["all"]?.total_tokens ?? 0)
             updateLivePresentationSource()
-            lastStatusRateText = nil
-            if statusItem != nil {
-                updateStatusItem(rate: latestLiveSnapshot.totalRate)
-            }
             generatorRunning = false
             updateModelPricingMenuItem()
             setLoading(false, title: "", detail: "")
@@ -3206,6 +3376,7 @@ private struct LiveTokenPopover: View {
     @ObservedObject private var theme = AtlasTheme.shared
     @ObservedObject var controller: AppDelegate
     @ObservedObject var presentation: LiveMonitorPresentation
+    @ObservedObject var quotas: QuotaPanelPresentation
 
     private var snapshot: LiveTokenSnapshot { presentation.snapshot }
     private var isActive: Bool {
@@ -3213,24 +3384,41 @@ private struct LiveTokenPopover: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(quotas.preferences.sections.enumerated()), id: \.element.id) { index, section in
+                if index > 0 { Divider().opacity(0.55).frame(height: 1) }
+                if section.isLive {
+                    liveStatistics
+                } else {
+                    QuotaPopover(presentation: quotas, providers: section.providers, refresh: controller.refreshQuotas,
+                                 connectClaude: controller.connectClaudeQuota, openAntigravity: controller.openAntigravity,
+                                 expand: controller.toggleQuotaDetails)
+                }
+            }
+        }
+        .frame(width: QuotaPanelLayout.width, height: controller.liveQuotaPanelHeight)
+        .overlay(alignment: .top) {
+            LivePanelDragHandle().frame(width: 48, height: 12).padding(.top, 3)
+        }
+        .atlasGlass(
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous),
+            tint: Color(nsColor: AtlasColor.teal).opacity(0.012)
+        )
+        .environment(\.atlasGlassFrostAmount, controller.liveGlassFrostAmount)
+    }
+
+    private var liveStatistics: some View {
         VStack(alignment: .leading, spacing: 8) {
             sourcePicker
             historySummary
             rateHeader
-            LiveRateChart(samples: snapshot.samples)
-                .frame(height: 38)
+            LiveRateChart(samples: snapshot.samples).frame(height: 38)
             rateBreakdown
             Divider().opacity(0.55)
             statusLine
         }
         .padding(14)
-        .frame(width: 300, height: 288)
-        .atlasGlass(
-            in: RoundedRectangle(cornerRadius: 22, style: .continuous),
-            tint: Color(nsColor: AtlasColor.teal).opacity(0.012),
-            clear: true
-        )
-        .environment(\.atlasGlassFrostAmount, controller.liveGlassFrostAmount)
+        .frame(width: QuotaPanelLayout.width, height: QuotaPanelLayout.liveStatisticsHeight)
     }
 
     private var sourcePicker: some View {
