@@ -30,9 +30,9 @@ class RefreshTests(unittest.TestCase):
             "id": "test", "timestamp": "2024-01-01T00:00:00Z", "model_provider": "openai"}) + "\n")
         self.append_call(1)
 
-    def append_call(self, number, explicit_tier=None, duplicate=False):
-        stamp = f"2024-01-01T00:00:{number:02d}Z"
-        rows = [atlas.synthetic_event(stamp, "turn_context", {"turn_id": f"turn-{number}", "model": "gpt-5.4-mini"})]
+    def append_call(self, number, explicit_tier=None, duplicate=False, *, model="gpt-5.4-mini", stamp=None):
+        stamp = stamp or f"2024-01-01T00:00:{number:02d}Z"
+        rows = [atlas.synthetic_event(stamp, "turn_context", {"turn_id": f"turn-{number}", "model": model})]
         if explicit_tier is not None:
             rows.append(atlas.synthetic_event(stamp, "event_msg", {"type": "thread_settings_applied",
                         "thread_settings": {"service_tier": explicit_tier}}))
@@ -130,6 +130,32 @@ class RefreshTests(unittest.TestCase):
         self.cache()
         self.append_call(2, duplicate=True)
         self.assert_matches_full(atlas.incrementally_refresh_usage(self.source))
+
+    def test_ultrafast_reprices_cached_calls_by_timestamp(self):
+        model = "gpt-6.2-sol"
+        self.append_call(2, "ultrafast", model=model, stamp="2027-03-01T07:59:59Z")
+        previous_catalog = dict(atlas.PRICING_USD_PER_MTOK)
+        previous_catalog.pop(model)
+        with patch.object(atlas, "PRICING_USD_PER_MTOK", previous_catalog):
+            old = self.cache()
+        self.assertEqual(old.costs_by_model[model]["unpriced_calls"], 1)
+        self.append_call(3, "ultrafast", model=model, stamp="2027-03-01T08:00:00Z")
+        updated = atlas.incrementally_refresh_usage(self.source)
+        self.assert_matches_full(updated)
+        costs = updated.costs_by_model[model]
+        standard_per_call = (40 * 2 + 50 * 0.1 + 10 * 10) / 1_000_000
+        self.assertAlmostEqual(costs["estimated_cost_usd"], (3 + 6) * standard_per_call)
+        self.assertAlmostEqual(costs["standard_equivalent_cost_usd"], 2 * standard_per_call)
+        self.assertEqual(costs["ultrafast_tier_calls"], 2)
+        self.assertEqual(costs["other_tier_calls"], 0)
+        self.assertEqual(costs["tier_rate_fallback_calls"], 0)
+
+    def test_unsupported_ultrafast_preserves_usage_and_audits_fallback(self):
+        self.append_call(2, "ultrafast")
+        costs = atlas.collect_source_usage(self.source).costs_by_model["gpt-5.4-mini"]
+        self.assertEqual(costs["ultrafast_tier_calls"], 1)
+        self.assertEqual(costs["tier_rate_fallback_calls"], 1)
+        self.assertEqual(costs["estimated_cost_usd"], costs["standard_equivalent_cost_usd"])
 
     def test_empty_cache_can_receive_first_session(self):
         self.path.unlink()

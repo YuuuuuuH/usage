@@ -150,9 +150,10 @@ RELEVANT_USAGE_LINE_MARKERS = tuple(
     for marker in (f'"type":"{event_type}"', f'"type": "{event_type}"')
 ) + (b"<think",)
 
-PRICING_AS_OF = "2026-10-11"
+PRICING_AS_OF = "2026-11-22"
 LONG_CONTEXT_THRESHOLD = 272_000
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
+GPT_62_ULTRAFAST_LIST_START = datetime(2027, 3, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
 def decode_json(value: str | bytes) -> Any:
@@ -424,7 +425,7 @@ def source_summary_path(source: UsageSource) -> Path:
 
 
 def tier_cache_path(source: UsageSource, tier: str) -> Path | None:
-    if tier not in {"default", "priority"}:
+    if tier not in {"default", "priority", "ultrafast"}:
         return None
     path = incremental_cache_path(source)
     return path.with_name(f"{path.stem}-{tier}{path.suffix}")
@@ -557,6 +558,8 @@ def pricing_rate(
     *,
     cache_write_input_rate: float | None = None,
     priority_rates: tuple[float, float | None, float | None, float] | None = None,
+    ultrafast_multiplier: float | None = None,
+    ultrafast_launch_pricing: bool = False,
     provider: str = "OpenAI",
     long_context: bool = False,
     long_context_threshold: int | None = None,
@@ -573,6 +576,8 @@ def pricing_rate(
         "cache_write_input": cache_write_input_rate,
         "output": output_rate,
         "priority_rates": priority_rates,
+        "ultrafast_multiplier": ultrafast_multiplier,
+        "ultrafast_launch_pricing": ultrafast_launch_pricing,
         "long_context": long_context,
         "long_context_threshold": long_context_threshold,
         "long_context_rates": long_context_rates,
@@ -598,12 +603,33 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         source="https://platform.claude.com/docs/en/about-claude/pricing",
     ),
     # Current GPT families and historical standard API models.
+    "gpt-6.2-astra": pricing_rate(
+        8.0, 0.40, 40.0, cache_write_input_rate=10.0,
+        priority_rates=(16.0, 0.80, 20.0, 80.0),
+        ultrafast_multiplier=6.0, ultrafast_launch_pricing=True,
+        long_context=True,
+        source="https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+    ),
+    "gpt-6.2-sol": pricing_rate(
+        2.0, 0.10, 10.0, cache_write_input_rate=2.5,
+        priority_rates=(4.0, 0.20, 5.0, 20.0),
+        ultrafast_multiplier=6.0, ultrafast_launch_pricing=True,
+        long_context=True,
+        source="https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+    ),
     "gpt-6.1-sol": pricing_rate(
         2.0, 0.10, 10.0, cache_write_input_rate=2.5,
         priority_rates=(4.0, 0.20, 5.0, 20.0),
+        ultrafast_multiplier=6.0,
         long_context_threshold=LONG_CONTEXT_THRESHOLD,
         long_context_rates=(4.0, 0.20, 5.0, 15.0),
         source="https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+    ),
+    "gpt-6.1-terra": pricing_rate(
+        1.0, 0.05, 5.0, cache_write_input_rate=1.25,
+        priority_rates=(2.0, 0.10, 2.5, 10.0),
+        long_context=True,
+        source="https://developers.openai.com/api/docs/models/gpt-6.1-terra",
     ),
     "gpt-6-luna": pricing_rate(
         0.10, 0.01, 0.50, cache_write_input_rate=0.125,
@@ -616,6 +642,7 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
         10.0, 1.0, 50.0,
         cache_write_input_rate=12.5,
         priority_rates=(20.0, 2.0, 25.0, 100.0),
+        ultrafast_multiplier=6.0,
         long_context_threshold=LONG_CONTEXT_THRESHOLD,
         long_context_rates=(20.0, 2.0, 25.0, 75.0),
         source="https://developers.openai.com/api/docs/models/gpt-6-astra",
@@ -1069,6 +1096,7 @@ COST_FIELDS = (
     "long_context_calls",
     "default_tier_calls",
     "priority_tier_calls",
+    "ultrafast_tier_calls",
     "other_tier_calls",
     "tier_rate_fallback_calls",
 )
@@ -2281,9 +2309,24 @@ def rates_for_service_tier(
     pricing: dict[str, Any],
     standard_rates: dict[str, float | None],
     service_tier: str,
+    timestamp: datetime | None = None,
 ) -> tuple[dict[str, float | None], bool]:
     if service_tier == "default":
         return dict(standard_rates), False
+    if service_tier == "ultrafast":
+        multiplier = pricing.get("ultrafast_multiplier")
+        if multiplier is None:
+            return dict(standard_rates), True
+        if pricing.get("ultrafast_launch_pricing"):
+            when = timestamp if timestamp is not None else datetime.now(timezone.utc)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if when < GPT_62_ULTRAFAST_LIST_START:
+                multiplier = 3.0
+        return {
+            field: rate * multiplier if rate is not None else None
+            for field, rate in standard_rates.items()
+        }, False
     if service_tier != "priority":
         return dict(standard_rates), True
     priority = pricing.get("priority_rates")
@@ -2369,6 +2412,11 @@ def estimate_usage_cost(
     aliases: dict[str, str] | None = None,
     timestamp: datetime | None = None,
 ) -> Counter:
+    call_tier = {
+        "default": "default_tier_calls",
+        "priority": "priority_tier_calls",
+        "ultrafast": "ultrafast_tier_calls",
+    }.get(service_tier, "other_tier_calls")
     pricing_match = pricing_for_model(
         model,
         route_provider,
@@ -2380,9 +2428,7 @@ def estimate_usage_cost(
             {
                 "unpriced_tokens": usage["total_tokens"],
                 "unpriced_calls": 1,
-                "priority_tier_calls": 1 if service_tier == "priority" else 0,
-                "default_tier_calls": 1 if service_tier == "default" else 0,
-                "other_tier_calls": 1 if service_tier not in {"default", "priority"} else 0,
+                call_tier: 1,
             }
         )
 
@@ -2392,6 +2438,7 @@ def estimate_usage_cost(
         pricing,
         standard_rates,
         service_tier,
+        timestamp,
     )
     result = cost_for_rates(usage, selected_rates)
     standard_cost = cost_for_rates(usage, standard_rates)
@@ -2421,9 +2468,7 @@ def estimate_usage_cost(
     result["priced_calls"] = 1 if result["priced_tokens"] else 0
     result["unpriced_calls"] = 1 if result["unpriced_tokens"] and not result["priced_tokens"] else 0
     result["long_context_calls"] = 1 if long_context else 0
-    result["default_tier_calls"] = 1 if service_tier == "default" else 0
-    result["priority_tier_calls"] = 1 if service_tier == "priority" else 0
-    result["other_tier_calls"] = 1 if service_tier not in {"default", "priority"} else 0
+    result[call_tier] = 1
     result["tier_rate_fallback_calls"] = 1 if tier_fallback else 0
     return result
 
@@ -4847,7 +4892,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
   "use strict";
   const data = JSON.parse(document.getElementById("usageData").textContent);
   const zeroUsage = {input_tokens:0,cached_input_tokens:0,cache_write_input_tokens:0,uncached_input_tokens:0,output_tokens:0,reasoning_output_tokens:0,unclassified_tokens:0,total_tokens:0,calls:0};
-  const zeroCost = {uncached_input_cost_usd:0,cached_input_cost_usd:0,cache_write_input_cost_usd:0,output_cost_usd:0,estimated_cost_usd:0,standard_equivalent_cost_usd:0,service_tier_premium_usd:0,cache_savings_usd:0,priced_tokens:0,unpriced_tokens:0,priced_calls:0,unpriced_calls:0,long_context_calls:0,default_tier_calls:0,priority_tier_calls:0,other_tier_calls:0,tier_rate_fallback_calls:0};
+  const zeroCost = {uncached_input_cost_usd:0,cached_input_cost_usd:0,cache_write_input_cost_usd:0,output_cost_usd:0,estimated_cost_usd:0,standard_equivalent_cost_usd:0,service_tier_premium_usd:0,cache_savings_usd:0,priced_tokens:0,unpriced_tokens:0,priced_calls:0,unpriced_calls:0,long_context_calls:0,default_tier_calls:0,priority_tier_calls:0,ultrafast_tier_calls:0,other_tier_calls:0,tier_rate_fallback_calls:0};
   const metrics = {
     total_tokens: {label:"Total tokens", short:"Total"},
     input_tokens: {label:"Input tokens", short:"Input"},
@@ -5060,7 +5105,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("standardCost").textContent = hasTrustedPricing ? usd(cost.standard_equivalent_cost_usd) : "未定价";
     document.getElementById("standardCostDetail").textContent = `${fmt(cost.default_tier_calls)} default · ${fmt(cost.long_context_calls)} long context`;
     document.getElementById("tierPremium").textContent = hasTrustedPricing ? usd(cost.service_tier_premium_usd) : "—";
-    document.getElementById("tierPremiumDetail").textContent = `${fmt(cost.priority_tier_calls)} priority / fast calls · ${fmt(cost.tier_rate_fallback_calls)} fallback`;
+    document.getElementById("tierPremiumDetail").textContent = `${fmt(cost.priority_tier_calls)} Fast · ${fmt(cost.ultrafast_tier_calls)} Ultrafast`;
     document.getElementById("cacheSavings").textContent = hasTrustedPricing ? usd(cost.cache_savings_usd) : "—";
     document.getElementById("cacheSavingsDetail").textContent = `${usd(cost.cached_input_cost_usd)} read · ${usd(cost.cache_write_input_cost_usd)} write`;
     document.getElementById("costCaption").textContent = hasTrustedPricing
@@ -5093,7 +5138,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     const unpricedNote = "";
     const authMode = String(pricing.billing_context?.current_auth_mode || "unknown").toLowerCase();
     const authNote = authMode.includes("api")
-      ? "当前认证为 API key；Priority/Fast 路由按官方 API Priority 价估算。"
+      ? "当前认证为 API key，使用官方 API 费率估算。"
       : authMode.includes("chatgpt")
         ? "当前认证为 ChatGPT；这里仍只显示 API 等价价值，无法从 token 日志还原订阅账单或 credits。"
         : "日志不保存可验证的历史认证方式，因此不能判定每次调用属于订阅还是 API 账单。";
@@ -5109,7 +5154,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("costMethod").textContent = hasTrustedPricing
       ? hasCustomPricing
         ? `自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。${customRateNote}${configNote}${configErrorNote}${unpricedNote}`
-        : `${authNote} Default 使用 Standard 价；Priority/Fast 使用可用的 Priority 价，无对应价时回退 Standard 并计入审计。${inferredTierNote} ChatGPT Plan Fast 对 GPT-5.6/5.5 使用 2.5x credits、GPT-5.4 使用 2x credits，但这不是 token 美元单价，日志不足以重建订阅账单。缓存读、缓存写、未缓存输入和输出分别计价；未提供独立写入价时按输入价。工具调用、缓存存储和非文本模态费用不在 Codex token 日志中，不计入。${configNote}${configErrorNote}${unpricedNote}`
+        : `${authNote} Default、Fast 和 Ultrafast 按调用时间使用各自费率。无对应费率时按 Standard 估算，并在审计中记录。${inferredTierNote} 缓存读取、缓存写入、未缓存输入和输出分别计价。${configNote}${configErrorNote}${unpricedNote}`
       : `当前来源仅提供用量统计。可在应用设置中为已识别模型填写价格。${configErrorNote}${unpricedNote}`;
     const sourceMap = new Map();
     pricing.sources.forEach(item => {
@@ -5132,7 +5177,8 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
       ["Internal threads", a.internal_threads], ["Orphan internal", a.orphan_internal_threads], ["Raw events", a.raw_token_events],
       ["Unique calls", a.unique_model_calls], ["Replay skipped", a.inherited_events], ["Local duplicates", a.local_duplicate_events],
       ["Null usage", a.null_usage_events], ["Delta fallbacks", a.fallback_delta_events], ["Model fallbacks", a.fallback_model_events],
-      ["Provider fallbacks", a.fallback_provider_events], ["Tier fallbacks", a.fallback_service_tier_events], ["Priority calls", data.pricing.scopes.all.priority_tier_calls],
+      ["Provider fallbacks", a.fallback_provider_events], ["Tier fallbacks", a.fallback_service_tier_events], ["Fast calls", data.pricing.scopes.all.priority_tier_calls],
+      ["Ultrafast calls", data.pricing.scopes.all.ultrafast_tier_calls],
       ["Tier price fallbacks", data.pricing.scopes.all.tier_rate_fallback_calls], ["Reasoning inferred", a.inferred_reasoning_events || 0], ["Inferred reasoning tokens", a.inferred_reasoning_tokens || 0],
       ["Heuristic reasoning", a.heuristic_reasoning_events || 0], ["Cache writes", data.totals.all.cache_write_input_tokens], ["Pricing config errors", a.pricing_config_errors],
       ["Total repairs", a.repaired_total_events], ["Missing timestamps", a.missing_timestamp_events], ["Unclassified", data.totals.all.unclassified_tokens]

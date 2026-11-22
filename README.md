@@ -31,8 +31,7 @@ The app retains its existing macOS bundle identifier and cache location to prese
 - Provides persistent section navigation and searchable, paginated session tables. Session and pricing columns fit the window; truncated text remains available on hover.
 - Shows tokens, calls, and the selected official direct-API equivalent value for every hourly and daily heatmap cell on hover.
 - Selects `~/.codex`, `~/.qodex`, or another compatible data home from the dashboard, then filters that source by model, metric, all history, the latest 7 or 30 days, or an exact custom date range.
-- Switches between a simple Standard-rate estimate and a service-tier estimate that distinguishes Default from Fast/Priority calls.
-- Separates Standard/default and Priority/Fast API rates where the provider publishes both.
+- Switches between a Standard API estimate and separate rates for Default, Fast and Ultrafast.
 - Prices current and historical GPT/Codex families plus built-in DeepSeek, Gemini, Anthropic, and xAI models. The 2026-09-07 catalog includes GPT-6 Astra, GPT-5.6 Sol/Terra/Luna/Cyber, Gemini 3.8 Flash, Claude 5/5.1, and Grok 4.6. Unknown models remain visible and are marked unpriced.
 - Stores optional per-model prices for local and open-source models inside the selected data home, with separate uncached input, cache read, cache write, and output rates.
 - Reads cache hits and cache writes separately when the log schema provides them.
@@ -63,14 +62,14 @@ Codex `/status` may show a much smaller number because its displayed token usage
 The value panel is deliberately not labelled as an actual bill. Its controls offer two comparison modes:
 
 - **Simple pricing:** every recognized call uses the model's official Standard API rate.
-- **Default / Fast pricing:** logged Default calls use Standard rates and logged Fast/Priority calls use official Priority rates when available, with an explicit Standard fallback when no Priority rate exists.
+- **Tiered pricing** applies the official Default, Fast or Ultrafast rate at the time of each call. The audit view records calls that fall back to Standard. GPT-6.2 Astra and Sol Ultrafast use 3× Standard through February 28, 2027 and 6× from March 1, Pacific time. [OpenAI API pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast)
 
 Older logs may not contain a service tier. For the standard `~/.codex` home, those calls use the current top-level `service_tier` from `~/.codex/config.toml` as an inferred fallback, and the audit panel reports exactly how many calls were inferred. Alternate data homes use Default without reading their auth or provider configuration.
 
 Channel interpretation remains separate from those controls:
 
 - **ChatGPT Plan:** local token events cannot reconstruct subscription charges or Codex credits. Standard API equivalent value is still shown for comparison. Fast-mode credit multipliers are not dollar token prices.
-- **OpenAI API key:** `default` uses Standard rates and logged `priority`/`fast` routes use published Priority rates when available.
+- **OpenAI API key** uses the published API rates for the logged service tier.
 - **Other provider or relay:** the logged provider and model are retained. A recognized DeepSeek, Gemini, Claude, Grok, or GPT model is valued at that vendor's official direct rate even when it was reached through an OpenAI-compatible relay.
 - **Unknown or internal model:** usage remains in every total and export, but value is unpriced until it can be mapped to a built-in official model.
 

@@ -342,6 +342,8 @@ private struct Cost: Decodable {
     let long_context_calls: Int64
     let default_tier_calls: Int64
     let priority_tier_calls: Int64
+    // Older report snapshots have no Ultrafast counter.
+    let ultrafast_tier_calls: Int64?
     let other_tier_calls: Int64
     let tier_rate_fallback_calls: Int64
 
@@ -364,6 +366,7 @@ private struct Cost: Decodable {
         long_context_calls: Int64 = 0,
         default_tier_calls: Int64 = 0,
         priority_tier_calls: Int64 = 0,
+        ultrafast_tier_calls: Int64 = 0,
         other_tier_calls: Int64 = 0,
         tier_rate_fallback_calls: Int64 = 0
     ) {
@@ -385,6 +388,7 @@ private struct Cost: Decodable {
         self.long_context_calls = long_context_calls
         self.default_tier_calls = default_tier_calls
         self.priority_tier_calls = priority_tier_calls
+        self.ultrafast_tier_calls = ultrafast_tier_calls
         self.other_tier_calls = other_tier_calls
         self.tier_rate_fallback_calls = tier_rate_fallback_calls
     }
@@ -712,7 +716,7 @@ private enum PricingMode: Int {
     var title: String {
         switch self {
         case .simple: return "简单计价"
-        case .tiered: return "区分 Default / Fast"
+        case .tiered: return "分层计价"
         }
     }
 
@@ -809,6 +813,7 @@ private extension Cost {
             long_context_calls: long_context_calls + other.long_context_calls,
             default_tier_calls: default_tier_calls + other.default_tier_calls,
             priority_tier_calls: priority_tier_calls + other.priority_tier_calls,
+            ultrafast_tier_calls: (ultrafast_tier_calls ?? 0) + (other.ultrafast_tier_calls ?? 0),
             other_tier_calls: other_tier_calls + other.other_tier_calls,
             tier_rate_fallback_calls: tier_rate_fallback_calls + other.tier_rate_fallback_calls
         )
@@ -3139,7 +3144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTo
             "priced_tokens": value.priced_tokens,
             "unpriced_tokens": value.unpriced_tokens,
             "default_tier_calls": value.default_tier_calls,
-            "priority_tier_calls": value.priority_tier_calls
+            "priority_tier_calls": value.priority_tier_calls,
+            "ultrafast_tier_calls": value.ultrafast_tier_calls ?? 0
         ]
     }
 
@@ -4347,7 +4353,7 @@ private struct AtlasDashboardView: View {
                     AtlasMetricDivider()
                     MetricCard(title: "STANDARD BASELINE", value: standardValue, detail: "\(formatInt(cost.default_tier_calls)) default · \(formatInt(cost.long_context_calls)) long context", accent: AtlasColor.teal)
                     AtlasMetricDivider()
-                    MetricCard(title: "TIER PREMIUM", value: secondaryValue, detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) fast / priority calls" : "简单计价不应用 Fast 溢价", accent: AtlasColor.coral)
+                    MetricCard(title: "TIER PREMIUM", value: secondaryValue, detail: controller.pricingMode == .tiered ? "\(formatInt(cost.priority_tier_calls)) Fast · \(formatInt(cost.ultrafast_tier_calls ?? 0)) Ultrafast" : "Standard API 费率", accent: AtlasColor.coral)
                     AtlasMetricDivider()
                     MetricCard(title: "CACHE SAVINGS", value: cacheValue, detail: hasTrustedPricing ? "\(formatUSD(controller.pricingMode.cacheReadCost(cost))) read · \(formatUSD(controller.pricingMode.cacheWriteCost(cost))) write" : "配置价格后计算", accent: AtlasColor.amber)
                 }
@@ -4365,7 +4371,7 @@ private struct AtlasDashboardView: View {
                         ? "自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。"
                         : (controller.pricingMode == .simple
                         ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
-                        : "分层计价：Default 使用 Standard；Fast/Priority 使用官方 Priority，无对应价格时回退 Standard。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
+                        : "分层计价按调用时间与 Default、Fast 或 Ultrafast 的官方费率估算。无对应费率时按 Standard 估算，并在审计中记录。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
                         + (hasTimeVariablePricing ? " DeepSeek V4 表中显示峰时价，历史金额按调用时间套用 UTC 工作日峰/谷价。" : ""))
                     .font(.system(size: 11))
                     .foregroundStyle(Color(nsColor: AtlasColor.muted))
@@ -4378,7 +4384,7 @@ private struct AtlasDashboardView: View {
         HStack(spacing: 12) {
             AtlasControl(label: "计价") {
                 AtlasSegmentedControl(
-                    items: [(.simple, "简单计价"), (.tiered, "区分 Default / Fast")],
+                    items: [(.simple, PricingMode.simple.title), (.tiered, PricingMode.tiered.title)],
                     selection: Binding(get: { controller.pricingMode }, set: { controller.choosePricingMode($0) })
                 )
                 .frame(width: 276)
@@ -4438,7 +4444,8 @@ private struct AtlasDashboardView: View {
             ("INTERNAL THREADS", Int64(audit.internalThreadCount)), ("ORPHAN INTERNAL", Int64(audit.orphanInternalThreadCount)), ("RAW EVENTS", Int64(audit.raw_token_events)),
             ("UNIQUE CALLS", Int64(audit.unique_model_calls)), ("REPLAY SKIPPED", Int64(audit.inherited_events)), ("LOCAL DUPLICATES", Int64(audit.local_duplicate_events)),
             ("NULL USAGE", Int64(audit.null_usage_events)), ("DELTA FALLBACKS", Int64(audit.fallback_delta_events)), ("MODEL FALLBACKS", Int64(audit.fallback_model_events)),
-            ("PROVIDER FALLBACKS", Int64(audit.fallback_provider_events)), ("TIER FALLBACKS", Int64(audit.fallback_service_tier_events)), ("PRIORITY CALLS", cost.priority_tier_calls),
+            ("PROVIDER FALLBACKS", Int64(audit.fallback_provider_events)), ("TIER FALLBACKS", Int64(audit.fallback_service_tier_events)),
+            ("FAST CALLS", cost.priority_tier_calls), ("ULTRAFAST CALLS", cost.ultrafast_tier_calls ?? 0),
             ("PRICE FALLBACKS", cost.tier_rate_fallback_calls), ("REASONING INFERRED", Int64(audit.inferredReasoningEventCount)), ("INFERRED REASONING", audit.inferredReasoningTokenCount),
             ("HEURISTIC REASONING", Int64(audit.heuristicReasoningEventCount)), ("TOTAL REPAIRS", Int64(audit.repaired_total_events)), ("MISSING TIME", Int64(audit.missing_timestamp_events)),
             ("CONFIG ERRORS", Int64(audit.pricing_config_errors)), ("CACHE WRITES", controller.filteredUsage(scope: "all", data: data).cache_write_input_tokens), ("UNCLASSIFIED", controller.filteredUsage(scope: "all", data: data).unclassified_tokens)
@@ -4453,7 +4460,12 @@ private struct AtlasDashboardView: View {
     }
 
     private func tierLabel(_ tier: String?) -> String {
-        tier == "priority" ? "Fast / Priority" : (tier ?? "Default")
+        switch tier {
+        case "priority": return "Fast / Priority"
+        case "ultrafast": return "Ultrafast"
+        case nil, "default": return "Default"
+        default: return tier ?? "Default"
+        }
     }
 }
 
