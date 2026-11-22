@@ -153,7 +153,6 @@ RELEVANT_USAGE_LINE_MARKERS = tuple(
 PRICING_AS_OF = "2026-11-22"
 LONG_CONTEXT_THRESHOLD = 272_000
 OFFICIAL_PRICING_URL = "https://developers.openai.com/api/docs/pricing"
-GPT_62_ULTRAFAST_LIST_START = datetime(2027, 3, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
 def decode_json(value: str | bytes) -> Any:
@@ -559,7 +558,6 @@ def pricing_rate(
     cache_write_input_rate: float | None = None,
     priority_rates: tuple[float, float | None, float | None, float] | None = None,
     ultrafast_multiplier: float | None = None,
-    ultrafast_launch_pricing: bool = False,
     provider: str = "OpenAI",
     long_context: bool = False,
     long_context_threshold: int | None = None,
@@ -577,7 +575,6 @@ def pricing_rate(
         "output": output_rate,
         "priority_rates": priority_rates,
         "ultrafast_multiplier": ultrafast_multiplier,
-        "ultrafast_launch_pricing": ultrafast_launch_pricing,
         "long_context": long_context,
         "long_context_threshold": long_context_threshold,
         "long_context_rates": long_context_rates,
@@ -606,14 +603,14 @@ PRICING_USD_PER_MTOK: dict[str, dict[str, Any]] = {
     "gpt-6.2-astra": pricing_rate(
         8.0, 0.40, 40.0, cache_write_input_rate=10.0,
         priority_rates=(16.0, 0.80, 20.0, 80.0),
-        ultrafast_multiplier=6.0, ultrafast_launch_pricing=True,
+        ultrafast_multiplier=6.0,
         long_context=True,
         source="https://developers.openai.com/api/docs/models/gpt-6.2-astra",
     ),
     "gpt-6.2-sol": pricing_rate(
         2.0, 0.10, 10.0, cache_write_input_rate=2.5,
         priority_rates=(4.0, 0.20, 5.0, 20.0),
-        ultrafast_multiplier=6.0, ultrafast_launch_pricing=True,
+        ultrafast_multiplier=6.0,
         long_context=True,
         source="https://developers.openai.com/api/docs/models/gpt-6.2-sol",
     ),
@@ -2309,7 +2306,6 @@ def rates_for_service_tier(
     pricing: dict[str, Any],
     standard_rates: dict[str, float | None],
     service_tier: str,
-    timestamp: datetime | None = None,
 ) -> tuple[dict[str, float | None], bool]:
     if service_tier == "default":
         return dict(standard_rates), False
@@ -2317,12 +2313,6 @@ def rates_for_service_tier(
         multiplier = pricing.get("ultrafast_multiplier")
         if multiplier is None:
             return dict(standard_rates), True
-        if pricing.get("ultrafast_launch_pricing"):
-            when = timestamp if timestamp is not None else datetime.now(timezone.utc)
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            if when < GPT_62_ULTRAFAST_LIST_START:
-                multiplier = 3.0
         return {
             field: rate * multiplier if rate is not None else None
             for field, rate in standard_rates.items()
@@ -2438,7 +2428,6 @@ def estimate_usage_cost(
         pricing,
         standard_rates,
         service_tier,
-        timestamp,
     )
     result = cost_for_rates(usage, selected_rates)
     standard_cost = cost_for_rates(usage, standard_rates)
@@ -5154,7 +5143,7 @@ tbody tr:hover { background: rgba(8, 121, 104, 0.045); }
     document.getElementById("costMethod").textContent = hasTrustedPricing
       ? hasCustomPricing
         ? `自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。${customRateNote}${configNote}${configErrorNote}${unpricedNote}`
-        : `${authNote} Default、Fast 和 Ultrafast 按调用时间使用各自费率。无对应费率时按 Standard 估算，并在审计中记录。${inferredTierNote} 缓存读取、缓存写入、未缓存输入和输出分别计价。${configNote}${configErrorNote}${unpricedNote}`
+        : `${authNote} Default、Fast 和 Ultrafast 按各自的标准公布费率估算。无对应费率时按 Standard 估算，并在审计中记录。${inferredTierNote} 缓存读取、缓存写入、未缓存输入和输出分别计价。${configNote}${configErrorNote}${unpricedNote}`
       : `当前来源仅提供用量统计。可在应用设置中为已识别模型填写价格。${configErrorNote}${unpricedNote}`;
     const sourceMap = new Map();
     pricing.sources.forEach(item => {

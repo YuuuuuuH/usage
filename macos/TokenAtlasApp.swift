@@ -4371,7 +4371,7 @@ private struct AtlasDashboardView: View {
                         ? "自定义价格按 USD / 100 万 tokens 保存，并分别应用于未缓存输入、缓存读取、缓存写入和输出。"
                         : (controller.pricingMode == .simple
                         ? "简单计价：全部调用按对应模型官方 Standard API 价格估算。"
-                        : "分层计价按调用时间与 Default、Fast 或 Ultrafast 的官方费率估算。无对应费率时按 Standard 估算，并在审计中记录。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
+                        : "分层计价按 Default、Fast 或 Ultrafast 各自的标准公布费率估算。无对应费率时按 Standard 估算，并在审计中记录。日志缺失 tier 的 \(formatInt(Int64(data.audit.fallback_service_tier_events))) 次调用按当前数据目录配置 \(tierLabel(data.audit.configured_service_tier_fallback)) 推断。")
                         + (hasTimeVariablePricing ? " DeepSeek V4 表中显示峰时价，历史金额按调用时间套用 UTC 工作日峰/谷价。" : ""))
                     .font(.system(size: 11))
                     .foregroundStyle(Color(nsColor: AtlasColor.muted))

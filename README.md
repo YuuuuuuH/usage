@@ -62,7 +62,7 @@ Codex `/status` may show a much smaller number because its displayed token usage
 The value panel is deliberately not labelled as an actual bill. Its controls offer two comparison modes:
 
 - **Simple pricing:** every recognized call uses the model's official Standard API rate.
-- **Tiered pricing** applies the official Default, Fast or Ultrafast rate at the time of each call. The audit view records calls that fall back to Standard. GPT-6.2 Astra and Sol Ultrafast use 3× Standard through February 28, 2027 and 6× from March 1, Pacific time. [OpenAI API pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast)
+- **Tiered pricing** applies official Default, Fast or Ultrafast list rates. GPT-6.2 Astra and Sol Ultrafast use 6× the applicable Standard rate. The audit view records calls that fall back to Standard. [OpenAI API pricing](https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast)
 
 Older logs may not contain a service tier. For the standard `~/.codex` home, those calls use the current top-level `service_tier` from `~/.codex/config.toml` as an inferred fallback, and the audit panel reports exactly how many calls were inferred. Alternate data homes use Default without reading their auth or provider configuration.
 
